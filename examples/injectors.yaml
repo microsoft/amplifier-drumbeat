@@ -1,0 +1,65 @@
+# injectors.yaml — turn-context injectors (drumbeat)
+#
+# COPY THIS FILE to your workspace root (beside drumpacks.txt) to take effect. It is
+# OPTIONAL: with no file, no injectors run and every turn is unchanged.
+#
+# WHAT IT DOES. Sometimes the brain needs standing context a turn's own text
+# does not carry — working state, a recall of durable facts, a summary of what
+# is open right now. That context lives OUTSIDE drumbeat, behind a command only
+# you know how to run. An injector is that command: drumbeat runs it and folds
+# its stdout into the turn as a labeled preamble block, without knowing anything
+# about what the command is or what it returns. Pure mechanism — drumbeat names
+# no service and embeds no command; you declare them here.
+#
+# WHEN THEY RUN. For each turn, every injector whose `apply_to` includes the
+# turn's profile is run. Its stdout becomes a labeled block prepended to the
+# turn text, in file order (top to bottom); your own message always stays last
+# and most salient. Injectors ride the turn that answers the person — a reply,
+# or a chat message — not a session's one-time setup turns.
+#
+# THE ENVIRONMENT. An injector runs with the turn environment: the same
+# constructed PATH the agent's own tool calls get (workspace `bin/` and pack
+# bins prepended), and `DRUMBEAT_DATA_DIR` pointing at the data dir. So an
+# injector command resolves exactly like a pack tool, and finds engine state
+# without depending on the current directory.
+#
+# THE CONTRACT (fail loud). An injector's result is classified in a FIXED order:
+#   - the binary cannot be spawned      -> the turn is refused (loud)
+#   - it times out (60s)                -> the turn is refused (loud)
+#   - it exits non-zero                 -> the turn is refused (loud; stderr shown)
+#   - stdout is exactly `INJECT_IDLE`   -> the injector opts out of THIS turn
+#   - stdout is empty (not the sentinel)-> the turn is refused (loud)
+#   - anything else                     -> that stdout becomes this turn's block
+# A configured injector that fails never runs the turn with a silently smaller
+# context — it refuses, and the turn is recorded failed with the reason. An
+# injector with nothing to add this turn must print `INJECT_IDLE` (byte-exact,
+# the whole of stdout) rather than exit empty: silence is never a contract value.
+#
+# KEYS. A single top-level `injectors:` key holding a list. Each entry:
+#   argv:     REQUIRED. A non-empty list of non-empty strings — the command and
+#             its arguments (run directly, no shell).
+#   label:    REQUIRED. A non-empty string. Heads the injected block, and names
+#             the injector in any refusal.
+#   apply_to: REQUIRED. A non-empty list of profile names this injector runs for
+#             — the names you defined in agent-config.yaml `profiles:`, matched
+#             against a turn's requested `profile`. A turn whose profile is not
+#             listed (or that names no profile) never runs it.
+# Unknown keys or a missing field are a loud refusal (the engine names the file
+# and the problem) rather than a silent misconfiguration. The `apply_to` names
+# are OPEN vocabulary — the engine imposes no fixed set of interaction modes.
+
+injectors:
+  # Fold a working-context summary into turns using the "quick" or "chat"
+  # profiles. `context-tool` here stands in for any command on the turn PATH
+  # that prints the context you want the brain to carry (and prints INJECT_IDLE
+  # when there is none). The names below are just example profile names — use
+  # whatever you named your profiles in agent-config.yaml.
+  - label: "Working context"
+    argv: ["context-tool", "--summarize"]
+    apply_to: ["quick", "chat"]
+
+  # A second injector, showing that argv can carry arguments and that blocks
+  # stack in file order (this one lands below "Working context").
+  - label: "Open items"
+    argv: ["items-cli", "list", "--for-turn"]
+    apply_to: ["chat"]

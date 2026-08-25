@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+runs/
+
+# Lane-harness scaffolding. Never product content, and it carries real
+# hostnames, absolute user paths and other projects' internals -- exactly
+# what must not reach a repo shared with colleagues. Ignored so a stray
+# `git add -A` cannot commit it. See EVIDENCE/SCRUB-MANIFEST.md s5.
+/CONTRACT-PINS.md
+/GOAL.md
+/lane.log
+EVIDENCE/
+lane.log
+BLOCKED*.md
+LANE-NOTE*.md
+INCIDENT*.md

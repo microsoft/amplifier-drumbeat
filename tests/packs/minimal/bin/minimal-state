@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# The engine test drumpack's inject tool. Contract (docs/DRUMPACKS.md, "inject: tools"):
+# stdout is the injection channel; INJECT_IDLE means "nothing to inject";
+# exit non-zero on any failed read; errors to stderr, never stdout.
+set -euo pipefail
+if [ "${MINIMAL_STATE_FAIL:-0}" = "1" ]; then
+  echo "minimal-state: simulated read failure" >&2
+  exit 3
+fi
+if [ "${MINIMAL_STATE_IDLE:-0}" = "1" ]; then
+  echo "INJECT_IDLE"
+  exit 0
+fi
+echo "minimal-state: 1 open thing (exemplar payload)"

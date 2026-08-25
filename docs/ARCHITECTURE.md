@@ -1,0 +1,573 @@
+# Architecture
+
+What drumbeat is, what it deliberately is not, and the contracts that hold at
+each boundary.
+
+This document is standalone. It assumes no knowledge of any particular
+consumer, and every claim in it is either a contract the code enforces or a
+measurement taken from a real deployment. Where a number appears, it was
+observed, not estimated.
+
+---
+
+## 1. What the engine is
+
+**drumbeat runs markdown automations as sequential turns in a long-lived agent
+session, on a schedule, unattended, and emits a reasoned record of everything
+it decided.**
+
+That is the whole product. Five nouns:
+
+| Noun | What it is |
+|---|---|
+| **Automation** | A markdown file: YAML frontmatter (trigger, notify policy, requirements) plus an ordered list of natural-language steps |
+| **Turn** | One step, executed as one `amplifier-agent` OS process against a pinned session |
+| **Drumpack** | A directory of `bin/` executables plus a `drumpack.md` card, brought by the consumer. The engine ships no tools |
+| **Delivery intent** | A durable, reasoned event saying "this run's output should / should not reach a human, and here is why" |
+| **Run artifact** | Per-run directory holding the result, every step's output, and stderr |
+
+Everything else in this repo exists to make those five reliable when nobody is
+watching.
+
+### The one-sentence version of the design
+
+**Policy is markdown the consumer owns; mechanism is Python the engine owns;
+and every gate that can silence output must write down why it fired.**
+
+---
+
+## 2. Topology
+
+```
+   ┌──────────────────────────────────────────────────────────┐
+   │ consumer workspace                                        │
+   │   automations/   guidance/   prompts/   drumpacks.txt     │   markdown — policy,
+   │   drumpacks/<name>/  (drumpack.md + bin/)                 │   owned by the consumer
+   └───────────────────────────┬──────────────────────────────┘
+                               │ --workspace <dir>
+   ┌───────────────────────────▼──────────────────────────────┐
+   │ drumbeat serve      (one instance per consumer)           │
+   │   scheduler · runner · pinned sessions · pre-run gate     │
+   │   inject turns · rotation · session health · artifacts    │
+   │   HTTP API on 127.0.0.1:<port>  (X-API-Key on writes)     │
+   │   └── spawns: amplifier-agent run   (one process/turn)    │
+   └───────┬──────────────────────────────────┬───────────────┘
+           │ durable event outbox             │ POST /api/turns
+           │ runs/engine-events.jsonl         │ (reply → exact session;
+           │ (tailed by the consumer)         │  423 locked, 404 unknown)
+   ┌───────▼──────────────────────────────────▼───────────────┐
+   │ the consuming service                                     │
+   │   delivery worker · transport (push/mail/chat/…) ·        │
+   │   quiet hours · notification store · reply routing · UI   │
+   └──────────────────────────────────────────────────────────┘
+```
+
+**One engine instance per consuming project.** Own port, own data directory,
+own lock. Multi-tenancy was considered and rejected: it buys nothing at small
+N and costs per-tenant scoping, authorization, and a shared daemon whose
+failure takes down every tenant at once. The engine is a service you run for
+your project — not a platform you register with.
+
+**Auth.** The engine binds loopback only. **Every mutating endpoint requires
+`X-API-Key`; there is no loopback bypass on writes.** A loopback bypass makes
+an engine authless to every local process — including a pack binary running
+inside some *other* engine instance's turn, which could then inject turns into
+your pinned sessions. Read-only endpoints may keep the loopback convenience.
+Writes never do.
+
+---
+
+## 3. The automation format
+
+A minimal automation:
+
+```markdown
+---
+automation:
+  name: Example Check
+  enabled: true
+  trigger:
+    type: schedule
+    expression: every 30 minutes
+  notify: auto
+  requires:
+    - example-cli
+    - guidance/EXAMPLE.md
+---
+
+1. Load and follow guidance/EXAMPLE.md.
+2. Check the source and tell me what needs my attention.
+3. This is a read-only run: do not send anything, do not modify anything.
+```
+
+The body is an **ordered list of freeform natural-language steps**. There is no
+branching, no looping, no variables, no per-step types, and no expression
+language. That is deliberate — see §8.
+
+Full authoring reference: [`AUTOMATIONS.md`](AUTOMATIONS.md).
+
+### The parser is strict on purpose
+
+An automation runs unattended. A silently-wrong parse produces silently-wrong
+behavior for days before anyone notices. So the parser refuses rather than
+guesses: unknown `notify` values, unknown trigger types, a `schedule` trigger
+with no expression, a non-boolean `enabled`, a `requires` that is not a list of
+strings — each is a loud refusal with the file path and the offending value.
+
+A broken automation is recorded in a durable error log and **listed as broken**,
+rather than causing the engine to refuse to start. One bad file must not take
+down every other automation's schedule.
+
+---
+
+## 4. The turn execution model
+
+### One OS process per turn
+
+Each step becomes one invocation:
+
+```
+amplifier-agent run --session-id <pinned> [--fresh | --resume] "<step text>"
+```
+
+The first turn of a session's life uses `--fresh`; every turn after it uses
+`--resume`. The agent's transcript lives on disk and is replayed between turns.
+The engine holds no in-memory conversation state — which is why an engine
+restart mid-day loses nothing but the currently-executing turn.
+
+This also means **the engine is not a fork of the agent runtime.** It spawns a
+stock binary with stock arguments. Nothing in the engine depends on a modified
+agent underneath, which is the property that keeps it portable.
+
+### Sessions are pinned, not per-run
+
+Each automation resumes **one long-lived conversation**, across runs, for weeks.
+That is the single most consequential design choice in the engine, and it is
+what makes "review activity **since your last check**" a meaningful
+instruction: the prior check is literally in the conversation.
+
+A fresh session per run would be simpler and would be wrong — it would make
+every run a cold start with no memory of what it already said, which is the
+behavior the whole design exists to avoid.
+
+**Where the pin lives.** The session id is engine state and is stored as engine
+state: `<data-dir>/session_pins.json` (default `<workspace>/runs/`), written
+atomically under a lock. It is **not** in the automation file. Earlier versions
+of the engine wrote it back into the automation's own frontmatter (`session:`);
+that key is now **refused** by the parser rather than ignored, with the
+migration remediation printed.
+
+The reason is the boundary this whole document is about: an automation file is
+**policy** — authored by a person, versioned, copied between machines. A
+session id is **machine-local runtime state**. State living inside policy meant
+the engine wrote to files it does not own, that every archive of a workspace
+carried conversation ids meaningful on exactly one machine, and that restoring
+such an archive somewhere else produced automations pinned to conversations
+that do not exist. Server state belongs in the server's state directory. See
+`docs/AUTOMATIONS.md` for the operator surface (`drumbeat sessions` and
+`drumbeat rotate-session`).
+
+### The pre-run gate
+
+Before step 1, the engine checks every `requires:` entry:
+
+- A **file** requirement must exist and is injected **verbatim, re-read on
+  every single run**. Guidance edited between runs takes effect on the next run
+  with no restart.
+- A **tool** requirement must resolve to an executable on the constructed turn
+  PATH. Its pack card is injected verbatim.
+
+**An unsatisfied requirement aborts the run** with a reasoned record. It does
+not run the steps with a missing tool and let the agent report "I could not do
+that" — the run never starts, and the failure names the requirement.
+
+### Injections, and the two the engine owns
+
+The engine performs exactly two built-in injections, both domain-free:
+
+1. **`requires:` file content** — verbatim, every run.
+2. **The resolved local time, timezone, and UTC offset** — because an agent
+   cannot reliably know what time it is, and every "since your last check"
+   instruction depends on it.
+
+Everything else the consumer wants present on every run comes through
+`inject:` (§6), which is domain-blind. The engine does not know what an "item",
+a "notification", or a "subscription" is, and it never will.
+
+### The turn PATH is pinned
+
+```
+<pack 1 bin> : <pack 2 bin> : … : <workspace bin> : <PINNED BASE>
+```
+
+The base list is captured **once at engine startup**, logged there, and echoed
+in `GET /api/capabilities`. It is identical for every turn regardless of how
+the service was launched.
+
+This is a scar. Tools once worked only because whoever started the process
+happened to have the right directory exported; a restart from a different shell
+made every tool vanish, and the agent faithfully reported "I could not do that"
+while the real cause was the launcher. Undeclared dependence on the launching
+environment is not a contract.
+
+---
+
+## 5. Session lifecycle: when a pinned session must be abandoned
+
+A pinned session accumulates conversation forever. **Only two failure modes
+have ever actually broken a run, both are mechanically detectable with zero
+judgment, and those two are the only rotation triggers in the code.**
+
+### Trigger 1 — ceiling hit
+
+The provider rejects the request outright:
+
+```
+prompt is too long: 219685 tokens > 200000 maximum
+```
+
+This is not a bad day; it is a permanent deadlock. The agent runtime's context
+policy compacts at a threshold *above* the provider's hard refusal, so a
+session whose prompt lands in that window can never compact its way out —
+compaction never fires.
+
+Measured on real run history: one session hit the ceiling and then failed **12
+consecutive times over 27 hours**; another hit it and failed twice before a
+human rotated it by hand. **Zero recoveries, ever.** A first ceiling hit is
+therefore a zero-false-positive death signal, and acting on it immediately
+costs exactly one run — the one that already failed.
+
+### Trigger 2 — contract drift
+
+When an automation's steps are rewritten, the pinned session still carries
+every *old* instruction as conversation history — and keeps obeying it.
+
+Measured: one session answered a bare sentinel to a step that asks no question,
+for **15 consecutive runs**, reasoning about a schedule its automation no
+longer declared. The engine fingerprints the *steps* (the contract) and
+compares on resume, catching this before the bad run rather than after fifteen.
+
+### NOT a trigger — transcript size on disk
+
+It is the obvious metric and it does not work. Measured against the only two
+sessions whose true token counts the provider ever reported:
+
+| session | on disk | true prompt tokens | bytes/token |
+|---|---|---|---|
+| A | 10.4 MB | 219,685 | ~50 |
+| B | 33.0 MB | 201,361 | ~172 |
+
+**The smaller file produced the larger prompt**, and the implied bytes-per-token
+differs by 3.4×. Compaction has already discarded an unknown prefix, and the
+file carries megabytes of signature data that is never sent to the provider.
+Any megabyte threshold is therefore either a false alarm or a missed failure,
+and which one is unknowable from the file alone.
+
+Size is reported as an *aside* and is never grounds for rotation. This is worth
+stating loudly because "the transcript is big, therefore it is at risk" is an
+inference every reader makes, and it is false.
+
+### Rotation is safe, and that is measured
+
+Rotation abandons the transcript, not the state. `run()` re-injects the durable
+state on **every** run — the `requires:` guidance files verbatim, plus the
+consumer's `inject:` state turn. Checked across every rotation performed in the
+originating deployment: **71/71 tracked ids survived one automation's rotation
+boundary, 27/27 survived another's**, and no post-rotation run contained an "I
+don't have that context" phrase.
+
+The transcript is sediment, not memory. What must survive a rotation is
+re-injected on every run anyway — which is exactly why `inject:` exists.
+
+---
+
+## 6. `inject:` — the only aperture for consumer state
+
+An `inject:` entry names an argv. Before step 1 of every run, the engine
+executes it with the turn environment and constructed PATH, and **its stdout
+becomes a turn**.
+
+```yaml
+inject:
+  - argv: ["example-cli", "state"]
+    label: "current state"
+```
+
+That is the entire aperture. The engine does not know what the tool returns and
+does not parse it. This is what lets a consumer put arbitrary durable state in
+front of every run without the engine ever acquiring the consumer's domain.
+
+### The hybrid-sentinel contract
+
+**Classification order is fixed: timeout → exit code → stdout.**
+
+| Tool result | Engine behavior |
+|---|---|
+| Times out | **Abort the run**, voiced through the intent path |
+| Exits non-zero | **Abort the run**, voiced |
+| Exits 0, stdout (whole, stripped) is byte-exactly `INJECT_IDLE` | **Inject nothing; the run proceeds.** A reasoned `inject_skipped` event is written |
+| Exits 0, stdout is bare-empty | **Abort, loud** |
+| Anything else | **Inject stdout verbatim** as a turn |
+
+Three things in that table were paid for:
+
+**Bare-empty aborts, `INJECT_IDLE` proceeds.** An earlier draft said "empty
+stdout aborts" *and* "emit nothing when there is genuinely nothing" — mutually
+exclusive sentences that would have bricked the system at its designed success
+state: resolve everything the consumer tracks, and every subsequent run aborts
+forever. A tool with nothing to say must *say* so. **Silence is never a
+contract value** — a crashed pipe and a genuinely idle state must not share an
+observable.
+
+**The sentinel match is byte-exact on the whole stripped stdout** — not a
+prefix, not a regex. A near-miss anchor that could not match what a real
+producer writes is a failure this project has already shipped once.
+
+**`INJECT_IDLE` is deliberately distinct from `NOTHING_TO_REPORT`.** The latter
+is a value the *agent* emits inside turns; the former is a value a *tool* emits
+on stdout. Distinct meanings get distinct tokens — the worst bugs in this
+system's history were semantic overloads, one identifier meaning two things.
+
+---
+
+## 7. The delivery seam — the engine never touches a transport
+
+**The engine evaluates delivery policy. It never performs delivery.**
+
+Per run, the engine evaluates the automation's `notify:` policy — including the
+auto-notify judgment turn and its sentinel, which are mechanism and stay
+engine-side — and emits exactly one **delivery-intent event**:
+
+```json
+{"type": "delivery_intent", "run_id": "…", "automation": "example-check",
+ "session_id": "…", "verdict": "deliver|withhold|demote",
+ "gate": "<one of the closed gate enum>",
+ "reason": "<required, no default>", "text": "<the full final output>"}
+```
+
+alongside `run_started`, `run_completed` (carrying **all** step replies plus
+which was selected as `final_reply` and by what rule), `inject_skipped`,
+`session_rotated`, `automation_error`, and `turn_completed`.
+
+### Why this boundary exists at all
+
+Three independent gates could each silently zero a run's output, and did. An
+automation ran 56 times and produced nothing a human ever saw, and no record
+anywhere said why — the absence looked exactly like "nothing to report."
+
+So the rule is now structural: **a run record without a delivery-intent event
+is an invalid run**, and the engine enforces that on itself. Every gate firing
+is a required, reasoned, queryable record. "N runs, zero intents to deliver" is
+one API call, not an investigation.
+
+`automation_error` events are part of this: a dead automation was log-only once
+and stayed dead for 27 hours. The consumer is expected to surface them.
+
+### Outbox semantics
+
+- **The file** is an append-only, lock-guarded `runs/engine-events.jsonl`. One
+  writer: the engine. Appends are line-atomic and performed inside the lock,
+  with **fsync before releasing on `delivery_intent`** — an intent that only
+  ever existed in the page cache is exactly the failure this seam exists to
+  prevent.
+- **The cursor is a byte offset**, not a sequence number. Byte offsets survive
+  the writer restarting; a per-process counter does not. Events carry no
+  consumer-visible monotonic sequence.
+- **Torn tail**: a reader never parses past the last newline. A partial final
+  line is "not yet written," never an error.
+- **Delivery is at-least-once, and a duplicate beats a drop.** The recommended
+  consumer order is **push-then-persist**, with dedup at record-mint time so a
+  crash-replay is a store-level no-op. The inverse order converts a crash into
+  a silent non-delivery *recorded as delivered* — the original failure, rebuilt
+  at the new boundary.
+
+**Why an outbox and not a webhook:** a webhook to a consumer that is down
+*loses the intent*. The outbox is durable — a consumer offline for an hour
+picks up every intent on restart, in order. The cost is one poll interval
+against turns that take minutes. Accepted.
+
+**Honest residual:** the engine cannot know whether the consumer's *transport*
+succeeded. Intent accounting is the engine's; send accounting is the consumer's.
+"Ran, but never reached a human" is answerable by joining two honest records
+instead of interrogating a silence.
+
+**Declared, not hidden:** the outbox does not rotate today, it grows unbounded,
+and it embeds the full output text of everything the system ever said or
+withheld — a permanent shadow copy, and a sensitivity to name plainly before
+you point this at anything private. Its size, age, and the consumer's cursor
+lag are reported by both `drumbeat doctor` and `GET /api/health`.
+
+---
+
+## 8. The consumer boundary — what the engine is NOT
+
+Each fence rejects a specific temptation this design met and refused.
+
+- **Not a delivery system.** No push, no subscriptions, no quiet hours, no
+  notification store, no transport of any kind.
+- **Not an item tracker.** No items, no priorities, no urgency scoring, no
+  domain objects. `inject:` is the only aperture, and it is domain-blind.
+- **Not a policy owner.** Ships zero automations-as-defaults, zero guidance,
+  zero prompt text. The `examples/` tree is documentation, not defaults:
+  there is **no built-in fallback** if a consumer's files are missing. A
+  missing prompt file is a loud failure, not a quiet substitution.
+- **Not a platform.** No multi-tenancy, no pack registry, no permission model
+  beyond its API key, no trigger grammar beyond `schedule | manual`. The order
+  is *connect → prove → generalize*, never *generalize → connect → hope*.
+- **Not a fork of the agent runtime.** One OS process per turn, `--fresh` once
+  and `--resume` forever, the compaction gap routed around via rotation.
+
+### Where the line actually falls
+
+| Concern | Owner |
+|---|---|
+| When does this run? | **Engine** (scheduler) |
+| What does it do? | Consumer (automation markdown) |
+| What tools exist? | Consumer (packs) |
+| Should this output reach a human? | **Engine evaluates**, emits a verdict + reason |
+| How does it reach a human? | Consumer (delivery worker + transport) |
+| Which session does a reply resume? | Consumer maps its own identifier → session; **engine executes the turn** |
+| What is an "item"? | Consumer, exclusively. The engine has no opinion |
+
+---
+
+## 9. Reply routing — split at the identifier
+
+The load-bearing capability, split so neither side holds the other's state:
+
+```
+client → consumer: "reply to <its own notification identifier>: <text>"
+       → consumer resolves that identifier → session_id   (its map; unknown → 404,
+                                                           "refusing to guess a session")
+       → engine POST /api/turns {session_id, text, origin}
+       → engine acquires the per-session lock   (locked → 423, honest, not queued;
+                                                 unknown session → 404)
+       → 202 {turn_id}; consumer polls GET /api/turns/{turn_id}
+```
+
+- The **mapping** is the consumer's, minted at delivery time, persisted
+  server-side, **never held by a client**.
+- The **turn** is the engine's: the same lock that arbitrates scheduled runs
+  arbitrates replies. One lock namespace, so "two processes resuming one
+  session" cannot re-enter through the new door.
+- **A reply targets the session that produced the notification — by explicit
+  `session_id`, even if the automation has since rotated.** Rotation never
+  destroys transcripts; the reply lands in the conversation it answers.
+- **Never a module-level "current session" anywhere in the chain.** That
+  variable passes every single-conversation test and cross-contaminates every
+  concurrent one. The regression gate is two automations, two sessions, two
+  notifications, replied to independently, each resuming its own.
+- A `423` **must never lose the user's typed text.** The client keeps the draft
+  and re-offers send. Losing typed input on an honest busy signal is a worse
+  failure than the busy signal.
+
+---
+
+## 10. Fail-loud as contract
+
+The single rule that generated most of the specifics above:
+
+> **Every gate that can reduce output writes a reason. Every absence that could
+> be mistaken for "nothing happened" is made into a record instead.**
+
+Concretely, and non-negotiably:
+
+- **No silent fallback.** An unknown session is a 404, never a guess. A missing
+  prompt file is an error, never a built-in default. A duplicate tool name
+  across packs refuses to start, naming both packs, rather than letting load
+  order pick a winner.
+- **Required means required, with no default.** A rotation reason, a delivery
+  intent's reason — the field has no default value, so it cannot be silently
+  omitted.
+- **A skip is a record, never an inference.** `INJECT_IDLE` produces an
+  `inject_skipped` event naming the tool and its label.
+- **Listings can say "this has never fired."** An automation that is enabled
+  but structurally unfireable renders as unfireable in the one listing
+  everything reads, instead of looking healthy and doing nothing.
+- **Timestamps are explicit-UTC ISO-8601; rendering is the client's job.**
+- **A partial success is a failure.** A step failure aborts the run rather than
+  reporting partial success as success.
+
+Every one of these replaced a real incident where a system did something
+reasonable-looking and nobody could tell it had gone wrong.
+
+---
+
+## 11. Where things live
+
+**Two roots, not one: policy and state.** `--workspace` is *policy* — files a
+human authors, versions, and copies between machines. `--data-dir` is *state* —
+files only the engine writes and no human should ever hand-edit or version.
+They were the same tree by construction until the flag existed, which made
+"the server owns its state" a rule kept by discipline. Separated, it is a
+structural property: **a `git clean -fdx` in a policy repo must be incapable of
+destroying server state, not merely unlikely to.**
+
+```
+<workspace>/                        POLICY -- yours. Put it under git.
+  automations/*.md         the automations (consumer-owned)
+  guidance/*.md            policy files referenced by requires: (consumer-owned)
+  prompts/*.md             engine-loaded prompt text (consumer-owned, no fallback)
+  drumpacks.txt            ordered list of drumpack directories
+  drumpacks/<name>/        in-workspace drumpacks (drumpack.md + bin/)
+  injectors.yaml           turn-context injectors, optional (see docs/INJECTORS.md)
+  bin/                     workspace-local executables, on the turn PATH
+
+<data-dir>/                         STATE -- the engine's. Never version it.
+  <slug>/<run_id>/         result.json, step-NN.txt, stderr.log
+  engine-events.jsonl      the delivery-intent outbox (engine-written)
+  session_pins.json        which conversation each automation resumes
+  session_rotations.jsonl
+  session_contracts.json
+  automation_errors.jsonl
+  vocabulary_errors.jsonl
+  api_key
+  .scheduler.lock  .scheduler.drain  .session-locks/
+```
+
+`--data-dir` **defaults to `<workspace>/runs`** — the pre-split layout, byte
+for byte, because behavior preservation is the point of introducing a seam
+before anyone moves through it. That default puts state *inside* the policy
+tree, which is exactly what the split exists to prevent, so `drumbeat doctor`
+reports a containment warning whenever the data dir resolves inside a
+git-tracked workspace. **Pass `--data-dir` explicitly the moment your workspace
+becomes a git checkout.**
+
+**A data-dir resident's address is a property of the data dir, never of a
+process's or a turn's cwd.** This is stated as an invariant because it was
+learned twice, the hard way: consumer tools that resolved their store as
+`./runs`, and the engine's own log modules that captured `Path.cwd()` at
+import, both silently followed the workspace when the two roots split apart —
+writing state into the policy tree, where `.gitignore` made it invisible. The
+engine exports `DRUMBEAT_DATA_DIR` into every turn's environment for exactly
+this reason; anything that keeps state should resolve it from there, not from
+where it happened to be started.
+
+**Single writer per file, across the boundary.** This is what makes a shared
+directory safe between the engine and its consumer. No engine-written file is
+ever written by the consumer, and no consumer-written file is ever written by
+the engine.
+
+**`<slug>/<run_id>/` is not only scheduled automations.** A bare-`session_id`
+turn accepted at `POST /api/turns` — the notification / Conversation **reply**
+path — is persisted here too, under a slug derived from the session id, so a
+typed reply is retrievable via the same runs API as an automation run (see
+`runner._persist_session_turn`).
+
+**Realtime voice-call transcripts do NOT live in this data-dir.** A voice call
+never reaches drumbeat: the gateway mints the realtime session and the device
+streams straight to the provider. A voice call's turn-by-turn record is written
+by the upstream voice **gateway**, not here — a voice call never invokes
+drumbeat's turn path, so drumbeat's `runs/` holds no voice-session records.
+
+---
+
+## 12. Reading order
+
+| You want to | Read |
+|---|---|
+| Write your first automation | [`AUTOMATIONS.md`](AUTOMATIONS.md) |
+| Give the agent tools | [`DRUMPACKS.md`](DRUMPACKS.md) |
+| Make an automation actually good | [`TUNING.md`](TUNING.md) |
+| Copy a working starting point | [`../examples/`](../examples) |
+| Copy the `inject:` pattern | [`../tests/packs/minimal/`](../tests/packs/minimal) |

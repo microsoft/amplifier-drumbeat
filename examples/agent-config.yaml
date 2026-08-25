@@ -1,0 +1,72 @@
+# agent-config.yaml — layered agent config for a drumbeat workspace
+#
+# COPY THIS FILE to your workspace root (beside drumpacks.txt) to take effect. It is
+# OPTIONAL: with no file, every automation and every turn runs on the bundle's
+# default provider/model, exactly as before this existed.
+#
+# WHAT IT DOES. This is the single place an owner shapes which provider, model,
+# MCP servers, skills, and debug knobs a run is handed — in amplifier-agent's
+# OWN host-config vocabulary. drumbeat merges up to five layers into ONE host
+# config it hands amplifier-agent via `--config`; it never invents a second
+# model-resolution mechanism. Lowest precedence first:
+#
+#   1. $AMPLIFIER_AGENT_CONFIG — the operator's own debug/host config (env), the base.
+#   2. this file's `default:`  — the baseline merged into EVERY automation and turn.
+#   3. a named `profile`       — chosen per interactive/API turn (see `profiles:` below).
+#   4. an automation's own `agent_config:` frontmatter block.
+#   5. `prompt_caching: false` sugar (deprecated alias).
+#
+# MERGE RULES (deliberately boring so you can predict the result): two mappings
+# at the same key recurse; a scalar or a list REPLACES wholesale; a `null`
+# anywhere is REFUSED (v1 has no deletion semantics).
+#
+# CLOSED top-level vocabulary for every layer (default AND each profile):
+# `provider | providers | mcp | skills | debug`. Any other top-level key, and
+# `approval` / `allowProtocolSkew` by name, are a loud refusal.
+#
+# CREDENTIALS NEVER LIVE HERE. Any credential-bearing key (api_key / apiKey /
+# token / secret / authorization, case-insensitive) at ANY depth is refused —
+# amplifier-agent re-asserts credentials from the ENGINE ENVIRONMENT after this
+# overlay, so a value here is both silently ignored and (in a committed file) a
+# leaked secret. Set OPENAI_API_KEY / ANTHROPIC_API_KEY / OLLAMA_HOST in the
+# engine environment instead.
+
+# ── default: the baseline every automation and every turn starts from ──────────
+# Omit this whole block to leave the bundle default untouched as the baseline.
+default:
+  provider:
+    config:
+      # Turn on prompt caching for every run by default, for example.
+      enable_prompt_caching: true
+
+# ── profiles: named overlays a turn selects with `profile: <name>` ─────────────
+# OPEN VOCABULARY — the names are yours. An interactive/API turn carries
+# `{"profile": "quick", ...}` on POST /api/turns; the named profile is folded in
+# as layer 3 of the merge above. A turn that names NO profile just uses `default:`.
+# An UNKNOWN profile name is refused loud, listing the profiles you defined here.
+profiles:
+  # A cheap, latency-sensitive turn: run it on the provider's fast model,
+  # same provider as the bundle default (omit `module` to keep it).
+  quick:
+    provider:
+      config:
+        default_model: claude-3-5-haiku-latest
+
+  # A heavier turn: pin an explicit provider + a stronger model.
+  deep:
+    provider:
+      module: anthropic
+      config:
+        default_model: claude-sonnet-4-latest
+
+  # Point a turn at a LOCAL, OpenAI-compatible endpoint. `base_url` is folded
+  # into provider.config; the API key still comes from the environment
+  # (OPENAI_API_KEY), never this file.
+  local:
+    provider:
+      module: openai
+      config:
+        default_model: qwen3.6-35b-a3b
+        base_url: http://192.168.1.7:8081/v1
+        use_streaming: false
+        max_tokens: 512
