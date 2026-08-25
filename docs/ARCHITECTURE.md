@@ -93,16 +93,24 @@ automation:
   requires:
     - example-cli
     - guidance/EXAMPLE.md
+  steps:
+    - id: load-guidance
+      prompt: Load and follow guidance/EXAMPLE.md.
+    - id: check-source
+      prompt: Check the source and tell me what needs my attention.
+    - id: read-only-guard
+      prompt: This is a read-only run; do not send or modify anything.
 ---
 
-1. Load and follow guidance/EXAMPLE.md.
-2. Check the source and tell me what needs my attention.
-3. This is a read-only run: do not send anything, do not modify anything.
+Optional human-facing description. Never parsed for execution.
 ```
 
-The body is an **ordered list of freeform natural-language steps**. There is no
-branching, no looping, no variables, no per-step types, and no expression
-language. That is deliberate — see §8.
+`steps:` is an **ordered list of structured step objects** (`{id, prompt,
+label?}`) in the frontmatter — see [`../contracts/automation-file.v1.md`](../contracts/automation-file.v1.md).
+Each `prompt` is one freeform natural-language turn; there is no branching, no
+looping, no variables, no per-step types, and no expression language. That is
+deliberate — see §8. The markdown body is a human-facing description and is
+never parsed for execution.
 
 Full authoring reference: [`AUTOMATIONS.md`](AUTOMATIONS.md).
 

@@ -74,6 +74,10 @@ import sys
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from drumbeat.automation import Step
 
 from drumbeat import session_pins
 from drumbeat.fsutil import atomic_write
@@ -161,34 +165,43 @@ def detect_ceiling_hit(text: str) -> CeilingHit | None:
     return max(hits, key=lambda h: h.prompt_tokens)
 
 
-def contract_fingerprint(steps: Sequence[str]) -> str:
-    """Stable sha256 over an automation's ordered steps.
+def contract_fingerprint(steps: Sequence[Step]) -> str:
+    """Stable sha256 over an automation's ordered step **prompts**.
 
-    Deliberately covers the **steps only**, never the frontmatter. The
-    steps are the contract; everything else in the file is authoring
-    metadata that must be editable without abandoning the conversation.
-    (Historically this mattered doubly: the runner used to write
-    ``session:``/``session_workspace:`` back into the frontmatter, so a
-    whole-file hash would have reported drift against itself on the very
-    next run and rotated forever. Pins are engine state now -- see
-    ``drumbeat.session_pins`` -- but the steps-only scope is unchanged, and
-    is what makes the fingerprint stable across this migration.)
+    Deliberately covers the step prompts only -- never the frontmatter, and
+    never a step's ``id`` or ``label``. The prompt text is the contract the
+    pinned session obeys; the ``id`` is engine-facing identity and the
+    ``label`` is human display, both of which must be editable without
+    abandoning the conversation. Hashing the prompt text (and only that) is
+    also what makes this fingerprint stable across the steps-to-frontmatter
+    migration: a step whose prompt is unchanged keeps its fingerprint even
+    though it moved from the markdown body into ``steps:``, so an existing
+    pinned session is not needlessly rotated by the format change alone.
+
+    (Historically the steps-only scope mattered doubly: the runner used to
+    write ``session:``/``session_workspace:`` back into the frontmatter, so a
+    whole-file hash would have reported drift against itself on the very next
+    run and rotated forever. Pins are engine state now -- see
+    ``drumbeat.session_pins`` -- but the prompt-only scope is unchanged.)
 
     Args:
-        steps: the automation's ordered, stripped step texts.
+        steps: the automation's ordered ``Step`` objects.
 
     Returns:
         Lowercase hex sha256 digest.
 
     Example:
-        >>> contract_fingerprint(["a", "b"]) == contract_fingerprint(["a", "b"])
+        >>> from types import SimpleNamespace as S
+        >>> contract_fingerprint([S(prompt="a"), S(prompt="b")]) == \
+        ...     contract_fingerprint([S(prompt="a"), S(prompt="b")])
         True
-        >>> contract_fingerprint(["a", "b"]) == contract_fingerprint(["a", "c"])
+        >>> contract_fingerprint([S(prompt="a"), S(prompt="b")]) == \
+        ...     contract_fingerprint([S(prompt="a"), S(prompt="c")])
         False
     """
     h = hashlib.sha256()
     for step in steps:
-        h.update(step.strip().encode("utf-8"))
+        h.update(step.prompt.strip().encode("utf-8"))
         h.update(b"\x00")
     return h.hexdigest()
 
@@ -311,7 +324,7 @@ def read_contract(session_id: str, *, runs_dir: Path) -> str | None:
 
 
 def contract_drift(
-    *, session_id: str, steps: Sequence[str], runs_dir: Path
+    *, session_id: str, steps: Sequence[Step], runs_dir: Path
 ) -> tuple[bool, str | None]:
     """Has this session's automation been rewritten since it was created?
 

@@ -191,9 +191,10 @@ automation:
 {delivery_line}\
   requires:
     - guidance/IDENTITY.md
+  steps:
+    - id: do-the-thing
+      prompt: Do the thing.
 ---
-
-1. Do the thing.
 """
 
 

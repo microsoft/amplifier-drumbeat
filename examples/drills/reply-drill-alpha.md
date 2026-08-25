@@ -7,6 +7,10 @@ automation:
   notify: always
   requires:
     - guidance/IDENTITY.md
+  steps:
+    - id: step-1
+      prompt: |-
+        Migration drill for decomposition step 5. Your secret token is ALPHA-11 -- memorise it for this whole conversation, and if anyone later asks for your token, answer with it. Right now, answer with exactly this sentence and nothing else: Sentinel one holds the north gate. Do not use any tools.
 ---
 
-1. Migration drill for decomposition step 5. Your secret token is ALPHA-11 -- memorise it for this whole conversation, and if anyone later asks for your token, answer with it. Right now, answer with exactly this sentence and nothing else: Sentinel one holds the north gate. Do not use any tools.
+Migration drill: session continuity + reply routing.

@@ -96,6 +96,22 @@ class InjectView:
 
 
 @dataclass(frozen=True)
+class StepView:
+    """One structured automation step: identity (``id``), behavior (``prompt``).
+
+    Mirrors :class:`drumbeat.automation.Step` for the surface layer. ``label``
+    is ``None`` when the step declares no human display name.
+    """
+
+    id: str
+    prompt: str
+    label: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"id": self.id, "prompt": self.prompt, "label": self.label}
+
+
+@dataclass(frozen=True)
 class AutomationSummary:
     """The at-a-glance shape for a listing -- no steps, no body."""
 
@@ -136,7 +152,7 @@ class AutomationDetail:
     trigger: TriggerView
     notify: str
     requires: tuple[str, ...]
-    steps: tuple[str, ...]
+    steps: tuple[StepView, ...]
     inject: tuple[InjectView, ...]
     guidance_delivery: str
     step_count: int
@@ -151,7 +167,7 @@ class AutomationDetail:
             "trigger": self.trigger.to_dict(),
             "notify": self.notify,
             "requires": list(self.requires),
-            "steps": list(self.steps),
+            "steps": [s.to_dict() for s in self.steps],
             "inject": [i.to_dict() for i in self.inject],
             "guidance_delivery": self.guidance_delivery,
             "step_count": self.step_count,
@@ -214,7 +230,7 @@ def _detail(a: Automation) -> AutomationDetail:
         trigger=TriggerView(a.trigger.type, a.trigger.expression),
         notify=a.notify,
         requires=tuple(a.requires),
-        steps=tuple(a.steps),
+        steps=tuple(StepView(id=s.id, prompt=s.prompt, label=s.label) for s in a.steps),
         inject=tuple(InjectView(argv=s.argv, label=s.label) for s in a.inject),
         guidance_delivery=a.guidance_delivery,
         step_count=len(a.steps),

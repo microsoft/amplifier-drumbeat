@@ -55,9 +55,10 @@ automation:
     type: schedule
     expression: every 30 minutes
   notify: auto
+  steps:
+    - id: do-the-thing
+      prompt: Do the thing.
 ---
-
-1. Do the thing.
 """
 
 

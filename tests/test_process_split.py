@@ -465,8 +465,10 @@ def test_post_with_key_reaches_the_handler(engine_server):
         "  trigger:\n"
         "    type: manual\n"
         "  notify: never\n"
-        "---\n\n"
-        "1. do nothing\n"
+        "  steps:\n"
+        "    - id: do-nothing\n"
+        "      prompt: do nothing\n"
+        "---\n"
     )
     status, payload = _post(f"{base}/api/automations", {"content": content}, key=KEY)
     assert status == 201, payload

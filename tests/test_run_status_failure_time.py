@@ -50,9 +50,10 @@ automation:
     type: schedule
     expression: every 30 minutes
   notify: auto
+  steps:
+    - id: first-step
+      prompt: First step.
 ---
-
-1. First step.
 """
 
 _SLUG = "demo"

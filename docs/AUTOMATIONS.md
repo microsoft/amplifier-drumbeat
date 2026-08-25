@@ -1,8 +1,10 @@
 # Authoring automations
 
-An automation is a markdown file. Frontmatter says **when it runs and whether
-anyone hears about it**; the body says **what it does**, in plain language,
-as an ordered list of steps.
+An automation is a markdown file. The frontmatter is the whole machine surface:
+**when it runs, whether anyone hears about it, and what it does** -- the steps
+are a structured `steps:` list (see [`../contracts/automation-file.v1.md`](../contracts/automation-file.v1.md)).
+The markdown body is a human-facing description and is **never parsed for
+execution**.
 
 This is the reference for the format and the conventions that make one work.
 For the design behind it, see [`ARCHITECTURE.md`](ARCHITECTURE.md). For how to
@@ -30,13 +32,21 @@ automation:
   inject:
     - argv: ["example-cli", "state"]
       label: "current state"
+  steps:
+    - id: load-guidance
+      prompt: Load and follow guidance/EXAMPLE.md.
+    - id: check-source
+      prompt: >-
+        Check the source and tell me what needs my attention since your last
+        check.
+    - id: read-only-guard
+      prompt: >-
+        This is a read-only run: do not send anything, do not modify anything.
+        If some part of this cannot be carried out with the tools you have, say
+        so explicitly rather than approximating.
 ---
 
-1. Load and follow guidance/EXAMPLE.md.
-2. Check the source and tell me what needs my attention since your last check.
-3. This is a read-only run: do not send anything, do not modify anything. If
-   some part of this cannot be carried out with the tools you have, say so
-   explicitly rather than approximating.
+Optional human-facing description. This body is never parsed for execution.
 ```
 
 The filename's stem is the automation's **slug** (`example-check.md` →
@@ -55,14 +65,18 @@ it never takes down the other automations' schedules.
 | `name` | yes | Human-readable name, used in reports and notifications |
 | `enabled` | no (default `true`) | Boolean. `false` = parsed and listed, never scheduled |
 | `trigger` | yes | Mapping; see §3 |
+| `steps` | yes | Ordered list of step objects (`{id, prompt, label?}`); see §2.2 and §7 |
 | `notify` | no (default `auto`) | `always` · `auto` · `urgent-only` · `never`; see §4 |
 | `requires` | no (default `[]`) | List of strings: tool names and/or workspace-relative file paths; see §5 |
 | `inject` | no | List of `{argv, label}`; see §6 |
 | `conversation` | no (default `continuous`) | `continuous` · `fresh` · `daily` — how the conversation persists across runs; see §2.1 |
+| `guidance_delivery` | no (default `reference`) | `reference` · `inline` — how required guidance FILES reach the agent; see §5 |
 | `agent_config` | no | Mapping: a per-automation host-config overlay (provider, model, MCP, skills, debug); see §10 |
 
-There is no `session:` key. **The frontmatter is yours; the engine never writes
-to it** — see below.
+This vocabulary is **closed** (contract rule 2): every key above is registered,
+and an unknown or retired top-level key is refused loudly with a remedy at parse
+time — never ignored. There is no `session:` key. **The frontmatter is yours;
+the engine never writes to it** — see below.
 
 ### Session pins are engine state, not part of your file
 
@@ -133,6 +147,38 @@ expression* (§3): the schedule decides **when a run fires**, while
 They are independent — a `daily` conversation on an `every 2 hours` schedule
 runs many times a day but rotates its conversation only on the first run after
 midnight.
+
+### 2.2 · Step anatomy (`steps:`)
+
+`steps:` is a **required, ordered list** of step objects. Each step carries
+exactly three keys, and no others:
+
+| Key | Required | Value |
+|---|---|---|
+| `id` | yes | A slug (lowercase letters, digits, single hyphens), **unique within the file**. It is identity, not control flow — it appears in run records so a run's turns tie back to the declared step, and it survives an edit to the prompt text |
+| `prompt` | yes | Non-empty text; the entirety of the step's behavior, fed as one sequential agent turn |
+| `label` | no | Human display name; carries no behavior |
+
+```yaml
+steps:
+  - id: load-guidance
+    label: Load guidance
+    prompt: Load and follow guidance/EXAMPLE.md.
+  - id: check-source
+    prompt: Check the source and tell me what needs my attention.
+```
+
+Steps execute in array order, one agent turn per step, all within the
+automation's conversation. **A step is judgment (prompt) plus identity (id) and
+nothing operational** — scheduling, notification policy, conversation lifecycle,
+and agent config are whole-automation frontmatter concerns, never per-step. An
+unknown key inside a step, a missing or duplicate `id`, or an empty `prompt` is
+refused loudly with a remedy, exactly like an unknown top-level key.
+
+The contract fingerprint that decides session rotation (see §2.1 and
+[`TUNING.md`](TUNING.md)) covers the ordered step **prompts** only — editing a
+step's `id` or `label`, or the frontmatter around the steps, does not abandon
+the conversation.
 
 ---
 
@@ -319,23 +365,31 @@ Copyable exemplar: [`../tests/packs/minimal/`](../tests/packs/minimal).
 
 ## 7. Writing the steps
 
-The body is an ordered list of natural-language steps. Each is fed as one
-sequential user turn in the same conversation. There is no branching, no
-looping, no variables, no conditionals — if you want a conditional, write the
-condition into the step's prose and let the agent apply judgment.
+The `steps:` list is the ordered set of natural-language steps (§2.2). Each
+step's `prompt` is fed as one sequential user turn in the same conversation.
+There is no branching, no looping, no variables, no conditionals — if you want
+a conditional, write the condition into the prompt's prose and let the agent
+apply judgment.
 
 ### One concern per step
 
 The step boundary is the unit you will edit later. When a run goes wrong, you
-want to change one step, not untangle a paragraph that does four things.
+want to change one step's `prompt`, not untangle a paragraph that does four
+things. A stable `id` per step also means the run records name *which* step
+produced each turn, so a failure points at the step you need to edit.
 
 A shape that works, from automations that have run for months:
 
-```
-1. Load and follow the guidance.          ← policy, no action
-2. Look at the source; report what needs attention.   ← the actual work
-3. Take the safe cleanup actions the guidance authorizes.   ← mutation, scoped
-4. Update the guidance file with anything durable you learned.   ← self-maintenance
+```yaml
+steps:
+  - id: load-guidance      # policy, no action
+    prompt: Load and follow the guidance.
+  - id: check-source       # the actual work
+    prompt: Look at the source; report what needs attention.
+  - id: cleanup            # mutation, scoped
+    prompt: Take the safe cleanup actions the guidance authorizes.
+  - id: self-maintain      # self-maintenance
+    prompt: Update the guidance file with anything durable you learned.
 ```
 
 ### State the negative space
@@ -402,9 +456,9 @@ path**:
 ```yaml
 requires:
   - guidance/EXAMPLE.md
-```
-```
-1. Load and follow guidance/EXAMPLE.md.
+steps:
+  - id: load-guidance
+    prompt: Load and follow guidance/EXAMPLE.md.
 ```
 
 The file is injected verbatim at the top of every run. The convention that has

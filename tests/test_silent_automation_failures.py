@@ -54,9 +54,10 @@ automation:
   trigger:
     type: manual
   notify: never
+  steps:
+    - id: do-the-thing
+      prompt: Do the thing.
 ---
-
-1. Do the thing.
 """
 
 _INJECT_AUTOMATION = """---
@@ -69,9 +70,10 @@ automation:
   inject:
     - argv: ["ledger-items", "inject-turn"]
       label: "open items"
+  steps:
+    - id: do-the-thing
+      prompt: Do the thing.
 ---
-
-1. Do the thing.
 """
 
 _SCHEDULED_AUTOMATION = """---
@@ -82,9 +84,10 @@ automation:
     type: schedule
     expression: every 90 minutes
   notify: never
+  steps:
+    - id: sweep-channels
+      prompt: Sweep the channels.
 ---
-
-1. Sweep the channels.
 """
 
 

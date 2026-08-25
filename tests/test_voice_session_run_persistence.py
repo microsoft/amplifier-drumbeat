@@ -54,9 +54,10 @@ automation:
   trigger:
     type: manual
   notify: never
+  steps:
+    - id: reply
+      prompt: Reply to the message.
 ---
-
-1. Reply to the message.
 """
 
 VOICE_SESSION_ID = "voice-sess-7f3a2b9c"

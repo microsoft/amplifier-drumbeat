@@ -66,9 +66,10 @@ automation:
   trigger:
     type: manual
   notify: {notify}
+  steps:
+    - id: do-the-thing
+      prompt: Do the thing.
 ---
-
-1. Do the thing.
 """
 
 

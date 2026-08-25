@@ -111,10 +111,12 @@ automation:
   # never: this check reads back the turn's own reply; nothing is ever delivered.
   notify: never
   requires: []
+  steps:
+    - id: health-check
+      prompt: |-
+        You are a one-shot install health check. Do exactly what the next turn
+        asks and nothing more.
 ---
-
-1. You are a one-shot install health check. Do exactly what the next turn asks
-   and nothing more.
 """
 
 
