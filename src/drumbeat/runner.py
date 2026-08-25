@@ -31,7 +31,23 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any
+
+# The maintained agent SDK. Every turn is driven through it rather than
+# hand-rolled argv + stream parsing (VISION §3). It is a subprocess-isolated
+# wrapper: one `amplifier-agent run` OS process per `submit()`, exactly the
+# isolation contract this engine already depended on. See docs/ARCHITECTURE.md
+# and evidence/amplifier-agent-issues.md for the properties it does NOT cover
+# (kept here as honest partial adoption).
+from amplifier_agent_py import (
+    PROTOCOL_VERSION_REQUIRED_BY_WRAPPER,
+    AaaError,
+    AssembleArgvInput,
+    ErrorEvent,
+    ResultEvent,
+    assemble_argv,
+    spawn_agent_sync,
+)
 
 from drumbeat import (
     agent_config,
@@ -265,8 +281,15 @@ class StepResult:
     reply: str
     error: str | None
     duration_ms: int
-    tokens_in: int
-    tokens_out: int
+    # Real summed usage counts from the turn's ``usage`` events, or ``None`` when
+    # no usage was reported -- honestly ABSENT, never a fabricated ``0`` (VISION
+    # §4: "a metric that is silently always zero is a defect"). Every failure
+    # path (spawn failure, timeout, lock contention, engine error) leaves these
+    # ``None``: no real turn produced usage, so there is no honest count to
+    # record. Persisted to run records verbatim (``_persist_run``), where a
+    # reader sees a real number or a null, never a lie.
+    tokens_in: int | None
+    tokens_out: int | None
     # ADDITIVE (decomposition step 5; see docs/ARCHITECTURE.md): a machine-readable
     # classification of WHY this turn failed, for the one decision that
     # genuinely depends on it -- "is it safe to resend the user's text
@@ -789,121 +812,95 @@ def _conversation_rotation_reason(
     return None
 
 
+def _ensure_turn_within_arg_limit(text: str) -> None:
+    """Fail loud, named, if one turn's text would breach the OS per-argument ceiling.
+
+    The maintained SDK passes the prompt as a SINGLE positional argv element
+    (``amplifier_agent_py.assemble_argv``), exactly as the old hand-rolled
+    command did -- so the ``MAX_ARG_STRLEN`` / E2BIG ceiling is NOT something the
+    SDK escapes (it spills a large *MCP config* to a tmpfile but never the
+    prompt; see evidence/amplifier-agent-issues.md #7). This belt is KEPT: a
+    turn at or over the ceiling would otherwise fail ``execve`` with an opaque
+    E2BIG inside the SDK, surfacing as a bare ``spawn_failed`` ErrorEvent that
+    loses the named remedy. Raising ``TurnTooLargeError`` here lets
+    ``_execute_turn`` convert it into a persisted run failure carrying the
+    reference-form-guidance remedy, exactly as before.
+    """
+    nbytes = len(text.encode("utf-8"))
+    if nbytes >= MAX_ARG_STRLEN:
+        raise TurnTooLargeError(nbytes=nbytes)
+
+
 def _build_command(
     *,
     session_id: str,
     fresh: bool,
     cwd: Path,
     text: str,
-    ndjson: bool = False,
     host_config_path: Path | None = None,
 ) -> list[str]:
-    cmd = [
-        # SIBLING FIRST, then turn PATH -- the absolute path of the agent
-        # co-installed into this engine's own tool venv (see
-        # ``_resolve_agent_command``). An absolute argv[0] still carries the
-        # ``amplifier-agent run --session-id`` substring drain/staleness match
-        # against (see drain.AGENT_TURN_MARKER), so process detection is
-        # unaffected. Falls back to the bare name only when nothing resolves,
-        # so a genuinely-missing agent still raises the FileNotFoundError that
-        # ``_execute_turn`` turns into a persisted, hinted run failure.
-        _resolve_agent_command(Path(cwd)),
-        "run",
-        "--session-id",
-        session_id,
-        "--fresh" if fresh else "--resume",
-        "--output",
-        "json",
-        "-y",
-        "--cwd",
-        str(cwd),
-    ]
-    if host_config_path is not None:
-        # Per-turn / per-automation agent config. The host config carries this
-        # turn's provider/model selection in amplifier-agent's OWN vocabulary --
-        # e.g. its ``provider.config.default_model`` field, resolved from
-        # ``--config``. drumbeat picks WHICH config (the layered agent-config
-        # merge -- see ``drumbeat.agent_config``); amplifier-agent still does the
-        # actual model resolution. Omitted (None) when the merge is empty, so the
-        # turn keeps the bundle's default model exactly as before.
-        cmd += ["--config", str(host_config_path)]
-    if ndjson:
-        # Chat/reply live-progress callers only (see ``_execute_turn``'s
-        # ``progress_callback`` parameter): swaps amplifier-agent's stderr
-        # display from human-readable text to one JSON-RPC notification per
-        # line (`{"method": ..., "params": ...}`), independent of `--output
-        # json` above, which governs stdout and is unaffected either way.
-        # Scheduled automation runs never pass this -- their stderr.log
-        # keeps its existing human-readable shape.
-        cmd += ["--display", "ndjson"]
-    # Belt: the turn text becomes a SINGLE argv element. If it reaches
-    # MAX_ARG_STRLEN the OS rejects the spawn with an opaque E2BIG before the
-    # agent boots (see the constant's note). Fail loud here, named, at the one
-    # point every turn's argv is actually constructed -- so reference-form
-    # guidance's whole promise (argv stays tiny) is enforced, not merely
-    # intended, and any legacy inline turn that would breach is caught with a
-    # remedy rather than a kernel errno. ``_execute_turn`` converts this into a
-    # persisted run failure; a dry-run surfaces it directly.
-    nbytes = len(text.encode("utf-8"))
-    if nbytes >= MAX_ARG_STRLEN:
-        raise TurnTooLargeError(nbytes=nbytes)
-    # ``--`` terminates amplifier-agent's own option parsing so a prompt that
-    # BEGINS with ``-`` is never mistaken for a flag. A turn-context injector
-    # block leads with ``--- <label> ---`` (see injectors.collect_preamble), so
-    # any interactive turn that carries an injector produced a prompt starting
-    # with ``---`` that amplifier-agent's CLI parsed as an unknown option
-    # ("Error: No such option '--- ...'", exit 2) -- the whole injector feature
-    # was dead on the interactive-turn path. Guard EVERY prompt, not just
-    # injector-led ones: any user/reply text may legitimately start with ``-``.
-    # Verified against amplifier-agent run: ``-- <prompt>`` treats the prompt as
-    # the positional PROMPT even when it begins with ``---``.
-    cmd.append("--")
-    cmd.append(text)
-    return cmd
+    """The EXACT argv the SDK will spawn for this turn.
+
+    Turn execution no longer spawns from this list -- ``spawn_agent_sync`` owns
+    the real spawn (VISION §3, "the invocation goes through the maintained agent
+    SDK rather than hand-rolled argv and stream parsing"). This function exists
+    for two things that genuinely need the argv, and it builds it from the SDK's
+    OWN ``assemble_argv`` so it can never drift from what actually runs:
+
+      * ``drumbeat --dry-run`` prints a real, runnable command line.
+      * ``drain.AGENT_TURN_MARKER`` (``"amplifier-agent run --session-id"``)
+        must appear in the spawned process's ``/proc/<pid>/cmdline``. The SDK
+        spawns ``create_subprocess_exec(binary, *assemble_argv(...))``; argv[0]
+        is the resolved agent binary (basename ``amplifier-agent``), immediately
+        followed by ``run`` then ``--session-id`` -- so the marker is carried
+        exactly as the old hand-rolled command carried it. Proven in
+        ``tests/test_soft_launch_gates.py`` against this function's output.
+
+    ``--display ndjson`` is unconditional now: every turn runs with the typed
+    NDJSON stream so usage events (real token counts, VISION §4) are always
+    available, not just on the interactive progress path. ``-y`` comes from the
+    SDK's ``approval_mode=None`` default. No ``--`` prompt guard is emitted --
+    the SDK does not support one; ``_execute_turn`` keeps the prompt off a
+    leading ``-`` by prepending the now-context line at the very top (see there
+    and evidence/amplifier-agent-issues.md #8).
+    """
+    _ensure_turn_within_arg_limit(text)
+    argv = assemble_argv(
+        AssembleArgvInput(
+            session_id=session_id,
+            prompt=text,
+            protocol_version=PROTOCOL_VERSION_REQUIRED_BY_WRAPPER,
+            resume=not fresh,
+            cwd=str(cwd),
+            config_path=str(host_config_path) if host_config_path is not None else None,
+            display_mode="ndjson",
+        )
+    )
+    # argv[0] resolution is unchanged from the hand-rolled era: SIBLING of
+    # sys.executable first (the agent co-installed into this engine's own tool
+    # venv, kept off the turn PATH by uv), then the turn PATH, then the bare
+    # name. The SDK's own binary discovery only knows AMPLIFIER_AGENT_BIN / PATH
+    # and would miss the sibling, so ``_submit_turn`` hands it this exact path
+    # via ``_binary_resolver`` -- see evidence/amplifier-agent-issues.md #10.
+    return [_resolve_agent_command(Path(cwd)), *argv]
 
 
 def _format_command(cmd: list[str]) -> str:
     return shlex.join(cmd)
 
 
-def _pump_stream(
-    stream,
-    sink: list[str],
-    *,
-    echo_to: TextIO | None,
-    on_line: Callable[[str], None] | None = None,
-) -> None:
-    """Read a subprocess stream line-by-line into sink, optionally echoing live
-    and/or forwarding each line to ``on_line`` (used to parse live NDJSON
-    progress off stderr -- see ``_TurnProgressTracker``). ``on_line`` must
-    never raise; a broken progress sink must not interrupt draining the
-    subprocess's actual stdout/stderr.
-    """
-    for line in stream:
-        sink.append(line)
-        if echo_to is not None:
-            echo_to.write(line)
-            echo_to.flush()
-        if on_line is not None:
-            try:
-                on_line(line)
-            except Exception as exc:  # noqa: BLE001 - progress parsing is best-effort only
-                sys.stderr.write(
-                    f"[runner] progress parsing failed for one line: {exc}\n"
-                )
-
-
 # ---- live progress (Change: chat "what is it doing right now") ----
 #
-# amplifier-agent already emits a stream of NDJSON events on stderr under
-# `--display ndjson` (tool/started, tool/completed, thinking/delta,
-# thinking/final, progress, result/delta, result/final, usage, error --
-# the 9-type canonical taxonomy). Nothing previously consumed this stream
-# for the engine's own turns; `_execute_turn` parsed only the single stdout
-# JSON envelope. This section surfaces the stream, translated into
-# human-safe phrases, for chat/reply turns only (see
-# ``_execute_turn``'s ``progress_callback`` parameter) -- scheduled
-# automation runs are untouched.
+# amplifier-agent emits a stream of NDJSON events on stderr under `--display
+# ndjson` (tool/started, tool/completed, thinking/delta, thinking/final,
+# progress, result/delta, result/final, usage, error -- the 9-type canonical
+# taxonomy). The SDK parses that stream into typed ``NotificationEvent``s
+# (``method`` + ``params``); ``_submit_turn`` feeds each one to the tracker
+# below via ``observe_event`` (no more hand-rolled per-line JSON parsing off a
+# raw pipe). This surfaces the stream, translated into human-safe phrases, for
+# chat/reply turns (see ``_execute_turn``'s ``progress_callback`` parameter);
+# the SAME typed stream also carries the ``usage`` events ``_submit_turn`` sums
+# into real token counts for EVERY turn (VISION §4).
 
 
 @dataclass(frozen=True)
@@ -1082,6 +1079,19 @@ class _TurnProgressTracker:
         params = envelope.get("params")
         if not isinstance(method, str) or not isinstance(params, dict):
             return
+        self.observe_event(method, params)
+
+    def observe_event(self, method: str, params: dict[str, Any]) -> None:
+        """Advance progress from one already-parsed NDJSON notification.
+
+        This is the seam the SDK path drives: ``_submit_turn`` receives typed
+        ``NotificationEvent(method, params)`` values off the SDK's parsed NDJSON
+        stream and calls this directly -- no more hand-rolled per-line JSON
+        parsing off a raw pipe. ``observe_line`` is kept as the wire-line entry
+        point (parses a raw line, then delegates here); it and its tests are
+        unchanged. An unrecognized ``method`` is ignored -- not counted, not
+        guessed -- exactly as before.
+        """
         if method not in _CANONICAL_NDJSON_METHODS:
             return  # unrecognized event type -- don't count it, don't guess
 
@@ -1590,89 +1600,275 @@ def _looks_like_refusal(text: str) -> bool:
     return False
 
 
-def _invoke_turn(
-    cmd: list[str],
-    *,
-    cwd: Path,
-    timeout: int,
-    on_progress: ProgressCallback | None = None,
-    env: dict[str, str] | None = None,
-) -> tuple[int, str, str, bool]:
-    """Run one subprocess turn.
+@dataclass
+class _TurnOutcome:
+    """Normalized result of one SDK-driven turn.
 
-    Streams the child's stderr through to our stderr live (never swallowed)
-    while also capturing it, and captures stdout (the single JSON envelope)
-    in full. Both streams are pumped on background threads so neither pipe
-    buffer filling up can deadlock the wait.
+    The SDK-agnostic seam between ``_submit_turn`` (which speaks the SDK's typed
+    event protocol) and ``_execute_turn`` (which maps to ``StepResult`` and owns
+    the failure taxonomy). It is also the established fake seam for tests: patch
+    ``runner._submit_turn`` to return one of these instead of driving a real
+    agent -- the replacement for the old ``_invoke_turn`` 4-tuple fake.
 
-    ``on_progress``, when given (chat/reply turns only -- see
-    ``_execute_turn``), receives a ``ProgressEvent`` for every recognized
-    NDJSON line on stderr as it arrives -- the caller's command must
-    already include ``--display ndjson`` for this to see anything (see
-    ``_build_command``'s ``ndjson`` parameter). Both stderr behaviors
-    (live echo to our own stderr, and progress parsing) run together;
-    neither replaces the other.
-
-    ``env``, when given, replaces the default subprocess.Popen behavior of
-    inheriting our own os.environ verbatim. ``_execute_turn`` always passes
-    ``_turn_env(cwd, runs_dir=..., session_id=...)`` -- a freshly-built COPY of os.environ
-    per call, never a mutation of the shared global (this function runs
-    concurrently from multiple threads -- scheduled runs and interactive
-    replies both call it -- so mutating ``os.environ`` in place here would be
-    a real cross-thread race; passing a private dict per call has none).
-
-    Returns:
-        (returncode, stdout_text, stderr_text, timed_out)
+    ``tokens_in``/``tokens_out`` are ``None`` when NO ``usage`` event carried
+    real counts -- honestly ABSENT, never a fabricated ``0`` (VISION §4: "a
+    metric that is silently always zero is a defect"). A turn that reported usage
+    carries the summed values (usage is emitted once per LLM call, so summing --
+    not last-wins -- is the only correct aggregation; a trailing rollup event
+    carries 0/0 and would zero a last-wins reader).
     """
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(cwd),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-        env=env,
+
+    reply: str = ""
+    error: str | None = None
+    timed_out: bool = False
+    spawn_failed: bool = False
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+    duration_ms: int = 0
+    stderr_text: str = ""
+
+
+# PATH bridge for the SDK's env model. ``build_env`` filters the child env to an
+# allowlist and REFUSES a per-turn ``PATH`` in ``env.extra`` (PATH is in its
+# BLOCKED_ENV_KEYS), inheriting only ``os.environ["PATH"]``. drumbeat's turns
+# need the pack-augmented turn PATH (``packs.turn_path``) so the agent's bash
+# tool can find pack-provided CLIs -- a load-bearing property the SDK does not
+# cover (evidence/amplifier-agent-issues.md #6). The bridge: set
+# ``os.environ["PATH"]`` to the turn PATH for the brief, SERIALIZED window in
+# which ``spawn_agent_sync`` snapshots ``os.environ`` (it does so once,
+# synchronously, before the turn subprocess is spawned), then restore it.
+# ``turn_path`` is a per-process constant (a serve process has one cwd), so
+# concurrent turns write the identical value; this lock makes save/set/restore
+# atomic so an interleave can never leave PATH mutated.
+_SDK_SPAWN_ENV_LOCK = threading.Lock()
+
+
+def _sdk_env_for_turn(
+    cwd: Path,
+    *,
+    runs_dir: Path,
+    session_id: str | None = None,
+) -> tuple[list[str], dict[str, str], str]:
+    """``(allowlist, extra, turn_path)`` for one SDK turn.
+
+    Preserves the exact child environment the old ``_turn_env`` produced for the
+    agent subprocess: the full ``os.environ`` inherited (allowlist = every
+    current key, matching the old ``dict(os.environ)``), plus the two drumbeat
+    vars the agent's bash tool and any consumer CLI it invokes read
+    (``DRUMBEAT_TURN_SESSION_ID``, ``DRUMBEAT_DATA_DIR``) in ``extra``, plus the
+    pack-augmented turn PATH -- which the SDK cannot accept in ``extra`` and so is
+    applied by the caller via the ``os.environ["PATH"]`` bridge above.
+
+    ``packs.turn_path`` is deliberately NOT wrapped: a workspace whose pack list
+    is broken must fail the run loudly (same discipline as ``_turn_env`` and its
+    module note), not quietly resolve tools off a degraded PATH.
+    """
+    extra: dict[str, str] = {
+        DATA_DIR_ENV_VAR: str(Path(runs_dir).expanduser().resolve()),
+    }
+    if session_id:
+        extra[TURN_SESSION_ID_ENV_VAR] = session_id
+    turn_path = packs.turn_path(cwd)
+    allowlist = list(os.environ.keys())
+    return allowlist, extra, turn_path
+
+
+def _aaa_error_message(exc: AaaError) -> str:
+    """Human-facing string for an SDK ``AaaError`` (remediation, else the code)."""
+    return exc.remediation or exc.code
+
+
+def _error_event_message(event: ErrorEvent) -> str:
+    """Human-facing string for an SDK ``ErrorEvent``.
+
+    Preserves the exact error string drumbeat has always recorded for a non-zero
+    engine exit -- ``"amplifier-agent exited N"`` -- which the SDK reports as code
+    ``engine_exit_<N>``. Run records, failures.log, and downstream assertions key
+    on that string, so translating it here keeps the failure taxonomy stable
+    across the SDK cut. Every other code keeps the SDK's own message plus its code
+    (e.g. ``envelope_missing``, ``engine_hung``) so a reader can still tell a hang
+    from a missing envelope from an envelope-carried engine error.
+    """
+    code = event.code or ""
+    m = re.match(r"engine_exit_(-?\d+)$", code)
+    if m:
+        return f"amplifier-agent exited {m.group(1)}"
+    base = event.message or code
+    if code and code not in base:
+        return f"{code}: {base}"
+    return base
+
+
+def _submit_turn(
+    *,
+    session_id: str,
+    fresh: bool,
+    cwd: Path,
+    text: str,
+    runs_dir: Path,
+    host_config_path: Path | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> _TurnOutcome:
+    """Drive ONE turn through the maintained agent SDK and normalize the outcome.
+
+    Replaces the hand-rolled ``_build_command`` / ``_invoke_turn`` stream pumps /
+    ``_parse_envelope`` stack (VISION §3). The SDK owns: the single-OS-process-
+    per-turn spawn, argv assembly, ``--output json`` envelope parsing with the
+    §4.1 precedence rules, the typed NDJSON event stream (progress + usage), and
+    the timeout -> SIGTERM/SIGKILL escalation on the child's process group.
+
+    On top of that, this adds the drumbeat properties the SDK does NOT itself
+    cover (honest partial adoption -- see evidence/amplifier-agent-issues.md):
+      * #7 the E2BIG argv belt (``_ensure_turn_within_arg_limit`` runs BEFORE any
+        spawn, so it propagates as ``TurnTooLargeError`` and ``_execute_turn``
+        keeps the named reference-form-guidance remedy);
+      * #6 the per-turn PATH bridge (``_SDK_SPAWN_ENV_LOCK``);
+      * #10 handing the SDK drumbeat's OWN resolved agent binary via
+        ``_binary_resolver`` (the SDK's discovery only knows AMPLIFIER_AGENT_BIN
+        / PATH and would miss the tool-venv sibling);
+      * VISION §4 real token counts, by SUMMING ``usage`` events into
+        ``tokens_in``/``tokens_out`` -- or leaving them absent (``None``), never 0.
+
+    Contract: every in-turn failure is returned as a populated
+    ``_TurnOutcome.error``. The only exceptions that escape are ``TurnTooLargeError``
+    (the belt, which ``_execute_turn`` handles explicitly) and ``packs.PackError``
+    from env construction (a broken workspace must fail the run loudly, exactly as
+    the old ``_turn_env`` on the same path did).
+    """
+    _ensure_turn_within_arg_limit(text)  # belt -> TurnTooLargeError, before any spawn
+    agent_bin = _resolve_agent_command(cwd)
+    allowlist, extra, turn_path = _sdk_env_for_turn(
+        cwd, runs_dir=runs_dir, session_id=session_id
     )
 
-    stdout_lines: list[str] = []
+    tokens_in = 0
+    tokens_out = 0
+    saw_usage = False
     stderr_lines: list[str] = []
-
     tracker = (
-        _TurnProgressTracker(on_progress, _load_activity_labels(cwd))
-        if on_progress is not None
+        _TurnProgressTracker(progress_callback, _load_activity_labels(cwd))
+        if progress_callback is not None
         else None
     )
 
-    assert proc.stdout is not None
-    assert proc.stderr is not None
-    stdout_thread = threading.Thread(
-        target=_pump_stream, args=(proc.stdout, stdout_lines), kwargs={"echo_to": None}
-    )
-    stderr_thread = threading.Thread(
-        target=_pump_stream,
-        args=(proc.stderr, stderr_lines),
-        kwargs={
-            "echo_to": sys.stderr,
-            "on_line": tracker.observe_line if tracker is not None else None,
-        },
-    )
-    stdout_thread.start()
-    stderr_thread.start()
+    started = time.monotonic()
 
-    timed_out = False
+    def _elapsed_ms() -> int:
+        return int((time.monotonic() - started) * 1000)
+
+    # Spawn the SDK handle under the PATH bridge. spawn_agent_sync snapshots
+    # os.environ synchronously here (binary discovery + version probe), so the
+    # turn PATH only needs to be in place for this call, not for the whole turn.
     try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        proc.kill()
-        proc.wait()
+        with _SDK_SPAWN_ENV_LOCK:
+            saved_path = os.environ.get("PATH")
+            os.environ["PATH"] = turn_path
+            try:
+                handle = spawn_agent_sync(
+                    session_id=session_id,
+                    resume=not fresh,
+                    cwd=str(cwd),
+                    config_path=(
+                        str(host_config_path) if host_config_path is not None else None
+                    ),
+                    display_mode="ndjson",
+                    env={"allowlist": allowlist, "extra": extra},
+                    timeout_ms=_STEP_TIMEOUT_SECONDS * 1000,
+                    _binary_resolver=lambda: agent_bin,
+                )
+            finally:
+                if saved_path is None:
+                    os.environ.pop("PATH", None)
+                else:
+                    os.environ["PATH"] = saved_path
+    except AaaError as exc:
+        # Raised BEFORE the turn started: binary_not_found, protocol_version_mismatch,
+        # engine_probe_failed, env_injection_rejected, ... No subprocess ran.
+        # binary_not_found is the old spawn FileNotFoundError case -- route it to
+        # the same hinted, agent_command_missing path.
+        return _TurnOutcome(
+            error=_aaa_error_message(exc),
+            spawn_failed=exc.code in ("binary_not_found", "spawn_failed"),
+            duration_ms=_elapsed_ms(),
+        )
+    except Exception as exc:  # noqa: BLE001 - every turn failure becomes StepResult.error
+        return _TurnOutcome(
+            error=f"turn could not be started: {exc}", duration_ms=_elapsed_ms()
+        )
 
-    stdout_thread.join(timeout=5)
-    stderr_thread.join(timeout=5)
-    proc.stdout.close()
-    proc.stderr.close()
+    terminal: ResultEvent | ErrorEvent | None = None
+    try:
+        with handle:
+            for event in handle.submit(text):
+                etype = getattr(event, "type", None)
+                if etype == "notification":
+                    method = event.method
+                    params = event.params if isinstance(event.params, dict) else {}
+                    # Reconstruct a stderr text stream for callers that still
+                    # need one (ceiling detection, run-record stderr.log): under
+                    # --display ndjson the child's stderr IS this notification
+                    # stream. Non-JSON stderr the SDK captured is appended from
+                    # the terminal ErrorEvent's tail below.
+                    stderr_lines.append(json.dumps({"method": method, "params": params}))
+                    if method == "usage":
+                        i = params.get("inputTokens")
+                        o = params.get("outputTokens")
+                        if isinstance(i, int) and isinstance(o, int):
+                            tokens_in += i
+                            tokens_out += o
+                            saw_usage = True
+                    if tracker is not None:
+                        tracker.observe_event(method, params)
+                elif etype in ("result", "error"):
+                    terminal = event
+                # init / activity events are liveness only -- nothing to record.
+    except Exception as exc:  # noqa: BLE001 - never let a turn failure escape as an exception
+        return _TurnOutcome(
+            error=f"turn failed mid-stream: {exc}",
+            duration_ms=_elapsed_ms(),
+            stderr_text="\n".join(stderr_lines),
+            tokens_in=tokens_in if saw_usage else None,
+            tokens_out=tokens_out if saw_usage else None,
+        )
 
-    return proc.returncode, "".join(stdout_lines), "".join(stderr_lines), timed_out
+    duration_ms = _elapsed_ms()
+    tok_in = tokens_in if saw_usage else None
+    tok_out = tokens_out if saw_usage else None
+    stderr_text = "\n".join(stderr_lines)
+
+    if isinstance(terminal, ResultEvent):
+        return _TurnOutcome(
+            reply=terminal.text,
+            error=None,
+            tokens_in=tok_in,
+            tokens_out=tok_out,
+            duration_ms=duration_ms,
+            stderr_text=stderr_text,
+        )
+
+    if isinstance(terminal, ErrorEvent):
+        tail = terminal.stderr_tail
+        if tail:
+            stderr_text = f"{stderr_text}\n{tail}" if stderr_text else tail
+        return _TurnOutcome(
+            error=_error_event_message(terminal),
+            timed_out=terminal.code == "engine_hung",
+            spawn_failed=terminal.code == "spawn_failed",
+            tokens_in=tok_in,
+            tokens_out=tok_out,
+            duration_ms=duration_ms,
+            stderr_text=stderr_text,
+        )
+
+    # The SDK always finalizes with a result or error event; reaching here means
+    # it did not. Report it as an honest failure rather than a silent success.
+    return _TurnOutcome(
+        error="turn produced no terminal result or error event",
+        tokens_in=tok_in,
+        tokens_out=tok_out,
+        duration_ms=duration_ms,
+        stderr_text=stderr_text,
+    )
 
 
 # ---- per-session advisory lock (Fix 1) ----
@@ -1970,20 +2166,6 @@ def reap_stale_session_locks(
     return reaped, skipped_active
 
 
-def _parse_envelope(stdout_text: str) -> dict:
-    try:
-        envelope = json.loads(stdout_text)
-    except json.JSONDecodeError as exc:
-        raise RunnerError(
-            f"malformed JSON envelope on stdout: {exc}\nraw stdout: {stdout_text!r}"
-        ) from exc
-    if not isinstance(envelope, dict):
-        raise RunnerError(
-            f"expected a JSON object envelope, got: {type(envelope).__name__}"
-        )
-    return envelope
-
-
 def _execute_turn(
     *,
     session_id: str,
@@ -2030,70 +2212,39 @@ def _execute_turn(
     text, same discipline ``resume_turn`` already uses for its ledger
     prefix.
     """
-    text = _prepend_now_context(text)
-    # Turn-context injectors: prepend each owner-declared preamble block above
-    # the now-context and the person's own message. Blocks arrive already
-    # rendered and labeled, in policy (file) order; prepending in reverse puts
-    # the first-declared block at the very top and leaves the person's message
-    # last (most salient). An empty tuple leaves the turn unchanged.
+    # Turn-context injectors first, THEN the now-context line at the very top.
+    # Ordering is load-bearing in two ways:
+    #   1. The now-context ("[drumbeat] Current date/time: ...") must be the
+    #      OUTERMOST prefix so the composed prompt ALWAYS begins with a letter,
+    #      never a leading "-". The SDK passes the prompt as a bare positional
+    #      argv element with no "--" option terminator (unlike the old hand-rolled
+    #      command, which appended one) -- and amplifier-agent's CLI would parse a
+    #      turn-context injector block's leading "--- <label> ---" as an unknown
+    #      option (exit 2), killing the injector feature on the interactive path.
+    #      Prepending the now-context LAST keeps every turn's prompt safe without
+    #      a "--" the SDK cannot emit (evidence/amplifier-agent-issues.md #8).
+    #   2. Injector blocks still sit above the person's own message (most-salient
+    #      last), in policy (file) order -- prepending in reverse preserves that.
     for block in reversed(preamble_blocks):
         text = f"{block}\n\n{text}"
+    text = _prepend_now_context(text)
     try:
         with _session_lock(session_id, runs_dir=runs_dir, wait_seconds=wait_seconds):
-            cmd = _build_command(
+            outcome = _submit_turn(
                 session_id=session_id,
                 fresh=fresh,
                 cwd=cwd,
                 text=text,
-                ndjson=progress_callback is not None,
+                runs_dir=runs_dir,
                 host_config_path=host_config_path,
+                progress_callback=progress_callback,
             )
-            returncode, stdout_text, stderr_text, timed_out = _invoke_turn(
-                cmd,
-                cwd=cwd,
-                timeout=_STEP_TIMEOUT_SECONDS,
-                on_progress=progress_callback,
-                env=_turn_env(
-                    cwd,
-                    runs_dir=runs_dir,
-                    session_id=session_id,
-                ),
-            )
-    except FileNotFoundError as exc:
-        # The agent binary itself could not be spawned. Returned as a
-        # StepResult with `.error` set -- exactly the shape SessionLockedError
-        # already uses below -- so this rides the abort path every other turn
-        # failure already takes: the caller sees `result.error`, marks the run
-        # failed, and `_persist_run` writes the run record AND emits the
-        # automation_error event. Raising here instead (the previous behavior,
-        # by omission) skipped every one of those, which is what made a
-        # dead engine indistinguishable from a quiet one. See
-        # AGENT_INSTALL_HINT above.
-        message = f"{exc.strerror or exc}: {exc.filename or _AGENT_COMMAND}\n{AGENT_INSTALL_HINT}"
-        print(f"[runner] turn could not be spawned -- {message}", file=sys.stderr)
-        ci_events.emit(
-            "drumbeat:agent_command_missing",
-            {"session_id": session_id, "command": _AGENT_COMMAND},
-            cwd=cwd,
-        )
-        return (
-            StepResult(
-                index=index,
-                text=text,
-                reply="",
-                error=message,
-                duration_ms=0,
-                tokens_in=0,
-                tokens_out=0,
-            ),
-            "",
-        )
     except TurnTooLargeError as exc:
-        # The belt in _build_command tripped: this turn's text would fail
-        # execve with E2BIG. Ride the same StepResult-with-.error abort path a
-        # spawn failure takes, so the breach lands in the ledger (run record +
-        # failures.log line + automation_error event via _persist_run) instead
-        # of surfacing as an opaque OSError with no record.
+        # The E2BIG belt (_ensure_turn_within_arg_limit, run before any spawn)
+        # tripped: this turn's text would fail execve with E2BIG. Ride the same
+        # StepResult-with-.error abort path a spawn failure takes, so the breach
+        # lands in the ledger (run record + failures.log line + automation_error
+        # event via _persist_run) instead of surfacing as an opaque OSError.
         message = str(exc)
         print(f"[runner] turn too large to spawn -- {message}", file=sys.stderr)
         ci_events.emit(
@@ -2112,8 +2263,8 @@ def _execute_turn(
                 reply="",
                 error=message,
                 duration_ms=0,
-                tokens_in=0,
-                tokens_out=0,
+                tokens_in=None,
+                tokens_out=None,
             ),
             "",
         )
@@ -2134,14 +2285,42 @@ def _execute_turn(
                 reply="",
                 error=str(exc),
                 duration_ms=0,
-                tokens_in=0,
-                tokens_out=0,
+                tokens_in=None,
+                tokens_out=None,
                 error_kind=ERROR_KIND_SESSION_LOCKED,
             ),
             "",
         )
 
-    if timed_out:
+    if outcome.spawn_failed:
+        # The agent binary could not be started (SDK binary_not_found /
+        # spawn_failed). Same shape SessionLockedError uses -- this rides the
+        # abort path every other turn failure takes: the caller sees
+        # `result.error`, marks the run failed, and `_persist_run` writes the run
+        # record AND emits the automation_error event, so a dead engine can never
+        # be mistaken for a quiet one. AGENT_INSTALL_HINT carries drumbeat's own
+        # tool-venv-sibling guidance on top of the SDK's install hint.
+        message = f"{outcome.error}\n{AGENT_INSTALL_HINT}"
+        print(f"[runner] turn could not be spawned -- {message}", file=sys.stderr)
+        ci_events.emit(
+            "drumbeat:agent_command_missing",
+            {"session_id": session_id, "command": _AGENT_COMMAND},
+            cwd=cwd,
+        )
+        return (
+            StepResult(
+                index=index,
+                text=text,
+                reply="",
+                error=message,
+                duration_ms=outcome.duration_ms,
+                tokens_in=None,
+                tokens_out=None,
+            ),
+            outcome.stderr_text,
+        )
+
+    if outcome.timed_out:
         return (
             StepResult(
                 index=index,
@@ -2149,57 +2328,28 @@ def _execute_turn(
                 reply="",
                 error=f"step timed out after {_STEP_TIMEOUT_SECONDS}s",
                 duration_ms=_STEP_TIMEOUT_SECONDS * 1000,
-                tokens_in=0,
-                tokens_out=0,
+                tokens_in=None,
+                tokens_out=None,
             ),
-            stderr_text,
+            outcome.stderr_text,
         )
 
-    if returncode != 0:
-        return (
-            StepResult(
-                index=index,
-                text=text,
-                reply="",
-                error=f"amplifier-agent exited {returncode}",
-                duration_ms=0,
-                tokens_in=0,
-                tokens_out=0,
-            ),
-            stderr_text,
-        )
-
-    try:
-        envelope = _parse_envelope(stdout_text)
-    except RunnerError as exc:
-        return (
-            StepResult(
-                index=index,
-                text=text,
-                reply="",
-                error=str(exc),
-                duration_ms=0,
-                tokens_in=0,
-                tokens_out=0,
-            ),
-            stderr_text,
-        )
-
-    envelope_error = envelope.get("error")
-    metadata = envelope.get("metadata") or {}
-    reply = envelope.get("reply") or ""
-
+    # Success (outcome.error is None) or a plain engine/envelope error -- one
+    # shape. Tokens are real summed usage or honestly absent (None), never 0
+    # (VISION §4); reply is the agent's text on success, "" on an error event;
+    # duration is measured wall-clock (the SDK does not surface the engine's
+    # self-reported durationMs, and a measured elapsed is the honest number).
     return (
         StepResult(
             index=index,
             text=text,
-            reply=reply,
-            error=str(envelope_error) if envelope_error else None,
-            duration_ms=int(metadata.get("durationMs", 0)),
-            tokens_in=int(metadata.get("tokensIn", 0)),
-            tokens_out=int(metadata.get("tokensOut", 0)),
+            reply=outcome.reply,
+            error=outcome.error,
+            duration_ms=outcome.duration_ms,
+            tokens_in=outcome.tokens_in,
+            tokens_out=outcome.tokens_out,
         ),
-        stderr_text,
+        outcome.stderr_text,
     )
 
 

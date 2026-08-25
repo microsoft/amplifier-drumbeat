@@ -16,6 +16,15 @@ dependencies = [
     # tool venv, where the runner resolves it as a sibling of its own
     # interpreter (see runner._resolve_agent_command).
     "amplifier-agent @ git+https://github.com/microsoft/amplifier-agent",
+    # amplifier-agent-py is the maintained SDK the runner drives every turn
+    # through (VISION §3: "the invocation goes through the maintained agent SDK
+    # rather than hand-rolled argv and stream parsing"). It ships in the SAME
+    # repo as the engine, under wrappers/python-py, and like the engine it is
+    # NOT on PyPI and deliberately UNPINNED (floating main) -- the two move
+    # together and the owner accepts the breakage risk. It is a pure Python
+    # package with no runtime deps of its own; it discovers the engine binary
+    # the runner resolves and hands it via `_binary_resolver`.
+    "amplifier-agent-py @ git+https://github.com/microsoft/amplifier-agent#subdirectory=wrappers/python-py",
 ]
 
 [project.scripts]
