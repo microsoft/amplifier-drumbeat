@@ -1,4 +1,4 @@
-# Automation File Contract — v1 (DRAFT — implementation does not yet pass; steps still live in the markdown body)
+# Automation File Contract — v1 (DRAFT — deliberately held un-frozen while sibling contracts are defined; implementation passes and the freeze bar is met in-repo; docs/VISION.md remains the leading doc)
 
 ## Who builds against this
 
@@ -84,6 +84,10 @@ against it · the worked example. Status stays DRAFT and says why until then.
 
 ## Changelog
 
+- **2026-08-25** — Owner review: the contract captures current state (frozen core
+  implemented and merged, conformance fixtures green, worked example shipped —
+  freeze bar 4/4 in-repo). Held loosely / un-frozen by owner decision while the
+  sibling contracts are defined; VISION.md stays the leading doc.
 - **2026-08-25** — v1 drafted. Encodes the negotiated decision: steps move from
   markdown body to frontmatter as minimal `{id, label?, prompt}` objects
   (Scout-informed: prompts as data, zero control-flow schema, config stays
