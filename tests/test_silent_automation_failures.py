@@ -91,18 +91,12 @@ automation:
 """
 
 
-def _success_envelope(reply: str = "ok") -> str:
-    return json.dumps(
-        {"reply": reply, "metadata": {"durationMs": 5, "tokensIn": 3, "tokensOut": 3}}
-    )
-
-
 class _RunFixture(unittest.TestCase):
     """Minimal real workspace/runs_dir/agent-home wiring to drive ``runner.run``.
 
-    The only seam mocked is ``runner._invoke_turn`` -- the established fake
-    for the amplifier-agent subprocess ((returncode, stdout, stderr,
-    timed_out)); everything else is the real code path.
+    The only seam mocked is ``runner._submit_turn`` -- the established fake
+    seam for the SDK-driven turn (see ``runner._TurnOutcome``); everything
+    else is the real code path.
     """
 
     def setUp(self) -> None:
@@ -135,9 +129,9 @@ class _RunFixture(unittest.TestCase):
         path.write_text(body, encoding="utf-8")
         self.automation = load(path)
 
-    def _run(self, *, invoke_return: tuple[int, str, str, bool]) -> runner.RunResult:
+    def _run(self, *, outcome: runner._TurnOutcome) -> runner.RunResult:
         with (
-            mock.patch.object(runner, "_invoke_turn", return_value=invoke_return),
+            mock.patch.object(runner, "_submit_turn", return_value=outcome),
             redirect_stderr(io.StringIO()),
         ):
             return runner.run(
@@ -159,10 +153,14 @@ class TestFailedRunSurfacesItsError(_RunFixture):
             _STEP_AUTOMATION.format(name="Teams Check"), "teams-check.md"
         )
 
-        # returncode 1 -> _execute_turn records step error "amplifier-agent
+        # a failed turn -> _execute_turn records step error "amplifier-agent
         # exited 1" (runner.py). The exact stderr text is irrelevant; the
-        # error string is derived from the returncode.
-        result = self._run(invoke_return=(1, "", "boom on the provider\n", False))
+        # error string is derived from the outcome's error.
+        result = self._run(
+            outcome=runner._TurnOutcome(
+                error="amplifier-agent exited 1", stderr_text="boom on the provider\n"
+            )
+        )
 
         self.assertTrue(result.failed)
         # THE FIX: before it, this was None even though a step carried the
@@ -192,7 +190,11 @@ class TestFailedRunSurfacesItsError(_RunFixture):
         self._write_automation(
             _STEP_AUTOMATION.format(name="Teams Check"), "teams-check.md"
         )
-        result = self._run(invoke_return=(0, _success_envelope(), "", False))
+        result = self._run(
+            outcome=runner._TurnOutcome(
+                reply="ok", tokens_in=3, tokens_out=3, duration_ms=5
+            )
+        )
         self.assertFalse(result.failed)
         self.assertIsNone(result.error)
 
@@ -215,11 +217,9 @@ class TestChatMessageSurfacesItsError(_RunFixture):
     ``TestFailedRunSurfacesItsError`` for the scheduled path.
     """
 
-    def _run_chat(
-        self, *, invoke_return: tuple[int, str, str, bool]
-    ) -> runner.RunResult:
+    def _run_chat(self, *, outcome: runner._TurnOutcome) -> runner.RunResult:
         with (
-            mock.patch.object(runner, "_invoke_turn", return_value=invoke_return),
+            mock.patch.object(runner, "_submit_turn", return_value=outcome),
             redirect_stderr(io.StringIO()),
         ):
             return runner.run_chat_message(
@@ -232,10 +232,14 @@ class TestChatMessageSurfacesItsError(_RunFixture):
     def test_message_turn_failure_reaches_top_level_and_result_json(self) -> None:
         self._write_automation(_STEP_AUTOMATION.format(name="Chat"), "chat.md")
 
-        # returncode 1 -> _execute_turn records step error "amplifier-agent
+        # a failed turn -> _execute_turn records step error "amplifier-agent
         # exited 1" on the identity turn (this automation's one declared
         # step, fired first on a brand-new chat session).
-        result = self._run_chat(invoke_return=(1, "", "boom on the provider\n", False))
+        result = self._run_chat(
+            outcome=runner._TurnOutcome(
+                error="amplifier-agent exited 1", stderr_text="boom on the provider\n"
+            )
+        )
 
         self.assertTrue(result.failed)
         # THE FIX: before it, a caller could reach ``turns[-1].error`` being
@@ -260,7 +264,11 @@ class TestChatMessageSurfacesItsError(_RunFixture):
         have an error manufactured for it.
         """
         self._write_automation(_STEP_AUTOMATION.format(name="Chat"), "chat.md")
-        result = self._run_chat(invoke_return=(0, _success_envelope(), "", False))
+        result = self._run_chat(
+            outcome=runner._TurnOutcome(
+                reply="ok", tokens_in=3, tokens_out=3, duration_ms=5
+            )
+        )
         self.assertFalse(result.failed)
         self.assertIsNone(result.error)
 
@@ -295,7 +303,11 @@ class TestInjectSkippedGuardCatchesOutboxError(_RunFixture):
                 runner.engine_events, "append_event", side_effect=fake_append
             ),
             mock.patch.object(
-                runner, "_invoke_turn", return_value=(0, _success_envelope(), "", False)
+                runner,
+                "_submit_turn",
+                return_value=runner._TurnOutcome(
+                    reply="ok", tokens_in=3, tokens_out=3, duration_ms=5
+                ),
             ),
             redirect_stderr(io.StringIO()),
         ):

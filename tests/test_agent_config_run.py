@@ -1,7 +1,7 @@
 """9h5 end-to-end: the resolver and provider rotation wired into ``runner.run``.
 
-These drive the REAL ``runner.run`` (mocking only ``_invoke_turn`` -- the same
-amplifier-agent-subprocess seam ``test_auto_rotation_and_failure_push`` uses) and
+These drive the REAL ``runner.run`` (mocking only ``_submit_turn`` -- the same
+SDK-turn seam ``test_auto_rotation_and_failure_push`` uses) and
 assert real on-disk side effects. They prove the two load-bearing acceptance
 criteria the unit tests can only prove in pieces:
 
@@ -31,17 +31,12 @@ from drumbeat.automation import load
 from drumbeat.paths import derive_workspace_slug
 
 
-def _success_envelope(reply: str = "ok") -> str:
-    return json.dumps(
-        {"reply": reply, "metadata": {"durationMs": 5, "tokensIn": 3, "tokensOut": 3}}
-    )
-
-
 class _RunnerFixture(unittest.TestCase):
     """Shared workspace/runs_dir/agent-home wiring. House style: drive the REAL
-    ``runner.run``; the only mock is ``runner._invoke_turn`` (the amplifier-agent
-    subprocess seam). ``AMPLIFIER_AGENT_CONFIG`` is pinned empty so a host value
-    cannot leak into the resolver's base layer and perturb these assertions."""
+    ``runner.run``; the only mock is ``runner._submit_turn`` (see
+    ``runner._TurnOutcome``). ``AMPLIFIER_AGENT_CONFIG`` is pinned empty so a
+    host value cannot leak into the resolver's base layer and perturb these
+    assertions."""
 
     def setUp(self) -> None:
         self._tmp = TemporaryDirectory()
@@ -104,9 +99,9 @@ class _RunnerFixture(unittest.TestCase):
         session_dir.mkdir(parents=True)
         (session_dir / "transcript.jsonl").write_text("{}\n", encoding="utf-8")
 
-    def _run(self, *, invoke_return: tuple[int, str, str, bool]) -> runner.RunResult:
+    def _run(self, *, outcome: runner._TurnOutcome) -> runner.RunResult:
         with (
-            mock.patch.object(runner, "_invoke_turn", return_value=invoke_return),
+            mock.patch.object(runner, "_submit_turn", return_value=outcome),
             redirect_stderr(io.StringIO()),
         ):
             return runner.run(
@@ -190,7 +185,7 @@ class TestRunRecordCarriesResolvedConfig(_RunnerFixture):
         )
         self._write_automation(_MODEL_PIN)
 
-        result = self._run(invoke_return=(0, _success_envelope(), "", False))
+        result = self._run(outcome=runner._TurnOutcome(reply="ok", tokens_in=3, tokens_out=3, duration_ms=5))
         self.assertFalse(result.failed)
 
         record = self._result_json(result.run_id)
@@ -219,7 +214,7 @@ class TestPlainAutomationIsUnchanged(_RunnerFixture):
 
     def test_no_config_threads_no_config_and_records_nulls(self) -> None:
         self._write_automation(_PLAIN)
-        result = self._run(invoke_return=(0, _success_envelope(), "", False))
+        result = self._run(outcome=runner._TurnOutcome(reply="ok", tokens_in=3, tokens_out=3, duration_ms=5))
         self.assertFalse(result.failed)
 
         record = self._result_json(result.run_id)
@@ -243,7 +238,7 @@ class TestProviderChangeAutoRotatesOnceThenSelfHeals(_RunnerFixture):
         self._pin_real_session(old_session_id, provider="anthropic")
 
         # ---- A: first run under the changed provider rotates the stale pin ----
-        result_a = self._run(invoke_return=(0, _success_envelope(), "", False))
+        result_a = self._run(outcome=runner._TurnOutcome(reply="ok", tokens_in=3, tokens_out=3, duration_ms=5))
         self.assertFalse(result_a.failed)
 
         rotations = self._rotation_lines()
@@ -266,7 +261,7 @@ class TestProviderChangeAutoRotatesOnceThenSelfHeals(_RunnerFixture):
         )
 
         # ---- B: the very next run does NOT rotate again (same provider) ----
-        result_b = self._run(invoke_return=(0, _success_envelope(), "", False))
+        result_b = self._run(outcome=runner._TurnOutcome(reply="ok", tokens_in=3, tokens_out=3, duration_ms=5))
         self.assertFalse(result_b.failed)
         self.assertEqual(len(self._rotation_lines()), 1)
 
@@ -277,7 +272,7 @@ class TestProviderChangeAutoRotatesOnceThenSelfHeals(_RunnerFixture):
         session_id = f"{self.automation.slug}-20260802T000000Z-bbbbbb"
         self._pin_real_session(session_id, provider="openai")
 
-        result = self._run(invoke_return=(0, _success_envelope(), "", False))
+        result = self._run(outcome=runner._TurnOutcome(reply="ok", tokens_in=3, tokens_out=3, duration_ms=5))
         self.assertFalse(result.failed)
         self.assertEqual(self._rotation_lines(), [])
 

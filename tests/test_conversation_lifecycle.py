@@ -11,7 +11,7 @@ Three lifecycles, one closed vocabulary:
 
 House style, mirroring ``test_auto_rotation_and_failure_push.py``: drive the
 REAL production functions; mock only their inputs. The only seams mocked here
-are ``runner._invoke_turn`` (the amplifier-agent subprocess) and, for the
+are ``runner._submit_turn`` (see ``runner._TurnOutcome``) and, for the
 deterministic daily-boundary tests, ``runner._local_now`` (the single clock the
 daily lifecycle reads). Every rotation is asserted against its real on-disk
 side effects -- the pin store, ``session_rotations.jsonl``, and the outbox --
@@ -51,12 +51,6 @@ automation:
 def _automation_text(*, name: str = "Lifecycle Check", conversation: str | None) -> str:
     line = "" if conversation is None else f"  conversation: {conversation}\n"
     return _AUTOMATION.format(name=name, conversation_line=line)
-
-
-def _success_envelope(reply: str = "ok") -> str:
-    return json.dumps(
-        {"reply": reply, "metadata": {"durationMs": 5, "tokensIn": 3, "tokensOut": 3}}
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -311,8 +305,10 @@ class _RunnerFixture(unittest.TestCase):
             stack.enter_context(
                 mock.patch.object(
                     runner,
-                    "_invoke_turn",
-                    return_value=(0, _success_envelope(), "", False),
+                    "_submit_turn",
+                    return_value=runner._TurnOutcome(
+                        reply="ok", tokens_in=3, tokens_out=3, duration_ms=5
+                    ),
                 )
             )
             if now is not None:

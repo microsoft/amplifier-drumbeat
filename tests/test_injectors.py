@@ -14,12 +14,13 @@ The classification rows mirror the automation-level ``inject:`` contract
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
+from typing import Self
 from unittest import mock
 
 import pytest
+from amplifier_agent_py import ResultEvent
 
 from drumbeat import injectors, packs, runner
 
@@ -30,6 +31,42 @@ def _write_tool(directory: Path, name: str, body: str) -> Path:
     tool.write_text("#!/usr/bin/env bash\n" + body + "\n", encoding="utf-8")
     tool.chmod(0o755)
     return tool
+
+
+class _FakeSpawnHandle:
+    """Stand-in for the SDK's ``SyncSessionHandle`` (Strategy B fakes).
+
+    Captures the prompt(s) submitted to it and replays a fixed sequence of
+    events -- exactly the shape ``runner._submit_turn`` iterates over.
+    """
+
+    def __init__(self, events: list[object], prompts: list[str]) -> None:
+        self._events = events
+        self._prompts = prompts
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+    def submit(self, prompt: str):
+        self._prompts.append(prompt)
+        return iter(self._events)
+
+
+def _fake_spawn_agent_sync(captured: dict, prompts: list[str]):
+    """Build a fake ``spawn_agent_sync`` that captures its kwargs and the
+    turn PATH in effect at spawn time (the bridge ``_submit_turn`` sets), then
+    hands back a ``_FakeSpawnHandle`` that replays a single successful reply.
+    """
+
+    def fake_spawn(**kwargs):
+        captured.update(kwargs)
+        captured["PATH_at_spawn"] = os.environ.get("PATH")
+        return _FakeSpawnHandle([ResultEvent(text="ok")], prompts)
+
+    return fake_spawn
 
 
 def _injector(tool: Path, *, label: str = "test state") -> injectors.Injector:
@@ -294,13 +331,11 @@ class TestInjectorSeam:
         )
         assert blocks == ("--- Working context ---\nFLEET IS NOMINAL",)
 
-        captured: list[dict] = []
-
-        def fake_invoke(cmd, *, cwd, timeout, on_progress=None, env=None):
-            captured.append({"cmd": list(cmd), "env": dict(env or {})})
-            return (0, json.dumps({"reply": "ok", "metadata": {}}), "", False)
-
-        monkeypatch.setattr(runner, "_invoke_turn", fake_invoke)
+        captured: dict = {}
+        prompts: list[str] = []
+        monkeypatch.setattr(
+            runner, "spawn_agent_sync", _fake_spawn_agent_sync(captured, prompts)
+        )
         runner.resume_turn(
             "sess-injected",
             "what's the fleet status?",
@@ -309,8 +344,8 @@ class TestInjectorSeam:
             preamble_blocks=blocks,
         )
 
-        assert len(captured) == 1
-        turn_text = captured[0]["cmd"][-1]
+        assert len(prompts) == 1
+        turn_text = prompts[-1]
         # The injector's label AND its output are in the assembled turn...
         assert "--- Working context ---" in turn_text
         assert "FLEET IS NOMINAL" in turn_text
@@ -328,13 +363,11 @@ class TestInjectorSeam:
         runs = tmp_path / "runs"
         runs.mkdir()
 
-        captured: list[dict] = []
-
-        def fake_invoke(cmd, *, cwd, timeout, on_progress=None, env=None):
-            captured.append({"cmd": list(cmd), "env": dict(env or {})})
-            return (0, json.dumps({"reply": "ok", "metadata": {}}), "", False)
-
-        monkeypatch.setattr(runner, "_invoke_turn", fake_invoke)
+        captured: dict = {}
+        prompts: list[str] = []
+        monkeypatch.setattr(
+            runner, "spawn_agent_sync", _fake_spawn_agent_sync(captured, prompts)
+        )
         runner.resume_turn(
             "sess-plain",
             "hello",
@@ -342,8 +375,42 @@ class TestInjectorSeam:
             runs_dir=runs,
             preamble_blocks=(),
         )
-        assert len(captured) == 1
-        turn_text = captured[0]["cmd"][-1]
+        assert len(prompts) == 1
+        turn_text = prompts[-1]
         # No block fence leaked into the turn; PATH is exactly the pack turn path.
         assert "--- " not in turn_text
-        assert captured[0]["env"]["PATH"] == packs.turn_path(workspace)
+        assert captured["PATH_at_spawn"] == packs.turn_path(workspace)
+
+    def test_path_bridge_sets_and_restores_turn_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The PATH bridge in ``runner._submit_turn`` sets ``os.environ["PATH"]``
+        to the pack-augmented turn PATH for the duration of the spawn, and
+        RESTORES it afterward -- replacing the coverage lost from the old
+        env-dict assertion (the SDK no longer accepts a per-turn PATH via
+        ``env.extra``; see runner.py's ``_SDK_SPAWN_ENV_LOCK`` module note).
+        """
+        packs.reset_base_path_for_tests()
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        runs = tmp_path / "runs"
+        runs.mkdir()
+
+        path_before = os.environ.get("PATH")
+
+        captured: dict = {}
+        prompts: list[str] = []
+        monkeypatch.setattr(
+            runner, "spawn_agent_sync", _fake_spawn_agent_sync(captured, prompts)
+        )
+        runner.resume_turn(
+            "sess-path-bridge",
+            "hello",
+            cwd=workspace,
+            runs_dir=runs,
+            preamble_blocks=(),
+        )
+
+        assert captured["PATH_at_spawn"] == packs.turn_path(workspace)
+        # And it must be restored afterward -- never left mutated.
+        assert os.environ.get("PATH") == path_before

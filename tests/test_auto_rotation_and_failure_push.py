@@ -73,22 +73,14 @@ automation:
 """
 
 
-def _success_envelope(reply: str = "ok") -> str:
-    """A well-formed amplifier-agent stdout envelope for a successful turn."""
-    return json.dumps(
-        {"reply": reply, "metadata": {"durationMs": 5, "tokensIn": 3, "tokensOut": 3}}
-    )
-
-
 class _RunnerFixture(unittest.TestCase):
     """Shared workspace/runs_dir/agent-home wiring for every test below.
 
     House style (see test_soft_launch_gates.py): drive the REAL production
     functions; mock only their inputs. The only thing mocked anywhere in
-    this file is ``runner._invoke_turn`` -- the established seam for faking
-    the amplifier-agent subprocess (its exact ``(returncode, stdout_text,
-    stderr_text, timed_out)`` contract is read from ``_invoke_turn`` and
-    ``_execute_turn`` in runner.py, not guessed).
+    this file is ``runner._submit_turn`` -- the established seam for faking
+    the SDK-driven turn (its exact ``_TurnOutcome`` contract is read from
+    ``runner._TurnOutcome`` and ``_execute_turn`` in runner.py, not guessed).
     """
 
     NOTIFY = "never"
@@ -177,9 +169,9 @@ class _RunnerFixture(unittest.TestCase):
         events, _ = engine_events.read_since(self.runs_dir, 0)
         return [e.data for e in events if e.event_type is event_type]
 
-    def _run(self, *, invoke_return: tuple[int, str, str, bool]) -> runner.RunResult:
+    def _run(self, *, outcome: runner._TurnOutcome) -> runner.RunResult:
         with (
-            mock.patch.object(runner, "_invoke_turn", return_value=invoke_return),
+            mock.patch.object(runner, "_submit_turn", return_value=outcome),
             redirect_stderr(io.StringIO()),
         ):
             return runner.run(
@@ -216,7 +208,11 @@ class TestCeilingHitAutoRotatesExactlyOnceThenSelfHeals(_RunnerFixture):
         self._pin_real_session(old_session_id)
 
         # ---- A: the ceiling-failing run -------------------------------
-        result_a = self._run(invoke_return=(1, "", CEILING_STDERR, False))
+        result_a = self._run(
+            outcome=runner._TurnOutcome(
+                error="amplifier-agent exited 1", stderr_text=CEILING_STDERR
+            )
+        )
 
         self.assertTrue(result_a.failed)
         self.assertEqual(result_a.session_id, old_session_id)
@@ -245,7 +241,11 @@ class TestCeilingHitAutoRotatesExactlyOnceThenSelfHeals(_RunnerFixture):
         self.assertEqual(rotated_events[0]["old_session_id"], old_session_id)
 
         # ---- B: the very next run self-heals with a fresh pin ---------
-        result_b = self._run(invoke_return=(0, _success_envelope(), "", False))
+        result_b = self._run(
+            outcome=runner._TurnOutcome(
+                reply="ok", tokens_in=3, tokens_out=3, duration_ms=5
+            )
+        )
 
         self.assertFalse(result_b.failed)
         pin_after_b = session_pins.get(self.automation.slug, runs_dir=self.runs_dir)
@@ -278,7 +278,11 @@ class TestNonCeilingFailureDoesNotRotate(_RunnerFixture):
             "    raise ValueError('boom')\n"
             "ValueError: boom\n"
         )
-        result = self._run(invoke_return=(1, "", ordinary_stderr, False))
+        result = self._run(
+            outcome=runner._TurnOutcome(
+                error="amplifier-agent exited 1", stderr_text=ordinary_stderr
+            )
+        )
 
         self.assertTrue(result.failed)
         self.assertEqual(self._rotation_lines(), [])
@@ -315,7 +319,11 @@ class TestNotifyNeverStillPushesFailure(_RunnerFixture):
         self._pin_real_session(session_id)
 
         ordinary_stderr = "some ordinary tool failure, not a ceiling hit\n"
-        result = self._run(invoke_return=(1, "", ordinary_stderr, False))
+        result = self._run(
+            outcome=runner._TurnOutcome(
+                error="amplifier-agent exited 1", stderr_text=ordinary_stderr
+            )
+        )
 
         self.assertTrue(result.failed)
         # The point: the failure report is a separate channel, not the

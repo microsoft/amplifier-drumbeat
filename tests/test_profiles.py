@@ -23,8 +23,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Self
 
 import pytest
+from amplifier_agent_py import ResultEvent
 
 from drumbeat import agent_config, runner, turns
 from drumbeat.management_api import EngineContext
@@ -326,15 +328,37 @@ def test_submit_turn_refuses_unknown_profile_400_listing_available(
 # ---- end-to-end: a profiled turn runs amplifier-agent with that provider/model ----
 
 
-def _capture_invoke(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
-    """Patch the amplifier-agent subprocess seam; capture each argv, succeed."""
-    captured: list[list[str]] = []
+class _FakeSpawnHandle:
+    """Stand-in for the SDK's ``SyncSessionHandle`` (Strategy B fakes)."""
 
-    def fake_invoke(cmd, *, cwd, timeout, on_progress=None, env=None):
-        captured.append(list(cmd))
-        return (0, json.dumps({"reply": "ok", "metadata": {}}), "", False)
+    def __init__(self, events: list[object], prompts: list[str]) -> None:
+        self._events = events
+        self._prompts = prompts
 
-    monkeypatch.setattr(runner, "_invoke_turn", fake_invoke)
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+    def submit(self, prompt: str):
+        self._prompts.append(prompt)
+        return iter(self._events)
+
+
+def _capture_spawn(monkeypatch: pytest.MonkeyPatch) -> dict:
+    """Patch the SDK spawn seam (``runner.spawn_agent_sync``); capture each
+    call's kwargs -- notably ``config_path``, the ``--config`` a profiled turn
+    threads through the SDK -- and succeed with a fixed reply.
+    """
+    captured: dict = {}
+    prompts: list[str] = []
+
+    def fake_spawn(**kwargs):
+        captured.update(kwargs)
+        return _FakeSpawnHandle([ResultEvent(text="ok")], prompts)
+
+    monkeypatch.setattr(runner, "spawn_agent_sync", fake_spawn)
     return captured
 
 
@@ -359,7 +383,7 @@ def test_quick_profile_runs_amplifier_agent_with_that_provider_model(
     ).path
     assert host_config_path is not None
 
-    captured = _capture_invoke(monkeypatch)
+    captured = _capture_spawn(monkeypatch)
     runner.resume_turn(
         "sess-quick",
         "what's on my calendar?",
@@ -368,12 +392,11 @@ def test_quick_profile_runs_amplifier_agent_with_that_provider_model(
         host_config_path=host_config_path,
     )
 
-    assert len(captured) == 1
-    cmd = captured[0]
-    assert "--config" in cmd, "a profiled turn must hand amplifier-agent a host config"
-    written = json.loads(
-        Path(cmd[cmd.index("--config") + 1]).read_text(encoding="utf-8")
+    config_path = captured.get("config_path")
+    assert config_path is not None, (
+        "a profiled turn must hand the SDK a host config (config_path)"
     )
+    written = json.loads(Path(config_path).read_text(encoding="utf-8"))
     assert written["provider"]["config"]["default_model"] == QUICK_MODEL
 
 
@@ -391,7 +414,7 @@ def test_turn_without_profile_or_config_uses_no_config(
     ).path
     assert host_config_path is None
 
-    captured = _capture_invoke(monkeypatch)
+    captured = _capture_spawn(monkeypatch)
     runner.resume_turn(
         "sess-default",
         "hello",
@@ -400,7 +423,6 @@ def test_turn_without_profile_or_config_uses_no_config(
         host_config_path=host_config_path,
     )
 
-    assert len(captured) == 1
-    assert "--config" not in captured[0], (
+    assert captured.get("config_path") is None, (
         "a turn with no profile and no config must run unchanged, on the default model"
     )

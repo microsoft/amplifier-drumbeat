@@ -141,6 +141,60 @@ class TestAgentCommandPreflight(unittest.TestCase):
         self.assertIn(drain.AGENT_TURN_MARKER, cmdline)
         self.assertIn(staleness._AGENT_TURN_MARKER, cmdline)
 
+    def test_find_agent_turns_detects_a_real_process_carrying_the_marker(self) -> None:
+        """Live-turn detection survives the SDK cut, proven against a REAL
+        process -- not just a synthetically joined argv string.
+
+        The runner no longer spawns the agent with its own ``subprocess.Popen``;
+        the amplifier-agent-py SDK does, via
+        ``create_subprocess_exec(binary, *assemble_argv(...))``. That child's
+        ``/proc/<pid>/cmdline`` is ``<...>/amplifier-agent run --session-id
+        <id> ...`` -- carrying ``drain.AGENT_TURN_MARKER`` exactly as the old
+        hand-rolled command did (argv[0] basename ``amplifier-agent``, then
+        ``run`` then ``--session-id``, all adjacent). ``drain`` and ``staleness``
+        detect a live turn by substring-matching that marker in ``/proc``, and
+        that answer gates whether it is safe to stop the scheduler -- a false
+        all-clear is the failure this guards.
+
+        Spawn a stand-in whose argv reproduces that exact cmdline shape (the
+        trailing tokens are inert ``sys.argv`` to a sleeper) and assert
+        ``drain.find_agent_turns`` finds it by pid. Read-only: ``drain`` never
+        signals anything, and this test kills only its own child.
+        """
+        import subprocess
+        import sys
+        import time
+
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import time; time.sleep(30)",
+                "amplifier-agent",
+                "run",
+                "--session-id",
+                "probe-marker-test",
+            ],
+        )
+        try:
+            deadline = time.time() + 5.0
+            found = False
+            while time.time() < deadline:
+                if any(t.pid == proc.pid for t in drain.find_agent_turns()):
+                    found = True
+                    break
+                time.sleep(0.05)
+            self.assertTrue(
+                found,
+                "drain.find_agent_turns did not detect a live process carrying "
+                "the SDK-spawned agent cmdline marker",
+            )
+            # staleness answers the same question through the same reader.
+            self.assertGreaterEqual(staleness.count_agent_turns_in_flight() or 0, 1)
+        finally:
+            proc.kill()
+            proc.wait()
+
     def test_spawn_failure_returns_a_step_result_not_a_raise(self) -> None:
         """The load-bearing half: a spawn death must ride the ordinary abort
         path (StepResult with .error) so `_persist_run` writes a run record
@@ -152,9 +206,10 @@ class TestAgentCommandPreflight(unittest.TestCase):
             with (
                 mock.patch.object(
                     runner,
-                    "_invoke_turn",
-                    side_effect=FileNotFoundError(
-                        2, "No such file or directory", "amplifier-agent"
+                    "_submit_turn",
+                    return_value=runner._TurnOutcome(
+                        spawn_failed=True,
+                        error="amplifier-agent binary not found: install it",
                     ),
                 ),
                 redirect_stderr(io.StringIO()),
