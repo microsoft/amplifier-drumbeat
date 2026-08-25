@@ -368,9 +368,10 @@ def _auto(block: str = "", *, name: str = "Demo") -> str:
         "  trigger:\n"
         "    type: manual\n"
         f"{block}"
+        "  steps:\n"
+        "    - id: do-it\n"
+        "      prompt: Do it.\n"
         "---\n"
-        "\n"
-        "1. Do it.\n"
     )
 
 

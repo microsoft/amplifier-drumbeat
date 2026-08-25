@@ -37,11 +37,14 @@ automation:
   inject:
     - argv: ["items-cli", "inject-turn"]
       label: "open items"
+  steps:
+    - id: first-step
+      prompt: First step, which spans two lines.
+    - id: second-step
+      prompt: Second step.
 ---
 
-1. First step, which spans
-   two lines.
-2. Second step.
+An email triage automation. Steps live in the frontmatter.
 """
 
 _MANUAL_AUTOMATION = """---
@@ -51,9 +54,10 @@ automation:
   trigger:
     type: manual
   notify: never
+  steps:
+    - id: do-the-thing
+      prompt: Do the thing.
 ---
-
-1. Do the thing.
 """
 
 _BROKEN_AUTOMATION = """---
@@ -134,8 +138,11 @@ class AutomationManagerTests(unittest.TestCase):
         self.assertEqual(detail.name, "Email Check")
         self.assertEqual(detail.trigger.expression, "every 45 minutes")
         self.assertEqual(
-            detail.steps,
-            ("First step, which spans\ntwo lines.", "Second step."),
+            [(s.id, s.prompt, s.label) for s in detail.steps],
+            [
+                ("first-step", "First step, which spans two lines.", None),
+                ("second-step", "Second step.", None),
+            ],
         )
         self.assertEqual(detail.requires, ("mail-cli", "guidance/EMAIL.md"))
         self.assertEqual(len(detail.inject), 1)
@@ -191,8 +198,11 @@ class AutomationManagerTests(unittest.TestCase):
             "# PLACEHOLDER tool names -- substitute whatever your packs provide.",
             new_text,
         )
-        self.assertIn("1. First step, which spans\n   two lines.", new_text)
-        self.assertIn("2. Second step.", new_text)
+        # Steps live in the frontmatter now; the surgical schedule edit must
+        # leave them (and the human-facing body) byte-for-byte intact.
+        self.assertIn("prompt: First step, which spans two lines.", new_text)
+        self.assertIn("prompt: Second step.", new_text)
+        self.assertIn("Steps live in the frontmatter.", new_text)
 
     def test_edit_schedule_accepts_daily_expression_with_colon(self) -> None:
         path = self._write("email-check.md", _SCHEDULE_AUTOMATION)

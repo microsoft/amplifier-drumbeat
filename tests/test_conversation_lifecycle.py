@@ -41,9 +41,10 @@ automation:
   trigger:
     type: manual
   notify: never
-{conversation_line}---
-
-1. Do the thing.
+{conversation_line}  steps:
+    - id: do-the-thing
+      prompt: Do the thing.
+---
 """
 
 

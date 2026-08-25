@@ -315,7 +315,7 @@ def get_automation_detail(slug: str, ctx: EngineContext) -> dict[str, Any]:
     return {
         **_automation_summary(a),
         "content": content,
-        "steps": a.steps,
+        "steps": [{"id": s.id, "prompt": s.prompt, "label": s.label} for s in a.steps],
         **_status_fields(a, runs_dir=ctx.runs_dir, pins=pins, pins_error=pins_error),
     }
 

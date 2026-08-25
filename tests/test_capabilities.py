@@ -57,8 +57,10 @@ def _automation(directory: Path, slug: str, requires: list[str]) -> Path:
         "  notify: never\n"
         "  requires:\n"
         f"{required}\n"
-        "---\n\n"
-        "1. Do the thing.\n",
+        "  steps:\n"
+        "    - id: do-the-thing\n"
+        "      prompt: Do the thing.\n"
+        "---\n",
         encoding="utf-8",
     )
     return path

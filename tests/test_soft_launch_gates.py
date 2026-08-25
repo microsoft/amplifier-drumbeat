@@ -39,9 +39,10 @@ automation:
     type: schedule
     expression: {expression}
   notify: {notify}
+  steps:
+    - id: say-something
+      prompt: Say something.
 ---
-
-1. Say something.
 """
 
 
@@ -253,59 +254,70 @@ class TestScheduleValidatedOnSave(unittest.TestCase):
             ctx = self._ctx(_workspace(tmp))
             content = (
                 "---\nautomation:\n  name: Manual\n  enabled: true\n"
-                "  trigger:\n    type: manual\n  notify: always\n---\n\n1. Do it.\n"
+                "  trigger:\n    type: manual\n  notify: always\n"
+                "  steps:\n    - id: do-it\n      prompt: Do it.\n---\n"
             )
             self.assertTrue(validate_automation_content(content, ctx)["valid"])
 
 
-class TestLeadingProseIsRefused(unittest.TestCase):
-    """RED-PROVEN twice. Against the parser: a body opening with a prose
-    paragraph validated `{'valid': True}` with the paragraph absent from
-    steps -- author-written instruction, silently dropped. Against the live
-    deployment: the reference packet's reconciliation automation opened with
-    exactly such a paragraph, unread on every run (the council's exemplar
-    sweep missed it; the halt rule caught it before the refusal shipped and
-    stopped a running automation).
+class TestBodyStepsAreRetired(unittest.TestCase):
+    """The retired body-steps shape (contract automation-file.v1, rule 1).
+
+    Steps are structured frontmatter data now; the markdown body is a
+    human-facing description that is never parsed for execution. A body that
+    still carries a numbered list -- the old step shape -- is refused loudly
+    with a pointer to the contract. This is a CLEAN CUT: the body-steps shape
+    is never dual-read.
+
+    RED-PROVEN history the cut retires: before it, a numbered body was the ONLY
+    place steps lived, so a body that silently stopped being parsed would run
+    an automation with no steps at all. The refusal is what makes the migration
+    loud instead of silent.
     """
 
-    def _body(self, body: str) -> str:
+    def _with_steps_and_body(self, body: str) -> str:
         return (
             "---\nautomation:\n  name: Prose Drill\n  enabled: true\n"
             "  trigger:\n    type: schedule\n    expression: every 30 minutes\n"
-            "  notify: always\n---\n\n" + body
+            "  notify: always\n  steps:\n    - id: do-a-thing\n"
+            "      prompt: Do a thing.\n---\n\n" + body
         )
 
-    def test_leading_prose_is_refused_naming_the_fix(self) -> None:
+    def test_numbered_body_is_refused_pointing_at_the_contract(self) -> None:
         from drumbeat.automation import AutomationError, load_from_text
 
         with self.assertRaises(AutomationError) as caught:
             load_from_text(
                 Path("drill.md"),
-                self._body(
-                    "Instructions the agent will never see.\n\n1. Do a thing.\n"
-                ),
+                self._with_steps_and_body("1. A step left behind in the body.\n"),
             )
-        self.assertIn("before step 1", caught.exception.problem)
-        self.assertIn("frontmatter", caught.exception.problem)  # the fix, named
+        problem = caught.exception.problem
+        self.assertIn("body-steps", problem)
+        self.assertIn("automation-file.v1", problem)  # the contract, named
 
-    def test_trailing_twin_still_refuses(self) -> None:
+    def test_numbered_body_is_refused_before_the_missing_steps_check(self) -> None:
+        """The refusal fires on the body shape even with no frontmatter steps."""
         from drumbeat.automation import AutomationError, load_from_text
 
+        text = (
+            "---\nautomation:\n  name: Prose Drill\n  enabled: true\n"
+            "  trigger:\n    type: schedule\n    expression: every 30 minutes\n"
+            "  notify: always\n---\n\n1. Do a thing.\n"
+        )
         with self.assertRaises(AutomationError) as caught:
-            load_from_text(
-                Path("drill.md"),
-                self._body("1. Do a thing.\n\nA trailing paragraph.\n"),
-            )
-        self.assertIn("inside step list", caught.exception.problem)
+            load_from_text(Path("drill.md"), text)
+        self.assertIn("body-steps", caught.exception.problem)
 
-    def test_clean_body_is_untouched(self) -> None:
+    def test_prose_body_is_untouched(self) -> None:
         from drumbeat.automation import load_from_text
 
         automation = load_from_text(
             Path("drill.md"),
-            self._body("1. Do a thing.\n\n2. Do another, with\n   a continuation.\n"),
+            self._with_steps_and_body(
+                "A human-facing description. It can span\nmultiple lines freely.\n"
+            ),
         )
-        self.assertEqual(len(automation.steps), 2)
+        self.assertEqual([s.id for s in automation.steps], ["do-a-thing"])
 
 
 class TestDuplicateSlugIsALoadFailure(unittest.TestCase):

@@ -23,7 +23,7 @@ import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 
-from drumbeat.automation import load_from_text
+from drumbeat.automation import Step, load_from_text
 from drumbeat.runner import _URGENT_MARKER_RE
 
 from drumbeat import session_health, session_pins
@@ -46,10 +46,12 @@ automation:
     type: schedule
     expression: every 30 minutes
   notify: auto
+  steps:
+    - id: first-step
+      prompt: First step.
+    - id: second-step
+      prompt: Second step.
 ---
-
-1. First step.
-2. Second step.
 """
 
 
@@ -106,8 +108,15 @@ class TestContractDrift(unittest.TestCase):
 
     def test_fingerprint_is_stable_and_order_sensitive(self) -> None:
         fp = session_health.contract_fingerprint
-        self.assertEqual(fp(["a", "b"]), fp(["a", "b"]))
-        self.assertNotEqual(fp(["a", "b"]), fp(["b", "a"]))
+        a = Step(id="a", prompt="a")
+        b = Step(id="b", prompt="b")
+        self.assertEqual(fp([a, b]), fp([a, b]))
+        self.assertNotEqual(fp([a, b]), fp([b, a]))
+        # Identity/label are authoring metadata, not the contract: a step whose
+        # prompt is unchanged keeps its fingerprint even if its id/label change.
+        self.assertEqual(
+            fp([Step(id="x", prompt="a", label="L")]), fp([Step(id="y", prompt="a")])
+        )
 
     def test_fingerprint_ignores_frontmatter(self) -> None:
         """The load-bearing invariant: the STEPS are the contract.
@@ -134,7 +143,9 @@ class TestContractDrift(unittest.TestCase):
         # contract reading as drifted would rotate every pre-existing
         # session at once.
         drifted, recorded = session_health.contract_drift(
-            session_id="never-recorded", steps=["a"], runs_dir=self.tmp_path
+            session_id="never-recorded",
+            steps=[Step(id="a", prompt="a")],
+            runs_dir=self.tmp_path,
         )
         self.assertFalse(drifted)
         self.assertIsNone(recorded)
@@ -164,7 +175,9 @@ class TestContractDrift(unittest.TestCase):
             runs_dir=self.tmp_path,
         )
         rewritten = self._automation(
-            _AUTOMATION_TEXT.replace("2. Second step.", "2. A different step.")
+            _AUTOMATION_TEXT.replace(
+                "prompt: Second step.", "prompt: A different step."
+            )
         )
         drifted, _ = session_health.contract_drift(
             session_id="demo-1", steps=rewritten.steps, runs_dir=self.tmp_path
@@ -197,7 +210,9 @@ class TestContractDrift(unittest.TestCase):
         buf = io.StringIO()
         with redirect_stderr(buf):
             drifted, recorded = session_health.contract_drift(
-                session_id="demo-1", steps=["a"], runs_dir=self.tmp_path
+                session_id="demo-1",
+                steps=[Step(id="a", prompt="a")],
+                runs_dir=self.tmp_path,
             )
         self.assertFalse(drifted)
         self.assertIsNone(recorded)

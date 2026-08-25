@@ -284,6 +284,14 @@ class StepResult:
     # ``None`` for every other failure, which is the conservative direction:
     # unknown never means resendable.
     error_kind: str | None = None
+    # The declared automation step's ``id`` (contract automation-file.v1, rule
+    # 4: step id appears in run records as identity, not control flow). Set only
+    # for turns that ARE an automation step; ``None`` for the system-prompt,
+    # requirements, inject, and auto-notify turns, which are engine-generated
+    # and correspond to no declared step. Threaded into result.json and the
+    # RUN_COMPLETED event so a run's turns can be tied back to the step that
+    # produced them by identity, surviving a later reordering of the steps.
+    step_id: str | None = None
 
 
 @dataclass
@@ -3503,12 +3511,12 @@ def _run_body(
                 host_config_path=host_config_path,
             )
             print(_format_command(cmd))
-        for i, step_text in enumerate(automation.steps, start=1):
+        for i, step in enumerate(automation.steps, start=1):
             cmd = _build_command(
                 session_id=session_id,
                 fresh=(step_one_is_fresh and i == 1),
                 cwd=cwd,
-                text=_prepend_now_context(step_text),
+                text=_prepend_now_context(step.prompt),
                 host_config_path=host_config_path,
             )
             print(_format_command(cmd))
@@ -3656,9 +3664,10 @@ def _run_body(
                     )
 
     if not failed:
-        for i, step_text in enumerate(automation.steps, start=1):
+        for i, step in enumerate(automation.steps, start=1):
             print(
-                f"[{automation.name}] step {i}/{len(automation.steps)}: {step_text.splitlines()[0][:80]}",
+                f"[{automation.name}] step {i}/{len(automation.steps)} "
+                f"({step.id}): {step.prompt.splitlines()[0][:80]}",
                 file=sys.stderr,
             )
             index = next(turn_index)
@@ -3666,12 +3675,15 @@ def _run_body(
                 session_id=session_id,
                 fresh=(step_one_is_fresh and i == 1),
                 cwd=cwd,
-                text=step_text,
+                text=step.prompt,
                 index=index,
                 runs_dir=runs_dir,
                 wait_seconds=None,
                 host_config_path=host_config_path,
             )
+            # Identity, not control flow: tie this turn's record back to the
+            # declared step by id (contract automation-file.v1, rule 4).
+            result.step_id = step.id
             step_results.append(result)
             stderr_chunks.append((index, stderr_text))
             if result.error:
@@ -4214,9 +4226,10 @@ def run_chat_message(
         # Identity/scope-establishing turns, fired ONCE ever for this pinned
         # session -- exactly like an ordinary automation's numbered steps,
         # just never repeated on later messages.
-        for i, step_text in enumerate(chat_automation.steps, start=1):
+        for i, step in enumerate(chat_automation.steps, start=1):
             print(
-                f"[{chat_automation.name}] identity turn {i}/{len(chat_automation.steps)}",
+                f"[{chat_automation.name}] identity turn {i}/{len(chat_automation.steps)} "
+                f"({step.id})",
                 file=sys.stderr,
             )
             index = next(turn_index)
@@ -4224,7 +4237,7 @@ def run_chat_message(
                 session_id=session_id,
                 fresh=(i == 1),
                 cwd=cwd,
-                text=step_text,
+                text=step.prompt,
                 index=index,
                 runs_dir=runs_dir,
                 wait_seconds=resolved_wait_seconds,
@@ -4541,6 +4554,7 @@ def _persist_run(
             "steps": [
                 {
                     "index": step.index,
+                    "id": step.step_id,
                     "reply": step.reply,
                     "error": step.error,
                     "duration_ms": step.duration_ms,

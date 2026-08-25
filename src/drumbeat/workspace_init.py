@@ -159,29 +159,46 @@ automation:
   # here (and declare their drumpack in drumpacks.txt) when an automation needs
   # one.
   requires: []
+  # Steps are structured frontmatter data (contracts/automation-file.v1.md): an
+  # ordered list, each with an `id` (identity in run records), a `prompt` (the
+  # whole behavior), and an optional `label`. The body below is for humans and
+  # is never parsed for execution.
+  steps:
+    - id: confirm-fire-time
+      label: Confirm the fire time
+      prompt: |-
+        Report the current wall-clock time and confirm this run fired at or
+        after the scheduled time (`daily at 09:00`). Say plainly whether the
+        fire time matched. A scheduled job that quietly drifts is worth
+        catching on its own.
+    - id: gather-digest
+      label: Gather the git status digest
+      prompt: |-
+        For the git repository in the current working directory, gather a short
+        status digest as your reply to THIS step:
+
+        - **Branch** -- the current branch, and whether it is ahead of or behind
+          its upstream.
+        - **Working tree** -- how many files are modified, staged, or untracked;
+          name the most recent few rather than listing everything.
+        - **Recent commits** -- the last handful of commits (short hash +
+          subject) so the digest shows what just landed.
+
+        Use read-only git commands only. Do not commit, push, pull, or change
+        any file -- this automation reports, it does not act.
+    - id: emit-digest
+      label: Emit the complete digest
+      prompt: |-
+        End this step's reply with the complete digest: restate the sections
+        above, unchanged, as one message. If a section has nothing in it, say so
+        plainly and say what you checked -- never skip a section silently. This
+        combined reply IS the digest, and this is the LAST step.
 ---
 
-1. Report the current wall-clock time and confirm this run fired at or after the
-   scheduled time (`daily at 09:00`). Say plainly whether the fire time matched.
-   A scheduled job that quietly drifts is worth catching on its own.
-
-2. For the git repository in the current working directory, gather a short
-   status digest as your reply to THIS step:
-
-   - **Branch** -- the current branch, and whether it is ahead of or behind its
-     upstream.
-   - **Working tree** -- how many files are modified, staged, or untracked; name
-     the most recent few rather than listing everything.
-   - **Recent commits** -- the last handful of commits (short hash + subject) so
-     the digest shows what just landed.
-
-   Use read-only git commands only. Do not commit, push, pull, or change any
-   file -- this automation reports, it does not act.
-
-3. End this step's reply with the complete digest: restate the sections above,
-   unchanged, as one message. If a section has nothing in it, say so plainly and
-   say what you checked -- never skip a section silently. This combined reply IS
-   the digest, and this is the LAST step.
+A working, generic example automation: a daily read-only git status digest that
+needs no tools. It ships disabled -- flip `enabled` to true once you have
+verified a turn actually runs. Every step lives in the frontmatter `steps:` list
+above; this body is a human-facing description only.
 """
 
 # Ordered so refusal and success output read top-to-bottom the same way every

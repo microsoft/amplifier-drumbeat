@@ -145,7 +145,10 @@ class TestInjectFrontmatter(unittest.TestCase):
             "    type: manual\n"
             "  notify: never\n"
             f"{inject_yaml}"
-            "---\n\n1. Do the thing.\n"
+            "  steps:\n"
+            "    - id: do-the-thing\n"
+            "      prompt: Do the thing.\n"
+            "---\n"
         )
         return load_from_text(Path("t.md"), text)
 

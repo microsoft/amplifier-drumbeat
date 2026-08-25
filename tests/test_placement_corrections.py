@@ -101,7 +101,8 @@ class TestEventTriggerFailsLoud(unittest.TestCase):
     def test_disabled_event_trigger_accepted_as_placeholder(self) -> None:
         text = (
             "---\nautomation:\n  name: Test Event\n  enabled: false\n"
-            "  trigger:\n    type: event\n  notify: never\n---\n\n1. Do something.\n"
+            "  trigger:\n    type: event\n  notify: never\n"
+            "  steps:\n    - id: do-something\n      prompt: Do something.\n---\n"
         )
         automation = load_from_text(Path("automations/_test-event-disabled.md"), text)
         self.assertEqual(automation.trigger.type, "event")

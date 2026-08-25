@@ -1,10 +1,15 @@
 """Parse and validate automation files.
 
-An automation file is markdown with YAML frontmatter plus an ordered list of
-freeform natural-language steps in the body. This module is intentionally
-strict: it rejects anything ambiguous rather than guessing, because a bad
-automation runs unattended and a silently-wrong parse produces silently-wrong
-behavior.
+An automation file is markdown with YAML frontmatter that carries the whole
+machine surface. Steps are structured frontmatter data -- an ordered
+``steps:`` list of ``{id, prompt, label?}`` objects -- not prose the engine
+parses out of the document body. The body is a human-facing description that
+is never parsed for execution. This module is intentionally strict: it rejects
+anything ambiguous rather than guessing, because a bad automation runs
+unattended and a silently-wrong parse produces silently-wrong behavior.
+
+The frozen shape lives in ``contracts/automation-file.v1.md``; this module is
+its only parser.
 
 File format::
 
@@ -16,11 +21,15 @@ File format::
         type: schedule
         expression: every 30 minutes
       notify: auto
+      steps:
+        - id: check-source
+          label: Check the source
+          prompt: First step text, possibly spanning multiple lines.
+        - id: report
+          prompt: Second step text.
     ---
 
-    1. First step text, possibly spanning
-       multiple lines.
-    2. Second step text.
+    Optional human-facing description. Never parsed for execution.
 """
 
 from __future__ import annotations
@@ -100,8 +109,48 @@ DEFAULT_GUIDANCE_DELIVERY = "reference"
 VALID_CONVERSATION_LIFECYCLES = {"continuous", "fresh", "daily"}
 DEFAULT_CONVERSATION_LIFECYCLE = "continuous"
 
+# The governing contract every remedy message points back at. One string so a
+# rename is a single edit and every refusal stays consistent.
+CONTRACT_REF = "contracts/automation-file.v1.md"
+
+# The closed top-level vocabulary of the `automation:` mapping (contract rule 2;
+# the human-facing registry is docs/AUTOMATIONS.md section 2). Any key here that
+# is not in this set is refused loudly with a remedy -- never ignored. The
+# retired keys (`session`, `session_workspace`, `prompt_caching`) are refused
+# earlier with their own specific migration messages, so they never reach the
+# generic closed-vocabulary check.
+KNOWN_AUTOMATION_KEYS = frozenset(
+    {
+        "name",
+        "enabled",
+        "trigger",
+        "notify",
+        "requires",
+        "inject",
+        "conversation",
+        "agent_config",
+        "guidance_delivery",
+        "steps",
+    }
+)
+
+# The exact keys a single step object may carry (contract rule 3). An unknown
+# key inside a step is refused the same way as an unknown top-level key.
+KNOWN_STEP_KEYS = frozenset({"id", "prompt", "label"})
+
+# A step `id` is a slug: lowercase letters, digits, and single hyphens between
+# them. Same filesystem-safe shape as an automation slug (see `_slugify`), so a
+# step id can appear in run-record paths and event payloads without escaping.
+_STEP_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
 _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?\n)---\s*\n?(.*)\Z", re.DOTALL)
-_TOP_LEVEL_ITEM_RE = re.compile(r"^(\d+)\.\s+(.*)$")
+
+# Detects the RETIRED body-steps shape (contract rule 1, clean cut): a numbered
+# list item at column 0 in the markdown body. Steps used to live here as
+# ``N. text``; they are now structured frontmatter data and the body is never
+# parsed for execution, so a body that still carries numbered steps is refused
+# with a pointer to the contract rather than silently ignored.
+_BODY_NUMBERED_RE = re.compile(r"^\d+\.\s", re.MULTILINE)
 
 # Surgical-edit regexes for removing the retired session-pin lines from a
 # frontmatter block without disturbing anything else in the file. Distinct
@@ -155,6 +204,28 @@ class InjectSpec:
 
 
 @dataclass(frozen=True)
+class Step:
+    """One structured automation step (contract rule 3).
+
+    A step is judgment plus identity and nothing operational:
+
+    - ``id`` -- a slug, unique within the file. It is identity, not control
+      flow: it appears in run records so a run's turns can be tied back to the
+      declared step, and it survives an edit to the prompt text.
+    - ``prompt`` -- the entirety of the step's behavior, fed as one sequential
+      agent turn. Non-empty, stripped.
+    - ``label`` -- optional human display name; carries no behavior.
+
+    Scheduling, notification policy, conversation lifecycle, and agent config
+    are whole-automation (top-level) concerns -- a step carries none of them.
+    """
+
+    id: str
+    prompt: str
+    label: str | None = None
+
+
+@dataclass(frozen=True)
 class Automation:
     """A fully parsed and validated automation."""
 
@@ -163,7 +234,7 @@ class Automation:
     trigger: Trigger
     notify: str  # always | auto | never | urgent-only
     requires: list[str]
-    steps: list[str]  # ordered, stripped
+    steps: list[Step]  # ordered structured steps from frontmatter `steps:`
     path: Path
     slug: str  # kebab-case of name, filesystem-safe
     # Section 7.1 `inject:` -- declared argv pre-step injections, in order.
@@ -235,63 +306,121 @@ def _split_frontmatter(path: Path, text: str) -> tuple[dict, str]:
     return data, body
 
 
-def _parse_steps(path: Path, body: str) -> list[str]:
-    """Extract ordered top-level list items from the markdown body.
+def _refuse_body_steps(path: Path, body: str) -> None:
+    """Refuse the RETIRED body-steps shape (contract rule 1, clean cut).
 
-    A new step starts at a line matching ``N. text`` at column 0. Any
-    subsequent indented (or blank) lines belong to that step as continuation
-    text, preserved verbatim (dedented) until the next numbered item.
+    Steps used to be an ordered list of ``N. text`` items in the markdown
+    body. They are structured frontmatter data now (``steps:``), and the body
+    is never parsed for execution. A body that still carries a numbered list is
+    the classic migration hazard -- the author moved on believing those lines
+    still run, while the engine ignores them entirely -- so it is refused
+    loudly with a pointer to the contract rather than silently dropped. This is
+    a clean cut: the body-steps shape is never dual-read.
     """
-    lines = body.splitlines()
-    steps: list[list[str]] = []
-    expected_next = 1
+    if _BODY_NUMBERED_RE.search(body):
+        raise AutomationError(
+            path,
+            "the markdown body carries a numbered list, which is the RETIRED "
+            "body-steps shape -- steps are structured frontmatter data now "
+            "(`steps:` in the `automation:` block) and the body is never "
+            "parsed for execution. Move each numbered step into a `steps:` "
+            f"entry with an `id` and a `prompt` (see {CONTRACT_REF}); the body "
+            "is for a human-facing description only. If this numbered list is "
+            "genuinely prose, remove the `N.` numbering.",
+        )
 
-    for raw_line in lines:
-        match = _TOP_LEVEL_ITEM_RE.match(raw_line)
-        if match:
-            number = int(match.group(1))
-            if number != expected_next:
-                raise AutomationError(
-                    path,
-                    f"step numbering out of order: expected {expected_next}, found {number}",
-                )
-            steps.append([match.group(2)])
-            expected_next += 1
-        elif raw_line.strip() == "":
-            continue
-        elif raw_line.startswith((" ", "\t")):
-            if not steps:
-                raise AutomationError(
-                    path, f"continuation line before any numbered step: {raw_line!r}"
-                )
-            steps[-1].append(raw_line.strip())
-        else:
-            # Non-indented, non-numbered, non-blank content outside any step.
-            if steps:
-                raise AutomationError(
-                    path, f"unexpected top-level content inside step list: {raw_line!r}"
-                )
-            # The leading twin of the trailing refusal above (2026-08-11,
-            # soft-launch halt). This branch used to `continue` -- "ignore
-            # headings/prose that precede the list" -- which meant body text
-            # before step 1 was silently dropped: the author wrote
-            # instructions, the agent never saw them, and nothing said so.
-            # Found live: the reference deployment's reconciliation
-            # automation opened with exactly such a paragraph, unread on
-            # every run. Prose the agent should read belongs in a numbered
-            # step; provenance/notes belong in frontmatter `#` comments
-            # (YAML keeps them, and this parser never sends frontmatter to
-            # the agent by design).
+
+def _parse_steps(path: Path, raw: object) -> list[Step]:
+    """Parse and validate the frontmatter ``steps:`` list (contract rule 3).
+
+    ``steps:`` is a required, ordered list of step objects. Each object has an
+    ``id`` (a slug, unique within the file), a non-empty ``prompt``, and an
+    optional ``label``. Strict on purpose: an unknown key inside a step, a
+    missing or duplicate id, or an empty prompt each makes the automation
+    invalid, because a silently-wrong step runs unattended.
+    """
+    if raw is None:
+        raise AutomationError(
+            path,
+            "automation.steps is required: an ordered list of step objects, "
+            f"each with an `id` and a `prompt` (see {CONTRACT_REF}).",
+        )
+    if not isinstance(raw, list) or not raw:
+        raise AutomationError(
+            path,
+            "automation.steps must be a non-empty list of step mappings "
+            f"(each with an `id` and a `prompt`; see {CONTRACT_REF}).",
+        )
+
+    steps: list[Step] = []
+    seen_ids: dict[str, int] = {}
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict):
             raise AutomationError(
                 path,
-                f"unexpected top-level content before step 1: {raw_line!r}. "
-                "Body text outside the numbered steps is never sent to the "
-                "agent, so this line would be silently dropped. Move it into "
-                "a `#` comment in the frontmatter (notes/provenance), or make "
-                "it part of a numbered step if the agent should read it.",
+                f"automation.steps[{i}] must be a mapping with an `id` and a "
+                f"`prompt`, got {type(entry).__name__}.",
+            )
+        unknown = set(entry) - KNOWN_STEP_KEYS
+        if unknown:
+            raise AutomationError(
+                path,
+                f"automation.steps[{i}] has unknown key(s) {sorted(unknown)}; "
+                f"only {sorted(KNOWN_STEP_KEYS)} are allowed. A step is "
+                "judgment (prompt) plus identity (id) and carries no "
+                f"operational config -- see {CONTRACT_REF}.",
             )
 
-    return ["\n".join(part_lines).strip() for part_lines in steps]
+        step_id = entry.get("id")
+        if not isinstance(step_id, str) or not step_id.strip():
+            raise AutomationError(
+                path,
+                f"automation.steps[{i}].id is required and must be a non-empty "
+                "slug string.",
+            )
+        step_id = step_id.strip()
+        if not _STEP_ID_RE.match(step_id):
+            raise AutomationError(
+                path,
+                f"automation.steps[{i}].id {step_id!r} must be a slug "
+                "(lowercase letters, digits, and single hyphens between them).",
+            )
+        if step_id in seen_ids:
+            raise AutomationError(
+                path,
+                f"automation.steps[{i}].id {step_id!r} duplicates "
+                f"automation.steps[{seen_ids[step_id]}].id -- step ids must be "
+                "unique within the file (they are the step's identity in run "
+                "records).",
+            )
+        seen_ids[step_id] = i
+
+        prompt = entry.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise AutomationError(
+                path,
+                f"automation.steps[{i}].prompt (id {step_id!r}) is required and "
+                "must be non-empty text -- it is the entirety of the step's "
+                "behavior.",
+            )
+
+        label = entry.get("label")
+        if label is not None and (not isinstance(label, str) or not label.strip()):
+            raise AutomationError(
+                path,
+                f"automation.steps[{i}].label (id {step_id!r}), when present, "
+                "must be a non-empty string.",
+            )
+
+        steps.append(
+            Step(
+                id=step_id,
+                prompt=prompt.strip(),
+                label=label.strip() if isinstance(label, str) else None,
+            )
+        )
+
+    return steps
 
 
 def _parse_trigger(path: Path, raw: object, *, enabled: bool) -> Trigger:
@@ -662,13 +791,30 @@ def load_from_text(path: Path, text: str) -> Automation:
             f"({' | '.join(sorted(VALID_CONVERSATION_LIFECYCLES))}) instead.",
         )
 
+    # Closed frontmatter vocabulary (contract rule 2). Every key in the
+    # `automation:` mapping is registered (KNOWN_AUTOMATION_KEYS, mirrored by
+    # the human registry in docs/AUTOMATIONS.md section 2); an unknown key is
+    # refused loudly with a remedy, never ignored. Placed AFTER the retired-key
+    # refusals above so `session`/`session_workspace`/`prompt_caching` still get
+    # their own specific migration messages rather than this generic one.
+    unknown_keys = sorted(set(section) - KNOWN_AUTOMATION_KEYS)
+    if unknown_keys:
+        raise AutomationError(
+            path,
+            f"automation has unknown top-level key(s) {unknown_keys}; the "
+            f"registered vocabulary is {sorted(KNOWN_AUTOMATION_KEYS)}. An "
+            "unknown key is refused rather than ignored so a typo can never "
+            f"silently do nothing (see {CONTRACT_REF} and docs/AUTOMATIONS.md).",
+        )
+
     inject = _parse_inject(path, section.get("inject"))
 
-    steps = _parse_steps(path, body)
-    if not steps:
-        raise AutomationError(
-            path, "automation has no steps (at least one numbered step is required)"
-        )
+    # The body is a human-facing description, never parsed for execution
+    # (contract rule 1). Refuse the retired body-steps shape loudly before
+    # reading the structured steps from the frontmatter.
+    _refuse_body_steps(path, body)
+
+    steps = _parse_steps(path, section.get("steps"))
 
     try:
         slug = _slugify(name)
@@ -689,3 +835,32 @@ def load_from_text(path: Path, text: str) -> Automation:
         conversation=conversation,
         agent_config=agent_config_value,
     )
+
+
+def validate_automation_content(text: str, *, path: Path | None = None) -> Automation:
+    """Validate automation file content, raising ``AutomationError`` on any violation.
+
+    The engine's own conformance surface for ``contracts/automation-file.v1.md``
+    (see the contract's Conformance section). It is exactly the same validation
+    ``load()``/``load_from_text`` apply, exposed under a name the contract and
+    its fixtures can call directly. Every frozen-core rule is enforced here:
+
+    - unknown top-level key (closed frontmatter vocabulary, rule 2)
+    - unknown step key (rule 3)
+    - missing ``steps`` / empty ``steps`` (rules 3, 6)
+    - missing or duplicate step ``id`` (rule 3)
+    - empty step ``prompt`` (rule 3)
+    - the retired body-steps shape (rule 1, clean cut)
+
+    Args:
+        text: the full automation file content (frontmatter + body).
+        path: optional source path for error attribution; a placeholder is
+            used when validating detached content (e.g. an incoming edit).
+
+    Returns:
+        The parsed, valid ``Automation``.
+
+    Raises:
+        AutomationError: naming the offending key/step and the remedy.
+    """
+    return load_from_text(path if path is not None else Path("<automation>"), text)

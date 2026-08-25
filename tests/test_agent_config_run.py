@@ -142,9 +142,10 @@ automation:
     provider:
       config:
         default_model: model-X
+  steps:
+    - id: do-the-thing
+      prompt: Do the thing.
 ---
-
-1. Do the thing.
 """
 
 _PLAIN = """---
@@ -154,9 +155,10 @@ automation:
   trigger:
     type: manual
   notify: never
+  steps:
+    - id: do-the-thing
+      prompt: Do the thing.
 ---
-
-1. Do the thing.
 """
 
 _PROVIDER_OPENAI = """---
@@ -169,9 +171,10 @@ automation:
   agent_config:
     provider:
       module: openai
+  steps:
+    - id: do-the-thing
+      prompt: Do the thing.
 ---
-
-1. Do the thing.
 """
 
 
