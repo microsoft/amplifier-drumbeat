@@ -241,6 +241,36 @@ the consumer boundary.
 
 ---
 
+## Skills
+
+`skills/` is a first-class surface: an AI agent can learn to operate the engine,
+author automations, and build drumpacks from this repo alone. Each skill is a
+self-contained [Agent Skill](https://agentskills.io) — it carries the how-to
+layer inline and links the canonical docs above for depth.
+
+| Skill | What it teaches |
+|---|---|
+| [`drumbeat-operations`](skills/drumbeat-operations) | Install, run, supervise (`service`), health-check (`doctor`), rotate pinned sessions, `drain`/`sweep`, and troubleshoot |
+| [`drumbeat-automation-authoring`](skills/drumbeat-automation-authoring) | The automation-file contract as a how-to: closed frontmatter, structured `steps:`, schedules, notify sentinels, `requires:`/`inject:`, `agent_config:`, the guidance loop |
+| [`drumbeat-drumpack-authoring`](skills/drumbeat-drumpack-authoring) | The `drumpack.md` card, `bin/` conventions, `activity:` labels, `inject:` tool rules, and wiring via `drumpacks.txt` |
+
+Consume them in an [Amplifier](https://github.com/microsoft/amplifier) bundle by
+pointing `tool-skills` at this repo's `skills/` subdirectory:
+
+```yaml
+tools:
+  - module: tool-skills
+    config:
+      skills:
+        - "git+https://github.com/microsoft/amplifier-drumbeat@main#subdirectory=skills"
+```
+
+Bundle-skills consumers pull **only** the `skills/` subdirectory, so each skill
+stands alone. Validate any edits with the reference linter —
+`npx skills-ref validate skills/drumbeat-operations`.
+
+---
+
 ## What it does not do
 
 Fences, each rejecting a specific temptation:
