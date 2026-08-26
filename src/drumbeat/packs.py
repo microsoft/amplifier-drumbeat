@@ -50,6 +50,7 @@ with no restart, exactly like every other markdown in this system.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import threading
@@ -57,6 +58,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 # The file a consumer workspace uses to hand the engine its ORDERED list of
 # drumpack directories (the drumpack contract's founding sentence: "The consumer
@@ -77,6 +80,18 @@ MANIFEST_FILENAME = "drumpack.md"
 # future drumpack format will mean something this code cannot know, and
 # guessing is how a card starts lying.
 SUPPORTED_PACK_FORMATS = frozenset({1})
+
+# The CLOSED top-level frontmatter vocabulary (drumpack-card.v1 rule 2). Every
+# key a card may declare at the top level is here; an unknown top-level key is
+# refused loudly, never silently ignored. Silently dropping a key is the
+# VISION §1/§4 failure this project has paid for: a mistyped `activty:` that
+# the engine swallows is a card that lies about what it declares, and a metric
+# (here, the author's narration) that is silently always empty. `bin` and
+# `description` inside a `tools:` entry are NESTED keys the card contract owns,
+# not top-level keys, and are deliberately not listed here.
+KNOWN_CARD_KEYS = frozenset(
+    {"pack_format", "name", "description", "tools", "activity"}
+)
 
 _FRONTMATTER_DELIMITER = "---"
 
@@ -255,6 +270,20 @@ def load_pack(directory: Path) -> Pack:
         raise PackError(f"{card_path}: cannot read: {exc}") from exc
 
     frontmatter, card = _split_frontmatter(card_path, text)
+
+    # Closed vocabulary (drumpack-card.v1 rule 2): an unknown top-level key is
+    # refused loudly with a remedy, never silently ignored. Run this FIRST so a
+    # typo (`pack_formatt:`, `activty:`) is reported as the unknown key it is --
+    # pointing at the mistake -- rather than surfacing only as a downstream
+    # "required key missing" for the correctly-spelled name.
+    unknown = sorted(str(key) for key in frontmatter if key not in KNOWN_CARD_KEYS)
+    if unknown:
+        raise PackError(
+            f"{card_path}: unknown frontmatter key(s) {unknown} -- the drumpack "
+            f"card vocabulary is CLOSED: {sorted(KNOWN_CARD_KEYS)}. Remove the "
+            "key, or fix the typo. An unknown key is never silently ignored: a "
+            "silently dropped key is a card that lies about what it declares."
+        )
 
     if "pack_format" not in frontmatter:
         raise PackError(
@@ -451,9 +480,53 @@ def read_pack_list(workspace: Path) -> PackList:
     return PackList(paths=tuple(paths), source=source, declared=True)
 
 
+def pack_list_visibility(listing: PackList) -> str | None:
+    """A loud, human warning when the drumpack list is missing or empty, else ``None``.
+
+    A missing or empty ``drumpacks.txt`` means every turn runs with ZERO
+    drumpack tools. That is a legal state -- a fresh ``drumbeat init`` workspace
+    declares none yet -- but drumpack-card.v1 rule 5 forbids it being a SILENT
+    one: a turn that silently runs tool-less is the VISION §4 successful-looking
+    run that did nothing, wearing a green light. So the condition is surfaced
+    LOUD-BUT-TOLERANT -- logged at load, named by ``drumbeat doctor`` -- rather
+    than hard-refused, because a hard refusal would break the fresh-init flow
+    that legitimately begins with no packs. (See the contract changelog for why
+    this rule 5 gap is fixed loud-but-tolerant rather than as a start refusal.)
+
+    Two distinct facts get two distinct messages -- the ``PackList.declared``
+    flag exists precisely so "this workspace has no drumpacks.txt" is never
+    conflated with "the drumpacks.txt here declares nothing".
+    """
+    if not listing.declared:
+        return (
+            f"no {PACK_LIST_FILENAME} at {listing.source} -- this workspace "
+            "declares NO drumpacks, so every turn runs with ZERO drumpack "
+            "tools. If that is intended (a fresh `drumbeat init` starts here), "
+            f"ignore this; otherwise create {PACK_LIST_FILENAME} listing your "
+            "pack directories, one per line."
+        )
+    if not listing.paths:
+        return (
+            f"{listing.source} declares NO drumpacks (every line is blank or a "
+            "comment) -- every turn runs with ZERO drumpack tools. Add a pack "
+            f"directory path, or delete {PACK_LIST_FILENAME} if none is intended."
+        )
+    return None
+
+
 def load_workspace_packs(workspace: Path) -> tuple[Pack, ...]:
-    """Every drumpack this workspace declares, loaded and verified. Fail-loud."""
-    return load_packs(read_pack_list(workspace).paths)
+    """Every drumpack this workspace declares, loaded and verified. Fail-loud.
+
+    A missing or empty pack list is surfaced loud-but-tolerant here (this is the
+    load path every runtime caller reaches -- serve startup, the runner per
+    turn, the capabilities endpoint) so the zero-tools condition is never a
+    silent one. See ``pack_list_visibility``.
+    """
+    listing = read_pack_list(workspace)
+    warning = pack_list_visibility(listing)
+    if warning is not None:
+        logger.warning("drumpack list: %s", warning)
+    return load_packs(listing.paths)
 
 
 # ---- PATH construction ----
@@ -539,6 +612,7 @@ def activity_by_tool(packs: tuple[Pack, ...]) -> dict[str, dict[str, str]]:
 
 
 __all__ = [
+    "KNOWN_CARD_KEYS",
     "MANIFEST_FILENAME",
     "PACK_LIST_FILENAME",
     "SUPPORTED_PACK_FORMATS",
@@ -552,6 +626,7 @@ __all__ = [
     "load_packs",
     "load_workspace_packs",
     "pack_for_tool",
+    "pack_list_visibility",
     "path_entries",
     "pin_base_path",
     "read_pack_list",

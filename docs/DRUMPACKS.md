@@ -5,6 +5,16 @@ the loader and refuses at startup when violated; everything under
 "Conventions" is on you, because the engine cannot enforce it without
 becoming the plugin protocol we deliberately refused.
 
+> **The frozen shape lives in the contract.**
+> [`contracts/drumpack-card.v1.md`](../contracts/drumpack-card.v1.md) is the
+> governing card contract — the smallest frozen surface (one card, closed
+> frontmatter vocabulary, real tool entries, explicit wiring, fail-loud load,
+> self-serving tools) plus its conformance fixtures. This page is the how-to
+> layer that teaches against that shape; it does not re-freeze it. When a rule
+> here and the contract ever disagree, the contract governs the machine
+> surface and VISION.md leads — so read them together, and don't trust a copy
+> over the source.
+
 A drumpack is a **directory** -- normally a git repo:
 
 ```

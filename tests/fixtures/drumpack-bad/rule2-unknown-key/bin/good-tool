@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# good-tool -- the conforming fixture's tool. Self-serving (drumpack-card.v1
+# rule 6): runs from a shell with no interactive prompts, supports --help, and
+# exits 0. The engine guarantees it is on PATH; it guarantees its own usability.
+set -euo pipefail
+if [[ "${1:-}" == "--help" ]]; then
+  echo "good-tool -- prints a one-line status. Usage: good-tool [status] [--help]"
+  exit 0
+fi
+echo "good-tool: ok"
