@@ -36,6 +36,7 @@ from drumbeat import drain as drain_mod
 from drumbeat import (
     error_log,
     invalid_runs,
+    packs,
     paths,
     runner,
     session_health,
@@ -134,6 +135,19 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         print(runner.AGENT_INSTALL_HINT)
     else:
         print(f"agent command: {agent_path}")
+
+    # Drumpack wiring (drumpack-card.v1 rule 5 / VISION §4). A missing or empty
+    # drumpacks.txt is a VISIBLE condition here, never a silent zero-tools turn:
+    # a turn that silently runs with no drumpack tools is the successful-looking
+    # run that did nothing. Read from ctx.cwd -- the SAME path serve loads packs
+    # from -- so this reports on the exact list the running engine would use.
+    print()
+    pack_list = packs.read_pack_list(ctx.cwd)
+    pack_warning = packs.pack_list_visibility(pack_list)
+    if pack_warning is None:
+        print(f"drumpacks: {len(pack_list.paths)} declared in {pack_list.source}")
+    else:
+        print(f"drumpacks: NONE declared -- {pack_warning}")
 
     # Draining is a state the operator asked for and can forget they asked
     # for. A drained scheduler is enabled, healthy, and inert -- which reads
