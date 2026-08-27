@@ -1,19 +1,13 @@
-"""Guidance reaches the agent by REFERENCE, not by inlining it into argv.
+"""Guidance reaches the agent by REFERENCE, not by inlining it into the turn.
 
-Drumbeat used to embed every required guidance body verbatim in the turn text,
-which is the last argv element handed to ``amplifier-agent``. A single argv
-element over Linux's ``MAX_ARG_STRLEN`` (131072 bytes = 128 KiB) fails
-``execve`` with E2BIG -- silently, before the agent boots, with no run record.
-That is exactly how channels-check died (IDENTITY.md was inlined).
-
-The fix, verified against the real installed ``amplifier-agent`` binary (which
-does NOT auto-load @-mentions in turn text -- see EVIDENCE/verify-atmention.md):
-inject the workspace-relative guidance PATHS plus a mandatory read-first
-preamble, and let the agent load the bodies with its own file tools. argv stays
-a few hundred bytes no matter how large the guidance grows. Legacy inline
-delivery stays selectable per-automation during migration, and a turn-size belt
-guard turns any breach into a named failure instead of the kernel's opaque
-E2BIG.
+Drumbeat prefers to inject the workspace-relative guidance PATHS plus a
+mandatory read-first preamble and let the agent load the bodies with its own
+file tools, rather than embedding every required guidance body verbatim into the
+turn text. Two reasons survive the move to the isolated per-turn worker (the
+prompt now travels to the worker on stdin, so the old OS argv ceiling that this
+feature also guarded against is gone): the turn stays small (cheaper, faster),
+and the agent reads the CURRENT on-disk body rather than a snapshot frozen at
+inject time. Legacy inline delivery stays selectable per-automation.
 
 Every test drives the real production functions directly -- no mocking of the
 logic under test.
@@ -21,6 +15,7 @@ logic under test.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -31,10 +26,8 @@ from drumbeat.automation import (
     load_from_text,
 )
 from drumbeat.runner import (
-    MAX_ARG_STRLEN,
     RequirementCheck,
     RunnerError,
-    TurnTooLargeError,
     _build_command,
     check_requirements,
     format_requirements_turn,
@@ -139,42 +132,36 @@ def test_nothing_to_inject_returns_none_in_both_modes() -> None:
     assert format_requirements_turn([exe], mode="reference") is None
 
 
-# ---- the turn-size belt guard ----------------------------------------------
+# ---- the prompt travels via stdin, never argv ------------------------------
 
 
-def test_build_command_rejects_a_turn_at_the_ceiling() -> None:
-    text = "x" * MAX_ARG_STRLEN  # exactly the failing size measured on-host
-    with pytest.raises(TurnTooLargeError) as excinfo:
-        _build_command(session_id="s1", fresh=True, cwd=Path("/tmp"), text=text)
-    assert excinfo.value.nbytes == MAX_ARG_STRLEN
-    assert "reference" in str(excinfo.value)
+def test_build_command_never_carries_the_prompt_in_argv() -> None:
+    """The worker command is fixed and small; the prompt reaches the worker on
+    stdin, so a turn's text -- at ANY size -- never appears on argv and there is
+    no OS per-argument ceiling to breach."""
+    huge = "x" * (256 * 1024)  # far past the old 128 KiB argv ceiling
+    cmd = _build_command(session_id="s1", fresh=True, cwd=Path("/tmp"), text=huge)
+    # It is exactly `python -m drumbeat.agent_worker` -- no prompt, no session id.
+    assert cmd == [sys.executable, "-m", "drumbeat.agent_worker"]
+    assert huge not in cmd
+    assert "s1" not in cmd
 
 
-def test_build_command_accepts_a_turn_just_under_the_ceiling() -> None:
-    text = "x" * (MAX_ARG_STRLEN - 1)  # 131071 execs on-host; 131072 fails
-    cmd = _build_command(session_id="s1", fresh=True, cwd=Path("/tmp"), text=text)
-    assert cmd[-1] == text
+def test_build_command_marker_is_present_for_live_turn_detection() -> None:
+    """drain/staleness match a live turn by the worker's dotted module name in
+    /proc/<pid>/cmdline; the built command must carry it."""
+    cmd = _build_command(session_id="s1", fresh=True, cwd=Path("/tmp"), text="hi")
+    assert "drumbeat.agent_worker" in " ".join(cmd)
 
 
-def test_belt_measures_utf8_bytes_not_characters() -> None:
-    # A 2-byte char must count as 2 toward the ceiling, or a multibyte turn
-    # could slip past the guard and hit E2BIG anyway.
-    text = "\u00e9" * (
-        MAX_ARG_STRLEN // 2
-    )  # 'é' is 2 bytes in UTF-8 -> exactly the limit
-    assert len(text) < MAX_ARG_STRLEN  # fewer CHARS than the ceiling...
-    with pytest.raises(TurnTooLargeError):  # ...but not fewer BYTES
-        _build_command(session_id="s1", fresh=True, cwd=Path("/tmp"), text=text)
-
-
-def test_reference_turn_is_never_rejected_by_the_belt() -> None:
-    """Reference form + the belt = argv is safe by construction, at any body size."""
+def test_reference_turn_stays_small_at_any_body_size() -> None:
+    """Reference form keeps the turn tiny regardless of how large the guidance
+    bodies are -- the property the worker's stdin transport no longer *needs*
+    but the feature still deliberately provides."""
     checks = [_file_check(f"guidance/F{i}.md", _HUGE_BODY) for i in range(20)]
     text = format_requirements_turn(checks, mode="reference")
     assert text is not None
-    # Would raise if it were anywhere near the ceiling; it is not.
-    cmd = _build_command(session_id="s1", fresh=True, cwd=Path("/tmp"), text=text)
-    assert cmd[-1] == text
+    assert len(text.encode("utf-8")) < 4000
 
 
 # ---- automation.guidance_delivery field ------------------------------------

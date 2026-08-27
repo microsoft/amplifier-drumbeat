@@ -35,10 +35,12 @@ def derive_workspace_slug(cwd: Path) -> str:
     only the env override and the cwd fallback apply here. The cwd-derived
     algorithm itself (verbatim, no hashing, full path encoded as the slug)
     is reproduced from amplifier-agent's own
-    ``amplifier_agent_lib.persistence.derive_workspace_from_cwd`` -- the
-    engine only shells out to the ``amplifier-agent`` CLI, it does not
-    depend on that library, so this is intentionally reimplemented rather
-    than imported.
+    ``amplifier_agent_lib.persistence.derive_workspace_from_cwd``. It is
+    reimplemented rather than imported on purpose: this helper runs in the
+    long-lived scheduler/serve process, which deliberately never imports the
+    engine library -- importing it here would bind its process-global state in
+    a process that outlives every turn. Only the isolated per-turn worker
+    imports the library.
 
     Shared by ``runner.py`` (session directory lookups) and ``ci_events.py``
     (tagging the engine's own orchestration events with the SAME workspace slug

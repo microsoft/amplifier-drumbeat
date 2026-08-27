@@ -454,10 +454,10 @@ fallback to the wrong provider/model.
 
 drumbeat does **not** resolve models itself and keeps no model registry. The
 `default_model` you name is forwarded verbatim into amplifier-agent's own
-host-config field `provider.config.default_model` (handed down via `--config`) —
-the same mechanism `amplifier-agent run` already uses to pick a per-provider
-model. drumbeat picks *which* config per turn; amplifier-agent still does the
-model resolution. A malformed `agent-config.yaml`, an unknown top-level key in a
+host-config field `provider.config.default_model`, carried in the host config
+each turn is handed — the same mechanism the engine itself uses to pick a
+per-provider model. drumbeat picks *which* config per turn; amplifier-agent
+still does the model resolution. A malformed `agent-config.yaml`, an unknown top-level key in a
 profile, or a credential inside one is a loud refusal that names the file and the
 profile — never a silent wrong-model turn.
 
@@ -520,8 +520,8 @@ export OPENAI_API_KEY=local     # any non-empty dummy
 #### Why `source:` and `module: provider-chat-completions` do NOT belong here
 
 A full amplifier provider block (the `- module: provider-chat-completions` /
-`source: git+…` / `config:` shape) is a **bundle** construct. amplifier-agent's
-`run --config` host config is not a bundle: it reads only
+`source: git+…` / `config:` shape) is a **bundle** construct. The host config a
+turn is handed is not a bundle: the engine reads only
 `provider.module` (a catalog short-name) and `provider.config`, and it does
 **not** read `provider.source`. So the way to reach an OpenAI-compatible local
 box through this path is `provider: openai` + `config.base_url`, not a
@@ -554,9 +554,10 @@ observed:
 
 ### Status: stream the activity, don't show a bare "working"
 
-Every chat/reply turn already surfaces live, **truthful** progress. amplifier-agent
-emits an NDJSON event stream (`thinking/delta`, `tool/started`, `tool/completed`,
-…); drumbeat translates it into a safe present-tense activity line and mirrors it
+Every chat/reply turn already surfaces live, **truthful** progress. The engine
+emits typed display events (`thinking/delta`, `tool/started`, `tool/completed`,
+…) that the turn's worker forwards as NDJSON; drumbeat translates them into a
+safe present-tense activity line and mirrors it
 onto the turn record's `progress` field, which a caller reads by polling
 `GET /api/turns/{turn_id}`:
 

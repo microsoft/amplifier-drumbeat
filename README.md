@@ -22,9 +22,10 @@ it runs; you supply the provider key it runs against.
 **1. `uv` and `git`.** drumbeat installs from a git URL with
 [uv](https://docs.astral.sh/uv/), which also provisions the Python it needs
 (3.13). Install `uv` first if you don't have it; `git` must be present because
-the install is a git reference. `amplifier-agent` — the engine every turn shells
-out to — is a dependency, so the single install below brings it too. It is **not
-on PyPI**; there is nothing separate to install and nothing to put on your PATH.
+the install is a git reference. `amplifier-agent` — which ships the engine
+library every turn imports — is a dependency, so the single install below brings
+it too. It is **not on PyPI**; there is nothing separate to install and nothing
+to put on your PATH.
 
 **2. An LLM provider key, exported in the environment the engine starts in.**
 
@@ -32,8 +33,8 @@ on PyPI**; there is nothing separate to install and nothing to put on your PATH.
 export ANTHROPIC_API_KEY=sk-ant-...      # or your provider's equivalent
 ```
 
-Check it the same way the engine will: if the key is missing, a turn still
-**exits 0** and returns the reply `Error: No providers available`. That is a
+Check it against the same engine your turns run on: if the key is missing, a
+turn still **exits 0** and returns the reply `Error: No providers available`. That is a
 successful-looking run that did nothing, so verify it once by hand rather than
 discovering it in a run artifact at 03:40:
 
@@ -55,16 +56,16 @@ Running the engine under systemd? The key must be in the *unit's* environment
 ## Quickstart
 
 **1. Install the engine.** One command. It installs `drumbeat` and co-installs
-the `amplifier-agent` it runs into the same tool environment.
+the `amplifier-agent` engine library it runs on into the same tool environment.
 
 ```bash
 uv tool install git+https://github.com/microsoft/amplifier-drumbeat
 drumbeat --help
 ```
 
-That is the whole install. `amplifier-agent` rides along as a dependency, so it
-lands in the same tool venv and the engine resolves it there automatically —
-there is no second install and nothing to put on your PATH. The agent dependency
+That is the whole install. `amplifier-agent` rides along as a dependency, so its
+engine library lands in the same tool venv and every turn imports it there
+automatically — there is no second install and nothing to put on your PATH. The agent dependency
 is unpinned, so `uv tool upgrade drumbeat` takes drumbeat *and* the latest agent
 `main` in one step.
 
@@ -116,9 +117,9 @@ That runs today, with no tools at all.
 drumbeat serve --workspace ~/myspace --port 9100
 ```
 
-It refuses to start, naming the fix, if `amplifier-agent` is not resolvable —
-so an engine that cannot execute a single turn never reaches the point of
-reporting itself healthy.
+It refuses to start, naming the fix, if the `amplifier-agent` engine library
+cannot be imported — so an engine that cannot execute a single turn never
+reaches the point of reporting itself healthy.
 
 **5. Run it now, before trusting the schedule.** In a second terminal:
 
@@ -142,7 +143,8 @@ drumbeat doctor --workspace ~/myspace
 
 **What healthy looks like:** `status: FRESH` (the running process matches the
 code on disk), `agent turns in flight: 0` between runs, `agent command:` naming
-a real path, `draining: no`, and `orphan pins: 0`. `FRESH` is the one to learn
+the engine library and the interpreter that imports it, `bundle prewarm: OK`,
+`draining: no`, and `orphan pins: 0`. `FRESH` is the one to learn
 — it goes `STALE` the moment you edit engine code under a running process,
 which is the difference between "I fixed that" and "I fixed that and restarted."
 

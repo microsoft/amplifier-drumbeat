@@ -114,10 +114,10 @@ _DRUMPACKS_TXT = """\
 # line pointing at a drumpack directory to bring tools to your automations.
 """
 
-# agent-config.yaml -- placeholder. The agent-config subsystem (drumbeat handing
-# amplifier-agent a host config for every turn) lands in a later release; this
-# is a commented-out default provider block so the file exists in the layout
-# without changing any behavior. Nothing reads it yet.
+# agent-config.yaml -- placeholder. The agent-config subsystem (drumbeat
+# resolving the ONE host config the engine is handed for every turn) lands in a
+# later release; this is a commented-out default provider block so the file
+# exists in the layout without changing any behavior. Nothing reads it yet.
 _AGENT_CONFIG_YAML = """\
 # agent-config.yaml -- host config drumbeat will hand amplifier-agent for every
 # turn. This is a PLACEHOLDER: the agent-config subsystem arrives in a later

@@ -182,8 +182,8 @@ of the `daily at HH:MM` *schedule* (when a run fires).
 
 ## 8 · `agent_config:` — per-automation host config
 
-`agent_config:` shapes the single host config `amplifier-agent run --config`
-reads, for this automation's turns only. The top-level vocabulary is **closed to
+`agent_config:` shapes the single host config a turn is handed, for this
+automation's turns only. The top-level vocabulary is **closed to
 `provider · providers · mcp · skills · debug`**; anything else (including
 `approval`) is refused.
 

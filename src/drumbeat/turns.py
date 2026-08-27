@@ -467,14 +467,14 @@ def _execute(ctx: EngineContext, record: dict[str, Any], request: TurnRequest) -
             # ``profile`` from that file's ``profiles:`` block, layer 3 of the
             # merge. A profile-less turn uses the default; a turn in a workspace
             # with neither an env config nor a ``default:`` block nor a profile
-            # resolves to nothing -- ``.path`` is ``None`` and the argv is
-            # byte-identical to pre-profile behavior. An unknown profile name is
+            # resolves to nothing -- ``.path`` is ``None`` and the turn runs on
+            # the engine's own defaults. An unknown profile name is
             # already refused synchronously by ``submit_turn``; resolving here
             # (re-read each turn) picks up any owner edit and, on a now-missing
             # profile, raises loudly so the turn is recorded failed. Keyed by
             # turn id so an interactive config can never collide with a scheduled
             # run's materialized file. The path (when any) is handed to the
-            # runner as ``--config``.
+            # runner, which threads it to the turn's worker as its host config.
             host_config_path = agent_config.resolve_turn(
                 runs_dir=runs_dir,
                 workspace=ctx.cwd,

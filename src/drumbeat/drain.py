@@ -4,9 +4,9 @@ This exists because of a specific, verified hazard (recorded during the
 engine extraction,
 section 12, council blocker B2 -- it replaced a bare kill 6-0):
 
-    The runner spawns ``amplifier-agent`` with **no process group, no
-    SIGTERM handling, and close_fds=True**. Kill the scheduler mid-turn and
-    the child keeps running and keeps writing the session transcript --
+    The runner spawns each turn's worker in **its own process group, with
+    no SIGTERM handling and close_fds=True**. Kill the scheduler mid-turn
+    and that worker keeps running and keeps writing the session transcript --
     while the kernel releases the parent's per-session flock the instant the
     parent dies. The next scheduler tick then resumes that same session
     underneath the still-writing orphan: the exact transcript corruption the
@@ -44,12 +44,18 @@ from pathlib import Path
 
 DRAIN_FILENAME = ".scheduler.drain"
 
-# The exact, real substring every agent turn is invoked with (see
-# runner._build_command: ["amplifier-agent", "run", "--session-id", ...]).
-# Matched in Python against /proc entries we read ourselves -- never through
-# a shell `pkill -f`/`grep`, which has matched its own invoking shell and
-# killed a live service in this project four times now.
-AGENT_TURN_MARKER = "amplifier-agent run --session-id"
+# The exact, real substring every agent turn's process carries in its cmdline.
+# Every turn runs in an isolated worker launched as
+# ``python -m drumbeat.agent_worker`` (see runner._submit_turn), so the dotted
+# module name is present in argv by construction -- this equals
+# ``drumbeat.agent_worker.WORKER_MODULE`` (kept as a literal here so this
+# low-level module imports nothing of the runner). Matched in Python against
+# /proc entries we read ourselves -- never through a shell `pkill -f`/`grep`,
+# which has matched its own invoking shell and killed a live service in this
+# project four times now. Nothing else on this host runs that module: a
+# ``drumbeat serve``/``doctor`` process, or the staleness closure subprocess
+# (``-m drumbeat.staleness``), never carries ``drumbeat.agent_worker`` in argv.
+AGENT_TURN_MARKER = "drumbeat.agent_worker"
 
 
 def drain_flag_path(runs_dir: Path) -> Path:

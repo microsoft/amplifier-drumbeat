@@ -19,7 +19,8 @@
   optional `prompt_caching: bool` frontmatter field (default `true` — the whole
   fleet is unchanged); when `false`, `runner.run`/`_run_body` materialize a
   minimal host config carrying `provider.config.enable_prompt_caching: false`
-  and thread it as `--config` into every turn (`_automation_host_config_path`).
+  and hand it to every turn as that turn's host config
+  (`_automation_host_config_path`).
   This makes real `recency-check` runs succeed without changing anything the
   pass observes or records. The durable fix belongs upstream (guard `thinking`
   blocks in `amplifier_module_provider_anthropic._stamps_empty_text_block` /
@@ -30,29 +31,21 @@
 
 ### Added
 
-- Required guidance now reaches the agent by **reference** instead of being
-  inlined into argv. `format_requirements_turn` gained a `mode` parameter and a
-  new automation field `guidance_delivery` (`reference`, the default, or
-  `inline`, the legacy form). In reference mode the requirements turn carries
-  the workspace-relative guidance PATHS plus a mandatory "read these first"
-  preamble; the agent loads the bodies with its own file tools, so the turn
-  text — and therefore argv — stays a few hundred bytes no matter how large the
-  guidance grows. This kills the argv-inlining failure class at the root: a
-  single argv element at/over Linux's `MAX_ARG_STRLEN` (131072 bytes = 128 KiB)
-  fails `execve` with E2BIG, silently, before the agent boots — exactly how
-  channels-check died when IDENTITY.md was inlined. Verified against the real
-  installed `amplifier-agent` (v0.9.3), which does NOT auto-load FILE
-  @-mentions in turn text; the reference form drives the agent's read tools
-  instead. `check_requirements` still reads every referenced file up front, so
-  a missing/empty guidance file is still a loud pre-run failure. Every existing
-  automation (which never set `guidance_delivery`) becomes a reference-form
-  automation automatically; `inline` stays selectable during migration.
-- Turn-size belt guard: `_build_command` now raises a named `TurnTooLargeError`
-  when a turn's text would reach `MAX_ARG_STRLEN`, and `_execute_turn` converts
-  it into a persisted run failure (run record + failures.log + a new
-  `drumbeat:turn_too_large` event) — a named, actionable failure with a remedy
-  instead of the kernel's opaque E2BIG. Belt-and-suspenders behind the
-  reference default.
+- Required guidance reaches the agent by **reference**.
+  `format_requirements_turn` gained a `mode` parameter and a new automation
+  field `guidance_delivery` (`reference`, the default, or `inline`). In
+  reference mode the requirements turn carries the workspace-relative guidance
+  PATHS plus a mandatory "read these first" preamble; the agent loads the
+  bodies with its own file tools, so the turn text stays a few hundred bytes no
+  matter how large the guidance grows — and a resumed session reads the CURRENT
+  file rather than a body snapshotted into its transcript. Verified against the
+  real installed `amplifier-agent`, which does NOT auto-load FILE @-mentions in
+  turn text; the reference form drives the agent's read tools instead.
+  `check_requirements` still reads every referenced file up front, so a
+  missing/empty guidance file is still a loud pre-run failure. An automation
+  that never sets `guidance_delivery` is a reference-form automation;
+  `inline` stays selectable for one that genuinely wants its guidance literally
+  in the transcript.
 
 - `list_automations`/`get_automation_detail` now serve `last_run` (the most
   recent run ATTEMPT -- `{run_id, started_at, finished_at, failed, error}`,
