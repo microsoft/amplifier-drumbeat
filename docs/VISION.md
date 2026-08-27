@@ -40,11 +40,14 @@ Structure that cannot be checked by a machine does not get schema.
 
 Every turn executes in its own OS process. A wedged, crashed, or runaway turn
 dies alone and becomes a recorded run failure; the engine keeps its schedule.
-The invocation goes through the maintained agent SDK rather than hand-rolled
-argv and stream parsing. In-process embedding arrives only when the upstream
-library contract makes it safe for concurrent hosts — a public turn-handler
-API and no process-global writes — and the isolation property itself is not up
-for negotiation.
+The invocation imports the agent's engine library inside an isolated per-turn
+worker process — no CLI subprocess, no argv contract, no stream parsing: the
+worker assembles the documented embedding surface and returns typed results
+over the engine's own pipe. One turn per process keeps the library's
+process-global state (env writes, import-time bindings) harmless by
+construction, and the isolation property itself is not up for negotiation.
+Long-lived in-process embedding waits on the upstream library contract — a
+public turn-handler API and no process-global writes.
 
 ### 4. Unattended honesty
 
@@ -81,6 +84,13 @@ judgment — all owner-supplied. Anything consumer-shaped in the engine is a lea
 
 ## Changelog
 
+- **2026-08-27** — §3 amended: turn invocation moves from the subprocess SDK to
+  the agent's engine library, imported in an isolated per-turn worker process.
+  Evidence: amplifier-agent v0.17.0 leads its integration story with the
+  documented embedding surface (engine-api.md) and fixed the usage/argv defects
+  we filed; a one-turn-per-process worker preserves this section's isolation
+  clause while deleting the CLI argv/envelope surface and its failure modes.
+  Isolation unchanged.
 - **2026-08-25** — Initial vision. Encodes the negotiated decisions: structured
   steps in frontmatter (contract v1), SDK-isolated turn execution with
   lib-when-upstream-ships posture, and skills as a first-class surface.
