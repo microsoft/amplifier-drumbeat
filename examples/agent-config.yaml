@@ -7,7 +7,7 @@
 # WHAT IT DOES. This is the single place an owner shapes which provider, model,
 # MCP servers, skills, and debug knobs a run is handed — in amplifier-agent's
 # OWN host-config vocabulary. drumbeat merges up to five layers into ONE host
-# config it hands amplifier-agent via `--config`; it never invents a second
+# config it hands the engine for that turn; it never invents a second
 # model-resolution mechanism. Lowest precedence first:
 #
 #   1. $AMPLIFIER_AGENT_CONFIG — the operator's own debug/host config (env), the base.

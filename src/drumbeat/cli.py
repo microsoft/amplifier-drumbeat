@@ -135,6 +135,13 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         print(runner.AGENT_INSTALL_HINT)
     else:
         print(f"agent command: {agent_path}")
+        # Pre-warm the bundle cache so the first scheduled turn never eats the
+        # cold prepare (which shells `uv pip install`). Reported here as well as
+        # done at `serve` startup -- doctor is where an operator checks readiness
+        # before relying on the engine. Best-effort: a failure is a visible
+        # warning, never a doctor crash.
+        warmed, warm_detail = runner.prewarm_engine()
+        print(f"bundle prewarm: {'OK' if warmed else 'WARNING'} -- {warm_detail}")
 
     # Drumpack wiring (drumpack-card.v1 rule 5 / VISION §4). A missing or empty
     # drumpacks.txt is a VISIBLE condition here, never a silent zero-tools turn:

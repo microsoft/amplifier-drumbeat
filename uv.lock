@@ -23,11 +23,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "amplifier-agent-py"
-version = "0.3.0"
-source = { git = "https://github.com/microsoft/amplifier-agent?subdirectory=wrappers%2Fpython-py#4e7c35185197234deae5905f5d0ff47dd235f64d" }
-
-[[package]]
 name = "amplifier-core"
 version = "1.6.1"
 source = { registry = "https://pypi.org/simple" }
@@ -254,14 +249,12 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "amplifier-agent" },
-    { name = "amplifier-agent-py" },
     { name = "pyyaml" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "amplifier-agent", git = "https://github.com/microsoft/amplifier-agent" },
-    { name = "amplifier-agent-py", git = "https://github.com/microsoft/amplifier-agent?subdirectory=wrappers%2Fpython-py" },
     { name = "pyyaml", specifier = ">=6.0" },
 ]
 

@@ -22,6 +22,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -33,21 +34,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-# The maintained agent SDK. Every turn is driven through it rather than
-# hand-rolled argv + stream parsing (VISION §3). It is a subprocess-isolated
-# wrapper: one `amplifier-agent run` OS process per `submit()`, exactly the
-# isolation contract this engine already depended on. See docs/ARCHITECTURE.md
-# and evidence/amplifier-agent-issues.md for the properties it does NOT cover
-# (kept here as honest partial adoption).
-from amplifier_agent_py import (
-    PROTOCOL_VERSION_REQUIRED_BY_WRAPPER,
-    AaaError,
-    AssembleArgvInput,
-    ErrorEvent,
-    ResultEvent,
-    assemble_argv,
-    spawn_agent_sync,
-)
+# Every turn runs in an isolated per-turn worker process that imports the
+# agent's engine LIBRARY directly (VISION §3) -- no CLI subprocess, no argv
+# contract, no stream parsing. The worker module is spawned via
+# ``sys.executable`` and returns typed results over a small NDJSON protocol on
+# its stdout; see ``drumbeat.agent_worker`` and ``_submit_turn`` below.
+from drumbeat.agent_worker import RESULT_ENVELOPE_KEY, WORKER_MODULE
 
 from drumbeat import (
     agent_config,
@@ -84,161 +76,125 @@ from drumbeat.rotation_log import log_session_rotation
 NOTHING_TO_REPORT = "NOTHING_TO_REPORT"
 
 _STEP_TIMEOUT_SECONDS = 900
-_AGENT_COMMAND = "amplifier-agent"
-
-# The engine executes every turn by shelling out to ``amplifier-agent``. If it
-# cannot be resolved, every automation in the workspace dies at spawn -- and,
-# before this, died invisibly: the FileNotFoundError propagated out of ``run()``
-# before the run had persisted anything, so the scheduler's catch-all logged one
-# line to a journal nobody tails and recorded ``run_id '<none -- raised>'`` in
-# memory. No run record, no failures.log line, no automation_error event, and
-# ``GET /api/automations/<slug>/runs`` still answered ``{"runs": [], "count":
-# 0}``. Failure class 1, in the engine whose entire pitch is that a silence
-# you cannot trust becomes a record you can.
-#
-# How it is resolved: SIBLING FIRST, then the turn PATH -- see
-# ``_resolve_agent_command``. A single ``uv tool install git+<drumbeat repo>``
-# co-installs amplifier-agent (a declared dependency) into the SAME tool venv
-# as drumbeat, but uv exposes only the primary package's script (``drumbeat``)
-# on the user PATH -- so the co-installed agent is found by locus (sibling of
-# ``sys.executable``), not by name. Nothing else needs installing.
+# The isolated per-turn worker (VISION §3). Every turn is a fresh
+# ``python -m drumbeat.agent_worker`` process that imports the engine LIBRARY
+# and runs one turn; ``sys.executable`` is what launches it, so there is no
+# separate CLI binary to resolve on PATH. What the turn needs is simply that
+# the engine library is IMPORTABLE in this interpreter (it is a declared
+# dependency -- the ``amplifier-agent`` git dep ships it). If it is not,
+# every automation dies at spawn -- and, before the defenses below, died
+# invisibly: the failure propagated out of ``run()`` before the run had
+# persisted anything, so no run record, no failures.log line, no
+# automation_error event was ever written. Failure class 1, in the engine
+# whose entire pitch is that a silence you cannot trust becomes a record you
+# can.
 #
 # Two defenses, deliberately overlapping. ``check_agent_command`` is the
 # PREFLIGHT: ``serve`` refuses to start and ``doctor`` reports, both quoting
 # the hint below, so the ordinary case is caught before a single automation is
-# scheduled. ``_execute_turn`` catches the spawn failure anyway, because the
-# preflight can be true at startup and false at 03:40 (an uninstall, a PATH
-# edit, a pack that shadows the name) -- and a run that dies then must still
-# land in the ledger.
+# scheduled. ``_execute_turn`` catches a worker start failure anyway, because
+# the preflight can be true at startup and false at 03:40 (a broken venv, a
+# partial upgrade) -- and a run that dies then must still land in the ledger.
 #
-# The hint is the fallback for a NON-tool-install setup (a dev checkout, a venv
-# without the dependency synced). amplifier-agent is not on PyPI, so the git URL
-# is the mechanism; it is unpinned to match the pyproject dependency.
+# The hint names the install path for a NON-tool-install setup (a dev checkout,
+# a venv without the dependency synced). amplifier-agent is not on PyPI, so the
+# git URL is the mechanism; it is unpinned to match the pyproject dependency.
 AGENT_INSTALL_HINT = (
-    f"{_AGENT_COMMAND} could not be resolved. The engine executes every turn "
-    "by running it, so nothing can run until it resolves.\n"
-    f"  A normal `uv tool install git+<drumbeat repo>` co-installs {_AGENT_COMMAND} "
-    "into the same tool venv and the engine finds it there automatically; if "
-    "you see this, drumbeat is likely running from a dev checkout or a venv "
-    "that has not installed its dependencies.\n"
-    "  To put it on PATH yourself (it is NOT on PyPI -- a bare `uv tool "
-    "install amplifier-agent` will not resolve):\n"
+    "the amplifier-agent engine library could not be imported. Every turn runs "
+    "in an isolated worker (`python -m " + WORKER_MODULE + "`) that imports it, "
+    "so nothing can run until it imports.\n"
+    "  A normal `uv tool install git+<drumbeat repo>` installs amplifier-agent "
+    "(a declared dependency) into the same environment automatically; if you "
+    "see this, drumbeat is likely running from a dev checkout or a venv that "
+    "has not installed its dependencies.\n"
+    "  To install it yourself (it is NOT on PyPI -- a bare `uv tool install "
+    "amplifier-agent` will not resolve):\n"
     "    uv tool install git+https://github.com/microsoft/amplifier-agent\n"
-    f"    {_AGENT_COMMAND} --version\n"
-    "  Then make sure the directory it landed in (usually ~/.local/bin) is on "
-    "the PATH this engine was started with."
+    "  or, in a dev checkout of drumbeat:  uv sync"
 )
 
-
-def _sibling_agent_command() -> str | None:
-    """``amplifier-agent`` installed alongside this interpreter, if present.
-
-    A ``uv tool install git+<drumbeat repo>`` builds ONE venv holding drumbeat
-    and its dependencies -- amplifier-agent among them, as an unpinned git dep
-    -- but uv exposes only the PRIMARY package's script (``drumbeat``) on the
-    user PATH (usually ~/.local/bin). amplifier-agent's own console script
-    lands in the tool venv's ``bin/`` (the directory holding ``sys.executable``)
-    and never reaches the turn PATH. Resolving it here, as a sibling of the
-    running interpreter, is what makes the single-command install story work:
-    the agent the engine shells out to is the one uv co-installed, with no
-    second manual install and no PATH surgery.
-    """
-    candidate = Path(sys.executable).parent / _AGENT_COMMAND
-    if candidate.is_file() and os.access(candidate, os.X_OK):
-        return str(candidate)
-    return None
-
-
-def _resolve_agent_command(workspace: Path) -> str:
-    """Absolute path to spawn ``amplifier-agent`` as; the bare name as last resort.
-
-    Order, and why:
-      1. Sibling of ``sys.executable`` (``_sibling_agent_command``) -- the agent
-         co-installed into this engine's own uv tool venv. uv keeps it off the
-         turn PATH, so it must be found by locus. This is the single-install
-         path, and it is preferred so the co-installed agent (guaranteed to be
-         the one resolved alongside this drumbeat) wins over any unrelated
-         amplifier-agent a machine happens to also have on PATH.
-      2. The turn PATH (``packs.turn_path``) -- a bring-your-own amplifier-agent
-         the operator installed separately and put on PATH. Preserves the
-         dev-checkout story.
-      3. The bare name, when neither resolves -- so the spawn raises the same
-         FileNotFoundError ``_execute_turn`` converts into a persisted run
-         failure quoting AGENT_INSTALL_HINT, rather than this function having to
-         return something a caller must special-case.
-    """
-    return (
-        _sibling_agent_command()
-        or shutil.which(_AGENT_COMMAND, path=packs.turn_path(Path(workspace)))
-        or _AGENT_COMMAND
-    )
+# How long the engine-library import preflight is allowed to take. The check
+# imports the library in a fresh ``sys.executable`` (the SAME interpreter every
+# worker runs in), so it answers about the exact import a turn will perform --
+# not about whatever happens to be in this process's sys.modules.
+_IMPORT_CHECK_TIMEOUT_SECONDS = 60
+# Prewarm shells a cold ``uv pip install`` on first prepare; give it real room.
+_PREWARM_TIMEOUT_SECONDS = 600
 
 
 def check_agent_command(workspace: Path) -> str | None:
-    """Resolve ``amplifier-agent`` as the engine will spawn it; None when missing.
+    """Confirm the engine LIBRARY is importable in a fresh worker interpreter.
 
-    The preflight for ``serve``/``doctor``. Mirrors ``_resolve_agent_command``'s
-    first two sources -- the sibling of ``sys.executable`` (the tool-venv
-    co-install), then the turn PATH -- so the preflight answers about the SAME
-    binary a turn will actually run.
+    The preflight for ``serve``/``doctor``. Every turn runs
+    ``python -m {WORKER_MODULE}`` under ``sys.executable`` and imports the
+    engine library there, so this imports it in a fresh subprocess of that SAME
+    interpreter -- answering about the exact import a turn will perform, not
+    about this long-lived process's already-loaded modules (importing the heavy
+    library into the serve process just to preflight would also bind its
+    process-global state here, which the per-turn-worker design exists to avoid).
 
-    The turn-PATH half is deliberately resolved against
-    ``packs.turn_path(workspace)`` -- the exact PATH ``_turn_env`` hands every
-    turn -- and not against ``os.environ``. Those two differ by construction
-    (the base PATH is pinned at startup and pack ``bin/`` directories are
-    prepended), so a preflight that consulted the launcher's environment could
-    answer "present" about a PATH no turn ever runs with.
-
-    Returns None -- not the bare name -- when neither source resolves, because
-    its callers (``serve`` refusing to start, ``doctor`` printing MISSING)
-    branch on None.
+    Returns a short descriptor (the resolved interpreter + library version) when
+    the import succeeds, or ``None`` when it fails -- because its callers
+    (``serve`` refusing to start, ``doctor`` printing MISSING) branch on None.
+    ``workspace`` is accepted for signature stability with the call sites; the
+    library import does not depend on the turn PATH.
     """
-    return _sibling_agent_command() or shutil.which(
-        _AGENT_COMMAND, path=packs.turn_path(Path(workspace))
+    del workspace  # library import is PATH-independent; kept for call-site stability
+    probe = (
+        "import amplifier_agent_lib as _l, amplifier_agent_cli.provider_sources; "
+        "print(_l.__version__)"
     )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=_IMPORT_CHECK_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    version = result.stdout.strip() or "unknown"
+    return f"amplifier-agent engine library {version} (import via {sys.executable})"
+
+
+def prewarm_engine(*, timeout: float = _PREWARM_TIMEOUT_SECONDS) -> tuple[bool, str]:
+    """Prepare the bundle cache in a worker subprocess. Returns ``(ok, detail)``.
+
+    Requirement (h): ``serve``/``service install`` startup and ``doctor``
+    pre-warm the bundle prep (a cold prepare shells ``uv pip install``) so the
+    first scheduled turn never eats it. Runs the worker's ``--prewarm`` mode
+    under ``sys.executable`` -- the SAME interpreter and code path a real turn
+    uses -- so a warm cache here is a warm cache there. Best-effort: a failure
+    is reported for the caller to log, never raised, because a turn can still
+    (slowly) prepare its own cache.
+    """
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", WORKER_MODULE, "--prewarm"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"bundle prewarm could not run: {exc}"
+    if result.returncode != 0:
+        tail = (result.stderr or result.stdout or "").strip()[-500:]
+        return False, f"bundle prewarm exited {result.returncode}: {tail}"
+    return True, "bundle cache prepared"
 
 
 class RunnerError(Exception):
     """Raised for runner-level failures that are not a specific step's fault."""
 
 
-# Linux caps a SINGLE argv element at MAX_ARG_STRLEN = 32 * PAGE_SIZE. On every
-# machine this engine has run on (4 KiB pages) that is 131072 bytes = 128 KiB.
-# The engine passes the whole turn text as the last argv element to
-# amplifier-agent (see ``_build_command``), so a turn whose text reaches this
-# size fails ``execve`` with ``OSError(errno=E2BIG)`` -- BEFORE the agent boots,
-# with no run record. Measured on this host: 131071 bytes execs, 131072 fails.
-# This is the ceiling the reference-form guidance mechanism exists to stay far
-# under, and the belt guard below is what turns a breach into a named,
-# actionable failure instead of the kernel's opaque E2BIG.
-MAX_ARG_STRLEN = 131072
-
-
-class TurnTooLargeError(RunnerError):
-    """One turn's text would exceed the OS per-argument ceiling (MAX_ARG_STRLEN).
-
-    The belt in ``_build_command``: a turn whose text is this large would fail
-    ``execve`` with E2BIG the moment it is spawned. Raising here instead lets
-    ``_execute_turn`` convert it into a StepResult with ``.error`` set -- the
-    SAME persisted-run / failures.log / automation_error path a spawn failure
-    already takes -- so the breach lands in the ledger loudly rather than
-    surfacing as an opaque OSError with no record. The remedy is almost always
-    ``guidance_delivery: reference`` (the default): reference-form guidance
-    keeps the turn a few hundred bytes no matter how large the files are.
-    """
-
-    def __init__(self, *, nbytes: int, limit: int = MAX_ARG_STRLEN) -> None:
-        self.nbytes = nbytes
-        self.limit = limit
-        super().__init__(
-            f"turn text is {nbytes} bytes, at or over the OS per-argument "
-            f"ceiling of {limit} bytes (MAX_ARG_STRLEN); it would fail execve "
-            f"with E2BIG before amplifier-agent could boot. Almost always this "
-            f"is an automation using `guidance_delivery: inline` with a large "
-            f"required guidance file -- switch it to the default "
-            f"`guidance_delivery: reference` so the guidance is referenced by "
-            f"path instead of inlined into argv."
-        )
+# The turn text travels on stdin: the worker reads its whole task spec (prompt
+# included) as JSON (see ``_submit_turn``). No OS per-argument ceiling applies
+# to a turn's text, so there is no size a turn's prompt must stay under and no
+# guard standing between a large prompt and the engine.
 
 
 class SessionLockedError(RunnerError):
@@ -290,6 +246,12 @@ class StepResult:
     # reader sees a real number or a null, never a lie.
     tokens_in: int | None
     tokens_out: int | None
+    # The engine's real reported cost for this turn (a decimal string, e.g.
+    # ``"0.0097434"``), or ``None`` when no cost was reported -- honestly ABSENT,
+    # never a fabricated ``0`` (VISION §4), same discipline as the token counts
+    # above. A decimal STRING, not a float, so monetary precision survives being
+    # persisted to the run record verbatim (``_persist_run``).
+    cost_usd: str | None = None
     # ADDITIVE (decomposition step 5; see docs/ARCHITECTURE.md): a machine-readable
     # classification of WHY this turn failed, for the one decision that
     # genuinely depends on it -- "is it safe to resend the user's text
@@ -367,10 +329,10 @@ class RunResult:
     ci_upload_exit_code: int | None = None
     ci_upload_error: str | None = None
     # Per-automation agent config (9h5): the materialized host config this run's
-    # turns were handed via ``--config`` (its ``runs_dir``-relative-ish absolute
-    # path) and the sha256 of its exact bytes. Both ``None`` when the resolved
-    # config was empty -- i.e. no ``--config`` was threaded and the run used the
-    # engine defaults, byte-identical to pre-feature behavior. Recorded so a run
+    # turns were handed (its ``runs_dir``-relative-ish absolute path) and the
+    # sha256 of its exact bytes. Both ``None`` when the resolved config was
+    # empty -- i.e. no host config was handed down and the run used the
+    # engine defaults. Recorded so a run
     # can be tied back to the exact provider/model/skills policy it executed
     # under. Set on the normal run path (aborts before any turn leave them None).
     effective_config_path: str | None = None
@@ -820,25 +782,6 @@ def _conversation_rotation_reason(
     return None
 
 
-def _ensure_turn_within_arg_limit(text: str) -> None:
-    """Fail loud, named, if one turn's text would breach the OS per-argument ceiling.
-
-    The maintained SDK passes the prompt as a SINGLE positional argv element
-    (``amplifier_agent_py.assemble_argv``), exactly as the old hand-rolled
-    command did -- so the ``MAX_ARG_STRLEN`` / E2BIG ceiling is NOT something the
-    SDK escapes (it spills a large *MCP config* to a tmpfile but never the
-    prompt; see evidence/amplifier-agent-issues.md #7). This belt is KEPT: a
-    turn at or over the ceiling would otherwise fail ``execve`` with an opaque
-    E2BIG inside the SDK, surfacing as a bare ``spawn_failed`` ErrorEvent that
-    loses the named remedy. Raising ``TurnTooLargeError`` here lets
-    ``_execute_turn`` convert it into a persisted run failure carrying the
-    reference-form-guidance remedy, exactly as before.
-    """
-    nbytes = len(text.encode("utf-8"))
-    if nbytes >= MAX_ARG_STRLEN:
-        raise TurnTooLargeError(nbytes=nbytes)
-
-
 def _build_command(
     *,
     session_id: str,
@@ -847,50 +790,30 @@ def _build_command(
     text: str,
     host_config_path: Path | None = None,
 ) -> list[str]:
-    """The EXACT argv the SDK will spawn for this turn.
+    """The EXACT argv the worker is spawned with for this turn.
 
-    Turn execution no longer spawns from this list -- ``spawn_agent_sync`` owns
-    the real spawn (VISION §3, "the invocation goes through the maintained agent
-    SDK rather than hand-rolled argv and stream parsing"). This function exists
-    for two things that genuinely need the argv, and it builds it from the SDK's
-    OWN ``assemble_argv`` so it can never drift from what actually runs:
+    Turn execution spawns this in ``_submit_turn`` -- ``[sys.executable, "-m",
+    WORKER_MODULE]`` -- and hands the task spec (prompt, session id, cwd, config
+    path, resume flag) to the worker on **stdin** as JSON, never on argv. So the
+    prompt is deliberately NOT in this list: the arguments here are stable and
+    small, and a turn's text can be arbitrarily large with no OS argv ceiling.
 
-      * ``drumbeat --dry-run`` prints a real, runnable command line.
-      * ``drain.AGENT_TURN_MARKER`` (``"amplifier-agent run --session-id"``)
-        must appear in the spawned process's ``/proc/<pid>/cmdline``. The SDK
-        spawns ``create_subprocess_exec(binary, *assemble_argv(...))``; argv[0]
-        is the resolved agent binary (basename ``amplifier-agent``), immediately
-        followed by ``run`` then ``--session-id`` -- so the marker is carried
-        exactly as the old hand-rolled command carried it. Proven in
+    Two things genuinely need this argv, and both get exactly what a turn runs:
+
+      * ``drumbeat --dry-run`` prints the real, runnable worker command line.
+      * ``drain.AGENT_TURN_MARKER`` (``"drumbeat.agent_worker"``) must appear in
+        the spawned process's ``/proc/<pid>/cmdline``. ``python -m
+        drumbeat.agent_worker`` carries the dotted module name in argv, so the
+        marker is present by construction. Proven in
         ``tests/test_soft_launch_gates.py`` against this function's output.
 
-    ``--display ndjson`` is unconditional now: every turn runs with the typed
-    NDJSON stream so usage events (real token counts, VISION §4) are always
-    available, not just on the interactive progress path. ``-y`` comes from the
-    SDK's ``approval_mode=None`` default. No ``--`` prompt guard is emitted --
-    the SDK does not support one; ``_execute_turn`` keeps the prompt off a
-    leading ``-`` by prepending the now-context line at the very top (see there
-    and evidence/amplifier-agent-issues.md #8).
+    ``session_id``/``fresh``/``text``/``host_config_path`` are accepted so every
+    existing (dry-run) call site is untouched; they travel to the worker via the
+    stdin task spec, not argv, so they do not appear in the returned list.
     """
-    _ensure_turn_within_arg_limit(text)
-    argv = assemble_argv(
-        AssembleArgvInput(
-            session_id=session_id,
-            prompt=text,
-            protocol_version=PROTOCOL_VERSION_REQUIRED_BY_WRAPPER,
-            resume=not fresh,
-            cwd=str(cwd),
-            config_path=str(host_config_path) if host_config_path is not None else None,
-            display_mode="ndjson",
-        )
-    )
-    # argv[0] resolution is unchanged from the hand-rolled era: SIBLING of
-    # sys.executable first (the agent co-installed into this engine's own tool
-    # venv, kept off the turn PATH by uv), then the turn PATH, then the bare
-    # name. The SDK's own binary discovery only knows AMPLIFIER_AGENT_BIN / PATH
-    # and would miss the sibling, so ``_submit_turn`` hands it this exact path
-    # via ``_binary_resolver`` -- see evidence/amplifier-agent-issues.md #10.
-    return [_resolve_agent_command(Path(cwd)), *argv]
+    del session_id, fresh, text, host_config_path  # -> stdin task spec, not argv
+    del cwd  # the worker's cwd is set on the spawn, not encoded in argv
+    return [sys.executable, "-m", WORKER_MODULE]
 
 
 def _format_command(cmd: list[str]) -> str:
@@ -899,16 +822,15 @@ def _format_command(cmd: list[str]) -> str:
 
 # ---- live progress (Change: chat "what is it doing right now") ----
 #
-# amplifier-agent emits a stream of NDJSON events on stderr under `--display
-# ndjson` (tool/started, tool/completed, thinking/delta, thinking/final,
-# progress, result/delta, result/final, usage, error -- the 9-type canonical
-# taxonomy). The SDK parses that stream into typed ``NotificationEvent``s
-# (``method`` + ``params``); ``_submit_turn`` feeds each one to the tracker
-# below via ``observe_event`` (no more hand-rolled per-line JSON parsing off a
-# raw pipe). This surfaces the stream, translated into human-safe phrases, for
-# chat/reply turns (see ``_execute_turn``'s ``progress_callback`` parameter);
-# the SAME typed stream also carries the ``usage`` events ``_submit_turn`` sums
-# into real token counts for EVERY turn (VISION §4).
+# The engine emits typed display events (tool/started, tool/completed,
+# thinking/delta, thinking/final, progress, result/delta, result/final, usage,
+# error -- the 9-type canonical taxonomy). The isolated per-turn worker forwards
+# each one to its stdout as a drumbeat-shaped NDJSON line (``method`` + ``params``);
+# ``_submit_turn`` reads those lines and feeds each to the tracker below via
+# ``observe_event``. This surfaces the stream, translated into human-safe
+# phrases, for chat/reply turns (see ``_execute_turn``'s ``progress_callback``
+# parameter). The engine's own authoritative token/cost totals arrive with the
+# worker's terminal result envelope, not by summing this stream (VISION §4).
 
 
 @dataclass(frozen=True)
@@ -1092,13 +1014,11 @@ class _TurnProgressTracker:
     def observe_event(self, method: str, params: dict[str, Any]) -> None:
         """Advance progress from one already-parsed NDJSON notification.
 
-        This is the seam the SDK path drives: ``_submit_turn`` receives typed
-        ``NotificationEvent(method, params)`` values off the SDK's parsed NDJSON
-        stream and calls this directly -- no more hand-rolled per-line JSON
-        parsing off a raw pipe. ``observe_line`` is kept as the wire-line entry
-        point (parses a raw line, then delegates here); it and its tests are
-        unchanged. An unrecognized ``method`` is ignored -- not counted, not
-        guessed -- exactly as before.
+        The seam the turn path drives: ``_submit_turn`` reads the worker's
+        NDJSON display events off its stdout and feeds each ``method``/
+        ``params`` pair here. ``observe_line`` is the wire-line entry point
+        (parses a raw line, then delegates here). An unrecognized ``method`` is
+        ignored -- not counted, not guessed.
         """
         if method not in _CANONICAL_NDJSON_METHODS:
             return  # unrecognized event type -- don't count it, don't guess
@@ -1328,23 +1248,18 @@ def format_requirements_turn(
 
     * ``"reference"`` (default, preferred): inject only the workspace-relative
       guidance PATHS plus a mandatory "read these first" preamble. The bodies
-      are NOT embedded, so the turn text -- and therefore argv -- stays a few
-      hundred bytes regardless of how large the guidance is. This is what
-      kills the argv-inlining failure class at the root (a single argv element
-      over Linux's 128 KiB ``MAX_ARG_STRLEN`` fails ``execve`` with E2BIG,
-      silently, before the agent ever boots -- exactly how channels-check
-      died). ``check_requirements`` has already read each file to fail loud on
-      a missing/empty one BEFORE this is reached, so referencing (rather than
+      are NOT embedded, so the turn text stays a few hundred bytes regardless
+      of how large the guidance is, and a resumed session reads the CURRENT
+      file rather than a body snapshotted into its transcript.
+      ``check_requirements`` has already read each file to fail loud on a
+      missing/empty one BEFORE this is reached, so referencing (rather than
       inlining) loses none of that guarantee; the agent loads the current body
       itself with its file tools, which every turn has.
-    * ``"inline"`` (legacy): embed each guidance body verbatim, as the engine
-      always did. Kept working during migration. Subject to the runner's
-      turn-size belt guard, which fails loud (named) before the kernel's opaque
-      E2BIG would.
+    * ``"inline"``: embed each guidance body verbatim, for an automation that
+      genuinely needs its guidance literally in the transcript.
 
     Pack cards ride inline in BOTH modes -- they are pack documentation, not
-    workspace files the agent can read by relative path, and have never been
-    the argv-size culprit.
+    workspace files the agent can read by relative path.
 
     Returns None only when there is genuinely nothing to inject -- no
     file-kind requirements AND no pack cards. Only ever called after every
@@ -1353,8 +1268,8 @@ def format_requirements_turn(
     """
     if mode not in VALID_GUIDANCE_DELIVERY:
         # Fail loud rather than silently defaulting: a typo'd mode that quietly
-        # inlined 200 KiB of guidance would resurrect the exact E2BIG class
-        # this parameter exists to prevent.
+        # inlined 200 KiB of guidance would change what every turn carries, and
+        # stale it, without anyone asking for either.
         raise RunnerError(
             f"format_requirements_turn mode must be one of "
             f"{sorted(VALID_GUIDANCE_DELIVERY)}, got {mode!r}"
@@ -1397,7 +1312,7 @@ def format_requirements_turn(
         # tools, resolving the relative path against its cwd (the workspace) --
         # the same base ``check_requirements`` used to verify them. The bodies
         # were verified present and non-empty at the gate; here we only name
-        # them, so argv never carries their weight.
+        # them, so the turn text never carries their weight.
         listing = "\n".join(f"- {c.item}" for c in file_checks)
         parts.append(
             "The following files are this automation's required guidance, "
@@ -1610,101 +1525,64 @@ def _looks_like_refusal(text: str) -> bool:
 
 @dataclass
 class _TurnOutcome:
-    """Normalized result of one SDK-driven turn.
+    """Normalized result of one worker-driven turn.
 
-    The SDK-agnostic seam between ``_submit_turn`` (which speaks the SDK's typed
-    event protocol) and ``_execute_turn`` (which maps to ``StepResult`` and owns
-    the failure taxonomy). It is also the established fake seam for tests: patch
-    ``runner._submit_turn`` to return one of these instead of driving a real
-    agent -- the replacement for the old ``_invoke_turn`` 4-tuple fake.
+    The seam between ``_submit_turn`` (which drives the isolated per-turn worker
+    and reads its NDJSON protocol) and ``_execute_turn`` (which maps to
+    ``StepResult`` and owns the failure taxonomy). It is also the established
+    fake seam for tests: patch ``runner._submit_turn`` to return one of these
+    instead of spawning a real worker.
 
-    ``tokens_in``/``tokens_out`` are ``None`` when NO ``usage`` event carried
-    real counts -- honestly ABSENT, never a fabricated ``0`` (VISION §4: "a
-    metric that is silently always zero is a defect"). A turn that reported usage
-    carries the summed values (usage is emitted once per LLM call, so summing --
-    not last-wins -- is the only correct aggregation; a trailing rollup event
-    carries 0/0 and would zero a last-wins reader).
+    ``tokens_in``/``tokens_out``/``cost_usd`` are ``None`` when the worker
+    reported no real usage -- honestly ABSENT, never a fabricated ``0`` (VISION
+    §4: "a metric that is silently always zero is a defect"). They carry the
+    engine's own authoritative numbers (the worker prefers the engine's turn
+    result fields, falling back to its ``usage`` display events), so drumbeat no
+    longer re-aggregates a raw stream itself.
     """
 
     reply: str = ""
     error: str | None = None
     timed_out: bool = False
+    # The worker could not run the turn at all (engine library unimportable, or
+    # the worker process exited without emitting a terminal result). Rides the
+    # AGENT_INSTALL_HINT path in ``_execute_turn`` -- the successor to the SDK
+    # era's binary-not-found ``spawn_failed``.
     spawn_failed: bool = False
     tokens_in: int | None = None
     tokens_out: int | None = None
+    cost_usd: str | None = None
     duration_ms: int = 0
     stderr_text: str = ""
 
 
-# PATH bridge for the SDK's env model. ``build_env`` filters the child env to an
-# allowlist and REFUSES a per-turn ``PATH`` in ``env.extra`` (PATH is in its
-# BLOCKED_ENV_KEYS), inheriting only ``os.environ["PATH"]``. drumbeat's turns
-# need the pack-augmented turn PATH (``packs.turn_path``) so the agent's bash
-# tool can find pack-provided CLIs -- a load-bearing property the SDK does not
-# cover (evidence/amplifier-agent-issues.md #6). The bridge: set
-# ``os.environ["PATH"]`` to the turn PATH for the brief, SERIALIZED window in
-# which ``spawn_agent_sync`` snapshots ``os.environ`` (it does so once,
-# synchronously, before the turn subprocess is spawned), then restore it.
-# ``turn_path`` is a per-process constant (a serve process has one cwd), so
-# concurrent turns write the identical value; this lock makes save/set/restore
-# atomic so an interleave can never leave PATH mutated.
-_SDK_SPAWN_ENV_LOCK = threading.Lock()
-
-
-def _sdk_env_for_turn(
+def _worker_env(
     cwd: Path,
     *,
     runs_dir: Path,
     session_id: str | None = None,
-) -> tuple[list[str], dict[str, str], str]:
-    """``(allowlist, extra, turn_path)`` for one SDK turn.
+) -> dict[str, str]:
+    """The exact environment the per-turn worker is spawned with.
 
-    Preserves the exact child environment the old ``_turn_env`` produced for the
-    agent subprocess: the full ``os.environ`` inherited (allowlist = every
-    current key, matching the old ``dict(os.environ)``), plus the two drumbeat
-    vars the agent's bash tool and any consumer CLI it invokes read
-    (``DRUMBEAT_TURN_SESSION_ID``, ``DRUMBEAT_DATA_DIR``) in ``extra``, plus the
-    pack-augmented turn PATH -- which the SDK cannot accept in ``extra`` and so is
-    applied by the caller via the ``os.environ["PATH"]`` bridge above.
+    The full parent environment inherited (so the worker resolves the same
+    ``$AMPLIFIER_AGENT_HOME`` / ``$AMPLIFIER_AGENT_WORKSPACE`` and provider
+    credentials the engine already used), plus the two drumbeat vars the agent's
+    bash tool and any consumer CLI it invokes read (``DRUMBEAT_TURN_SESSION_ID``,
+    ``DRUMBEAT_DATA_DIR``), plus the pack-augmented turn ``PATH`` set DIRECTLY on
+    the child -- no ``os.environ["PATH"]`` bridge, no serializing lock. The SDK
+    era needed that bridge because the wrapper's env model refused a per-turn
+    PATH; a plain subprocess env does not.
 
     ``packs.turn_path`` is deliberately NOT wrapped: a workspace whose pack list
-    is broken must fail the run loudly (same discipline as ``_turn_env`` and its
-    module note), not quietly resolve tools off a degraded PATH.
+    is broken must fail the run loudly (``packs.PackError`` propagates), not
+    quietly resolve tools off a degraded PATH.
     """
-    extra: dict[str, str] = {
-        DATA_DIR_ENV_VAR: str(Path(runs_dir).expanduser().resolve()),
-    }
+    env = dict(os.environ)
     if session_id:
-        extra[TURN_SESSION_ID_ENV_VAR] = session_id
-    turn_path = packs.turn_path(cwd)
-    allowlist = list(os.environ.keys())
-    return allowlist, extra, turn_path
-
-
-def _aaa_error_message(exc: AaaError) -> str:
-    """Human-facing string for an SDK ``AaaError`` (remediation, else the code)."""
-    return exc.remediation or exc.code
-
-
-def _error_event_message(event: ErrorEvent) -> str:
-    """Human-facing string for an SDK ``ErrorEvent``.
-
-    Preserves the exact error string drumbeat has always recorded for a non-zero
-    engine exit -- ``"amplifier-agent exited N"`` -- which the SDK reports as code
-    ``engine_exit_<N>``. Run records, failures.log, and downstream assertions key
-    on that string, so translating it here keeps the failure taxonomy stable
-    across the SDK cut. Every other code keeps the SDK's own message plus its code
-    (e.g. ``envelope_missing``, ``engine_hung``) so a reader can still tell a hang
-    from a missing envelope from an envelope-carried engine error.
-    """
-    code = event.code or ""
-    m = re.match(r"engine_exit_(-?\d+)$", code)
-    if m:
-        return f"amplifier-agent exited {m.group(1)}"
-    base = event.message or code
-    if code and code not in base:
-        return f"{code}: {base}"
-    return base
+        env[TURN_SESSION_ID_ENV_VAR] = session_id
+    env[DATA_DIR_ENV_VAR] = str(Path(runs_dir).expanduser().resolve())
+    env["PATH"] = packs.turn_path(cwd)
+    return env
 
 
 def _submit_turn(
@@ -1717,42 +1595,38 @@ def _submit_turn(
     host_config_path: Path | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> _TurnOutcome:
-    """Drive ONE turn through the maintained agent SDK and normalize the outcome.
+    """Run ONE turn in an isolated worker process and normalize the outcome.
 
-    Replaces the hand-rolled ``_build_command`` / ``_invoke_turn`` stream pumps /
-    ``_parse_envelope`` stack (VISION §3). The SDK owns: the single-OS-process-
-    per-turn spawn, argv assembly, ``--output json`` envelope parsing with the
-    §4.1 precedence rules, the typed NDJSON event stream (progress + usage), and
-    the timeout -> SIGTERM/SIGKILL escalation on the child's process group.
+    Spawns ``python -m drumbeat.agent_worker`` (one OS process per turn, VISION
+    §3), hands it the task spec -- prompt, session id, cwd, materialized-config
+    path, resume flag -- on **stdin** as JSON (never on argv), and reads the
+    worker's stdout NDJSON protocol: display events feed the progress tracker
+    (activity narration), and one terminal envelope (``RESULT_ENVELOPE_KEY``)
+    carries the reply and the engine's real token/cost counts. The worker's
+    stderr is captured verbatim as this turn's stderr text (ceiling detection and
+    the run's stderr.log read it).
 
-    On top of that, this adds the drumbeat properties the SDK does NOT itself
-    cover (honest partial adoption -- see evidence/amplifier-agent-issues.md):
-      * #7 the E2BIG argv belt (``_ensure_turn_within_arg_limit`` runs BEFORE any
-        spawn, so it propagates as ``TurnTooLargeError`` and ``_execute_turn``
-        keeps the named reference-form-guidance remedy);
-      * #6 the per-turn PATH bridge (``_SDK_SPAWN_ENV_LOCK``);
-      * #10 handing the SDK drumbeat's OWN resolved agent binary via
-        ``_binary_resolver`` (the SDK's discovery only knows AMPLIFIER_AGENT_BIN
-        / PATH and would miss the tool-venv sibling);
-      * VISION §4 real token counts, by SUMMING ``usage`` events into
-        ``tokens_in``/``tokens_out`` -- or leaving them absent (``None``), never 0.
-
-    Contract: every in-turn failure is returned as a populated
-    ``_TurnOutcome.error``. The only exceptions that escape are ``TurnTooLargeError``
-    (the belt, which ``_execute_turn`` handles explicitly) and ``packs.PackError``
-    from env construction (a broken workspace must fail the run loudly, exactly as
-    the old ``_turn_env`` on the same path did).
+    Properties preserved from the SDK era: one OS process per turn; a hard
+    timeout enforced by SIGKILL to the whole process group (so the agent's own
+    tool subprocesses die with it); the pack-augmented per-turn PATH, now set
+    DIRECTLY on the child (no ``os.environ`` bridge, no serializing lock); and
+    "every failure becomes a populated ``_TurnOutcome.error``". The only
+    exception allowed to escape is ``packs.PackError`` from ``_worker_env`` -- a
+    broken workspace must fail the run loudly, exactly as before.
     """
-    _ensure_turn_within_arg_limit(text)  # belt -> TurnTooLargeError, before any spawn
-    agent_bin = _resolve_agent_command(cwd)
-    allowlist, extra, turn_path = _sdk_env_for_turn(
-        cwd, runs_dir=runs_dir, session_id=session_id
-    )
-
-    tokens_in = 0
-    tokens_out = 0
-    saw_usage = False
-    stderr_lines: list[str] = []
+    env = _worker_env(cwd, runs_dir=runs_dir, session_id=session_id)  # PackError escapes
+    spec = {
+        "prompt": text,
+        "session_id": session_id,
+        "turn_id": f"turn-{secrets.token_hex(4)}",
+        "cwd": str(cwd),
+        "host_config_path": (
+            str(host_config_path) if host_config_path is not None else None
+        ),
+        "mode": None,
+        "resume": not fresh,
+    }
+    spec_json = json.dumps(spec)
     tracker = (
         _TurnProgressTracker(progress_callback, _load_activity_labels(cwd))
         if progress_callback is not None
@@ -1764,116 +1638,160 @@ def _submit_turn(
     def _elapsed_ms() -> int:
         return int((time.monotonic() - started) * 1000)
 
-    # Spawn the SDK handle under the PATH bridge. spawn_agent_sync snapshots
-    # os.environ synchronously here (binary discovery + version probe), so the
-    # turn PATH only needs to be in place for this call, not for the whole turn.
     try:
-        with _SDK_SPAWN_ENV_LOCK:
-            saved_path = os.environ.get("PATH")
-            os.environ["PATH"] = turn_path
-            try:
-                handle = spawn_agent_sync(
-                    session_id=session_id,
-                    resume=not fresh,
-                    cwd=str(cwd),
-                    config_path=(
-                        str(host_config_path) if host_config_path is not None else None
-                    ),
-                    display_mode="ndjson",
-                    env={"allowlist": allowlist, "extra": extra},
-                    timeout_ms=_STEP_TIMEOUT_SECONDS * 1000,
-                    _binary_resolver=lambda: agent_bin,
-                )
-            finally:
-                if saved_path is None:
-                    os.environ.pop("PATH", None)
-                else:
-                    os.environ["PATH"] = saved_path
-    except AaaError as exc:
-        # Raised BEFORE the turn started: binary_not_found, protocol_version_mismatch,
-        # engine_probe_failed, env_injection_rejected, ... No subprocess ran.
-        # binary_not_found is the old spawn FileNotFoundError case -- route it to
-        # the same hinted, agent_command_missing path.
-        return _TurnOutcome(
-            error=_aaa_error_message(exc),
-            spawn_failed=exc.code in ("binary_not_found", "spawn_failed"),
-            duration_ms=_elapsed_ms(),
+        proc = subprocess.Popen(  # noqa: S603 - args are fixed, prompt travels via stdin
+            [sys.executable, "-m", WORKER_MODULE],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=str(cwd),
+            env=env,
+            text=True,
+            start_new_session=True,  # own process group -> killpg reaches tool subprocesses
+            close_fds=True,
         )
-    except Exception as exc:  # noqa: BLE001 - every turn failure becomes StepResult.error
+    except Exception as exc:  # noqa: BLE001 - a worker that cannot even start is a spawn failure
         return _TurnOutcome(
-            error=f"turn could not be started: {exc}", duration_ms=_elapsed_ms()
+            error=f"could not start the turn worker: {exc}",
+            spawn_failed=True,
+            duration_ms=_elapsed_ms(),
         )
 
-    terminal: ResultEvent | ErrorEvent | None = None
+    timed_out = threading.Event()
+
+    def _kill_group() -> None:
+        timed_out.set()
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+
+    watchdog = threading.Timer(_STEP_TIMEOUT_SECONDS, _kill_group)
+    watchdog.daemon = True
+    watchdog.start()
+
+    stderr_parts: list[str] = []
+
+    def _drain_stderr() -> None:
+        try:
+            assert proc.stderr is not None
+            for line in proc.stderr:
+                stderr_parts.append(line)
+        except Exception:  # noqa: BLE001 - draining is best-effort; the turn still resolves
+            pass
+
+    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    stderr_thread.start()
+
+    def _write_stdin() -> None:
+        # A dedicated writer so an arbitrarily large prompt (which the SDK-era
+        # argv ceiling forbade) can never deadlock against the worker's own
+        # stdout: the worker reads all of stdin before emitting anything.
+        try:
+            assert proc.stdin is not None
+            proc.stdin.write(spec_json)
+            proc.stdin.close()
+        except Exception:  # noqa: BLE001 - a broken pipe surfaces as a missing terminal envelope
+            pass
+
+    stdin_thread = threading.Thread(target=_write_stdin, daemon=True)
+    stdin_thread.start()
+
+    terminal: dict[str, Any] | None = None
     try:
-        with handle:
-            for event in handle.submit(text):
-                etype = getattr(event, "type", None)
-                if etype == "notification":
-                    method = event.method
-                    params = event.params if isinstance(event.params, dict) else {}
-                    # Reconstruct a stderr text stream for callers that still
-                    # need one (ceiling detection, run-record stderr.log): under
-                    # --display ndjson the child's stderr IS this notification
-                    # stream. Non-JSON stderr the SDK captured is appended from
-                    # the terminal ErrorEvent's tail below.
-                    stderr_lines.append(json.dumps({"method": method, "params": params}))
-                    if method == "usage":
-                        i = params.get("inputTokens")
-                        o = params.get("outputTokens")
-                        if isinstance(i, int) and isinstance(o, int):
-                            tokens_in += i
-                            tokens_out += o
-                            saw_usage = True
-                    if tracker is not None:
-                        tracker.observe_event(method, params)
-                elif etype in ("result", "error"):
-                    terminal = event
-                # init / activity events are liveness only -- nothing to record.
-    except Exception as exc:  # noqa: BLE001 - never let a turn failure escape as an exception
-        return _TurnOutcome(
-            error=f"turn failed mid-stream: {exc}",
-            duration_ms=_elapsed_ms(),
-            stderr_text="\n".join(stderr_lines),
-            tokens_in=tokens_in if saw_usage else None,
-            tokens_out=tokens_out if saw_usage else None,
-        )
+        assert proc.stdout is not None
+        for raw in proc.stdout:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # stray non-protocol stdout -- ignore, exactly as before
+            if not isinstance(obj, dict):
+                continue
+            if RESULT_ENVELOPE_KEY in obj:
+                payload = obj[RESULT_ENVELOPE_KEY]
+                if isinstance(payload, dict):
+                    terminal = payload
+                continue
+            method = obj.get("method")
+            params = obj.get("params")
+            if (
+                tracker is not None
+                and isinstance(method, str)
+                and isinstance(params, dict)
+            ):
+                tracker.observe_event(method, params)
+    except Exception:  # noqa: BLE001 - never let a read failure escape as an exception
+        pass
+    finally:
+        watchdog.cancel()
+        try:
+            proc.wait(timeout=30)
+        except Exception:  # noqa: BLE001 - a wedged worker gets the same group SIGKILL
+            _kill_group()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=10)
+        stderr_thread.join(timeout=5)
+        stdin_thread.join(timeout=5)
 
     duration_ms = _elapsed_ms()
-    tok_in = tokens_in if saw_usage else None
-    tok_out = tokens_out if saw_usage else None
-    stderr_text = "\n".join(stderr_lines)
+    stderr_text = "".join(stderr_parts).strip()
 
-    if isinstance(terminal, ResultEvent):
+    # Timeout wins over every other classification: the group was SIGKILLed, so
+    # there is no terminal envelope, but this is a timeout, not a spawn failure.
+    # ``_execute_turn`` supplies the canonical timeout message and duration.
+    if timed_out.is_set():
         return _TurnOutcome(
-            reply=terminal.text,
+            error=f"step timed out after {_STEP_TIMEOUT_SECONDS}s",
+            timed_out=True,
+            duration_ms=duration_ms,
+            stderr_text=stderr_text,
+        )
+
+    if terminal is None:
+        # The worker exited without emitting a result -- the engine library was
+        # unimportable (the module itself failed), or the worker crashed hard.
+        # Route it through the AGENT_INSTALL_HINT path so the remedy is named.
+        tail = f"\n{stderr_text[-2000:]}" if stderr_text else ""
+        return _TurnOutcome(
+            error=f"the turn worker exited without producing a result{tail}",
+            spawn_failed=True,
+            duration_ms=duration_ms,
+            stderr_text=stderr_text,
+        )
+
+    tok_in = terminal.get("tokens_in")
+    tok_out = terminal.get("tokens_out")
+    cost = terminal.get("cost_usd")
+    tok_in = tok_in if isinstance(tok_in, int) else None
+    tok_out = tok_out if isinstance(tok_out, int) else None
+    cost = cost if isinstance(cost, str) and cost else None
+
+    if terminal.get("ok"):
+        reply = terminal.get("reply")
+        return _TurnOutcome(
+            reply=reply if isinstance(reply, str) else "",
             error=None,
             tokens_in=tok_in,
             tokens_out=tok_out,
+            cost_usd=cost,
             duration_ms=duration_ms,
             stderr_text=stderr_text,
         )
 
-    if isinstance(terminal, ErrorEvent):
-        tail = terminal.stderr_tail
-        if tail:
-            stderr_text = f"{stderr_text}\n{tail}" if stderr_text else tail
-        return _TurnOutcome(
-            error=_error_event_message(terminal),
-            timed_out=terminal.code == "engine_hung",
-            spawn_failed=terminal.code == "spawn_failed",
-            tokens_in=tok_in,
-            tokens_out=tok_out,
-            duration_ms=duration_ms,
-            stderr_text=stderr_text,
-        )
-
-    # The SDK always finalizes with a result or error event; reaching here means
-    # it did not. Report it as an honest failure rather than a silent success.
+    # The turn ran but failed. ``engine_library_unavailable`` is the one code the
+    # worker raises when the engine library could not be imported -- route it to
+    # the same hinted path a hard worker-start failure takes.
+    error = terminal.get("error")
+    code = terminal.get("code")
     return _TurnOutcome(
-        error="turn produced no terminal result or error event",
+        error=error if isinstance(error, str) and error else "the turn failed with no reported reason",
+        spawn_failed=code == "engine_library_unavailable",
         tokens_in=tok_in,
         tokens_out=tok_out,
+        cost_usd=cost,
         duration_ms=duration_ms,
         stderr_text=stderr_text,
     )
@@ -2192,7 +2110,7 @@ def _execute_turn(
     A failed turn still returns a StepResult (with `error` populated) rather
     than raising — the caller decides whether to abort.
 
-    Fix 1: the subprocess invocation happens under this session's advisory
+    Fix 1: the turn's worker process runs under this session's advisory
     lock (see ``_session_lock``), held for exactly the duration of this one
     turn -- never across multiple turns of the same run. If the lock can't
     be acquired (another process is mid-turn on this exact session id right
@@ -2206,9 +2124,9 @@ def _execute_turn(
     first (interactive reply/message semantics -- worth a brief wait before
     reporting an honest error to a waiting user).
 
-    ``progress_callback``, when given, switches this turn's command to
-    ``--display ndjson`` and receives a ``ProgressEvent`` for every
-    recognized event as it arrives (see ``_TurnProgressTracker``). Omitted
+    ``progress_callback``, when given, receives a ``ProgressEvent`` for every
+    recognized display event the worker forwards, as it arrives (see
+    ``_TurnProgressTracker``). Omitted
     by every scheduled-automation call site -- only chat/reply turns
     (``resume_turn``, ``run_chat_message``) ever pass one -- so this is a
     pure addition with no effect on existing automation runs.
@@ -2222,15 +2140,12 @@ def _execute_turn(
     """
     # Turn-context injectors first, THEN the now-context line at the very top.
     # Ordering is load-bearing in two ways:
-    #   1. The now-context ("[drumbeat] Current date/time: ...") must be the
-    #      OUTERMOST prefix so the composed prompt ALWAYS begins with a letter,
-    #      never a leading "-". The SDK passes the prompt as a bare positional
-    #      argv element with no "--" option terminator (unlike the old hand-rolled
-    #      command, which appended one) -- and amplifier-agent's CLI would parse a
-    #      turn-context injector block's leading "--- <label> ---" as an unknown
-    #      option (exit 2), killing the injector feature on the interactive path.
-    #      Prepending the now-context LAST keeps every turn's prompt safe without
-    #      a "--" the SDK cannot emit (evidence/amplifier-agent-issues.md #8).
+    #   1. The now-context ("[drumbeat] Current date/time: ...") is the
+    #      OUTERMOST prefix, so every composed prompt OPENS with the resolved
+    #      time -- the agent reads it before any turn-context injector block and
+    #      before the person's own message. Prepending it LAST is what puts it
+    #      there, and it is the one injection every "since your last check"
+    #      instruction depends on.
     #   2. Injector blocks still sit above the person's own message (most-salient
     #      last), in policy (file) order -- prepending in reverse preserves that.
     for block in reversed(preamble_blocks):
@@ -2247,35 +2162,6 @@ def _execute_turn(
                 host_config_path=host_config_path,
                 progress_callback=progress_callback,
             )
-    except TurnTooLargeError as exc:
-        # The E2BIG belt (_ensure_turn_within_arg_limit, run before any spawn)
-        # tripped: this turn's text would fail execve with E2BIG. Ride the same
-        # StepResult-with-.error abort path a spawn failure takes, so the breach
-        # lands in the ledger (run record + failures.log line + automation_error
-        # event via _persist_run) instead of surfacing as an opaque OSError.
-        message = str(exc)
-        print(f"[runner] turn too large to spawn -- {message}", file=sys.stderr)
-        ci_events.emit(
-            "drumbeat:turn_too_large",
-            {
-                "session_id": session_id,
-                "turn_bytes": exc.nbytes,
-                "limit_bytes": exc.limit,
-            },
-            cwd=cwd,
-        )
-        return (
-            StepResult(
-                index=index,
-                text=text,
-                reply="",
-                error=message,
-                duration_ms=0,
-                tokens_in=None,
-                tokens_out=None,
-            ),
-            "",
-        )
     except SessionLockedError as exc:
         print(f"[runner] {exc}", file=sys.stderr)
         ci_events.emit(
@@ -2301,18 +2187,18 @@ def _execute_turn(
         )
 
     if outcome.spawn_failed:
-        # The agent binary could not be started (SDK binary_not_found /
-        # spawn_failed). Same shape SessionLockedError uses -- this rides the
-        # abort path every other turn failure takes: the caller sees
-        # `result.error`, marks the run failed, and `_persist_run` writes the run
-        # record AND emits the automation_error event, so a dead engine can never
-        # be mistaken for a quiet one. AGENT_INSTALL_HINT carries drumbeat's own
-        # tool-venv-sibling guidance on top of the SDK's install hint.
+        # The turn worker could not run at all -- the engine library was
+        # unimportable, or the worker process died before producing a result.
+        # Same shape SessionLockedError uses -- this rides the abort path every
+        # other turn failure takes: the caller sees `result.error`, marks the run
+        # failed, and `_persist_run` writes the run record AND emits the
+        # automation_error event, so a dead engine can never be mistaken for a
+        # quiet one. AGENT_INSTALL_HINT names how to install the engine library.
         message = f"{outcome.error}\n{AGENT_INSTALL_HINT}"
         print(f"[runner] turn could not be spawned -- {message}", file=sys.stderr)
         ci_events.emit(
             "drumbeat:agent_command_missing",
-            {"session_id": session_id, "command": _AGENT_COMMAND},
+            {"session_id": session_id, "command": f"python -m {WORKER_MODULE}"},
             cwd=cwd,
         )
         return (
@@ -2342,11 +2228,10 @@ def _execute_turn(
             outcome.stderr_text,
         )
 
-    # Success (outcome.error is None) or a plain engine/envelope error -- one
-    # shape. Tokens are real summed usage or honestly absent (None), never 0
-    # (VISION §4); reply is the agent's text on success, "" on an error event;
-    # duration is measured wall-clock (the SDK does not surface the engine's
-    # self-reported durationMs, and a measured elapsed is the honest number).
+    # Success (outcome.error is None) or a plain engine error -- one shape.
+    # Tokens/cost are the engine's real reported numbers or honestly absent
+    # (None), never 0 (VISION §4); reply is the agent's text on success, "" on an
+    # error; duration is measured wall-clock (the honest elapsed).
     return (
         StepResult(
             index=index,
@@ -2356,6 +2241,7 @@ def _execute_turn(
             duration_ms=outcome.duration_ms,
             tokens_in=outcome.tokens_in,
             tokens_out=outcome.tokens_out,
+            cost_usd=outcome.cost_usd,
         ),
         outcome.stderr_text,
     )
@@ -2381,9 +2267,9 @@ def resume_turn(
 
     Used by ``reply_service`` to route a reply, or a follow-up message
     naming an existing session, into the correct running conversation.
-    Reuses the exact subprocess invocation this module already uses for
-    automation steps — there is only one code path that talks to
-    ``amplifier-agent``.
+    Reuses the exact per-turn worker invocation this module uses for
+    automation steps — there is only one code path that runs a turn on the
+    engine.
 
     ``wait_seconds``: how long to tolerate session-lock contention before
     giving up (see ``_session_lock``). Defaults to
@@ -2905,8 +2791,8 @@ def run(
         # Per-automation agent config (9h5): resolve the layered overlay
         # ($AMPLIFIER_AGENT_CONFIG base -> workspace agent-config.yaml default: ->
         # this automation's `agent_config:`) into ONE materialized amplifier-agent
-        # host config handed to `--config` on EVERY turn. `.path` is None -- no
-        # `--config`, byte-identical argv to pre-feature behavior -- when every
+        # host config handed to the engine on EVERY turn. `.path` is None -- no
+        # host config, the engine's own defaults -- when every
         # layer is empty. `.provider_module` drives built-in provider-change pin
         # rotation; `.sha`/`.path` are recorded in the run record. Resolved INSIDE
         # the try so a malformed operator env config or workspace
@@ -3019,10 +2905,10 @@ def _run_body(
     ``run_id``/``started_at`` already minted, by ``run()``.
 
     ``resolved_agent_config`` is the merged per-automation host config (9h5),
-    resolved by ``run()``. Its ``.path`` is the ``--config`` threaded on every
-    turn (``None`` -> no ``--config``, byte-identical argv to pre-feature
-    behavior), its ``.provider_module`` drives built-in provider-change pin
-    rotation below, and its ``.sha``/``.path`` are recorded in the run record.
+    resolved by ``run()``. Its ``.path`` is the host config handed to the engine
+    on every turn (``None`` -> no host config, the engine's own defaults), its
+    ``.provider_module`` drives built-in provider-change pin rotation below, and
+    its ``.sha``/``.path`` are recorded in the run record.
     """
     host_config_path = (
         resolved_agent_config.path if resolved_agent_config is not None else None
@@ -4710,6 +4596,7 @@ def _persist_run(
                     "duration_ms": step.duration_ms,
                     "tokens_in": step.tokens_in,
                     "tokens_out": step.tokens_out,
+                    "cost_usd": step.cost_usd,
                 }
                 for step in result.steps
             ],

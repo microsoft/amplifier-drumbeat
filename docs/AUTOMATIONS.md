@@ -528,10 +528,10 @@ into guidance and shrink the steps back to concerns.
 
 ## 10. `agent_config:` — per-automation host config
 
-`amplifier-agent run --config <file>` reads ONE host config that is the
-authoritative source for provider selection, model, MCP servers, skills, and
-debug knobs. `agent_config:` is how an automation shapes that file for its own
-turns without touching any other automation.
+Every turn is handed ONE host config — the authoritative source for provider
+selection, model, MCP servers, skills, and debug knobs the engine runs under.
+`agent_config:` is how an automation shapes that config for its own turns
+without touching any other automation.
 
 ```yaml
 agent_config:
@@ -547,8 +547,8 @@ merging up to three layers, **lowest precedence first**, and materializes the
 result under the data dir:
 
 1. **`$AMPLIFIER_AGENT_CONFIG`** — an operator's own debug/host config file, if
-   that variable is set, folded in as the BASE. (`--config` outranks the
-   environment inside amplifier-agent, so folding it in is what keeps that
+   that variable is set, folded in as the BASE. (The host config a turn is
+   handed outranks the environment, so folding it in is what keeps that
    variable from being silently defeated.)
 2. **`agent-config.yaml` `default:`** — the workspace baseline for every
    automation here (see below).
@@ -624,16 +624,16 @@ automation:
 ```
 
 `provider.config.enable_prompt_caching` is amplifier-agent's own host-config
-field, forwarded verbatim through `--config` — drumbeat does not interpret it.
+field, forwarded verbatim in the host config — drumbeat does not interpret it.
 There is no separate shorthand for it.
 
 ### Nothing set? Nothing changes
 
 An automation with no `agent_config:`, no workspace `agent-config.yaml`, and no
-`$AMPLIFIER_AGENT_CONFIG` runs with **no `--config` at all** — byte-identical to
-how automations ran before this feature existed. The materialized config's path
+`$AMPLIFIER_AGENT_CONFIG` runs with **no host config at all** — every turn runs
+on the engine's own defaults. The materialized config's path
 and sha256 are recorded in each run's
 `result.json` (`effective_config_path` / `effective_config_sha`), so a run can
 always be tied back to the exact policy it executed under; both are `null` when
-no config was threaded.
+no config was handed down.
 

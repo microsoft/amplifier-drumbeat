@@ -61,55 +61,30 @@ class TestAgentCommandPreflight(unittest.TestCase):
     0}`. Failure class 1 in the engine that exists to prevent it.
     """
 
-    def test_missing_agent_is_detected_on_the_turn_path(self) -> None:
-        # Neutralize the SIBLING source (the co-installed agent in this test
-        # venv, which the dependency now pulls in) so this exercises the
-        # turn-PATH half in isolation: agent nowhere -> None.
+    def test_present_engine_library_resolves_to_a_descriptor(self) -> None:
+        # Every turn runs `python -m drumbeat.agent_worker` under sys.executable
+        # and imports the engine library there; the preflight imports it in a
+        # fresh subprocess of that same interpreter. In this test venv the
+        # library IS installed (a declared dependency), so the preflight returns
+        # a non-None descriptor naming it.
         with tempfile.TemporaryDirectory() as tmp:
             root = _workspace(tmp)
-            with (
-                mock.patch.object(runner, "_sibling_agent_command", return_value=None),
-                mock.patch.object(packs, "turn_path", return_value="/nonexistent-bin"),
-            ):
+            descriptor = runner.check_agent_command(root)
+            self.assertIsNotNone(descriptor)
+            assert descriptor is not None
+            self.assertIn("amplifier-agent engine library", descriptor)
+
+    def test_missing_engine_library_is_detected(self) -> None:
+        # Simulate the library being unimportable: the import subprocess exits
+        # non-zero, so the preflight reports None -- the signal `serve` refuses
+        # to start on and `doctor` prints MISSING for.
+        import subprocess as _subprocess
+
+        failed = _subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="ModuleNotFoundError")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _workspace(tmp)
+            with mock.patch.object(runner.subprocess, "run", return_value=failed):
                 self.assertIsNone(runner.check_agent_command(root))
-
-    def test_present_agent_resolves_to_its_real_path(self) -> None:
-        # Sibling neutralized, so this asserts the turn-PATH fallback resolves
-        # a bring-your-own agent to its real path.
-        with tempfile.TemporaryDirectory() as tmp:
-            root = _workspace(tmp)
-            fake_bin = root / "bin"
-            fake_bin.mkdir()
-            agent = fake_bin / "amplifier-agent"
-            agent.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-            agent.chmod(0o755)
-            with (
-                mock.patch.object(runner, "_sibling_agent_command", return_value=None),
-                mock.patch.object(packs, "turn_path", return_value=str(fake_bin)),
-            ):
-                self.assertEqual(runner.check_agent_command(root), str(agent))
-
-    def test_sibling_agent_is_preferred_over_the_turn_path(self) -> None:
-        """The single-install path: uv co-installs amplifier-agent into the
-        engine's own tool venv but keeps it OFF the user PATH, so the runner
-        must resolve it as a sibling of sys.executable -- and prefer it over
-        any unrelated agent that happens to also be on the turn PATH.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            root = _workspace(tmp)
-            other_bin = root / "bin"
-            other_bin.mkdir()
-            other = other_bin / "amplifier-agent"
-            other.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-            other.chmod(0o755)
-            sibling = "/opt/drumbeat-toolvenv/bin/amplifier-agent"
-            with (
-                mock.patch.object(
-                    runner, "_sibling_agent_command", return_value=sibling
-                ),
-                mock.patch.object(packs, "turn_path", return_value=str(other_bin)),
-            ):
-                self.assertEqual(runner.check_agent_command(root), sibling)
 
     def test_install_hint_is_unpinned_with_no_dead_httpx_workaround(self) -> None:
         # The `--with httpx --with httpx-sse` workaround is DEAD (amplifier-agent
@@ -125,39 +100,36 @@ class TestAgentCommandPreflight(unittest.TestCase):
             runner.AGENT_INSTALL_HINT,
         )
 
-    def test_build_command_uses_sibling_path_and_keeps_the_drain_marker(self) -> None:
-        """argv[0] is the resolved sibling ABSOLUTE path, and the command line
-        still carries the ``amplifier-agent run --session-id`` substring that
-        drain/staleness match against -- so process detection is unaffected by
-        resolving the agent by locus instead of by bare name.
+    def test_build_command_is_the_worker_and_keeps_the_drain_marker(self) -> None:
+        """The turn command is ``python -m drumbeat.agent_worker`` (the prompt
+        travels on stdin, not argv), and its command line still carries the
+        ``drumbeat.agent_worker`` substring that drain/staleness match against --
+        so live-turn detection tracks the worker cmdline.
         """
-        sibling = "/opt/drumbeat-toolvenv/bin/amplifier-agent"
-        with mock.patch.object(runner, "_sibling_agent_command", return_value=sibling):
-            cmd = runner._build_command(
-                session_id="s1", fresh=True, cwd=Path("/tmp"), text="hi"
-            )
-        self.assertEqual(cmd[0], sibling)
+        import sys
+
+        cmd = runner._build_command(
+            session_id="s1", fresh=True, cwd=Path("/tmp"), text="hi"
+        )
+        self.assertEqual(cmd, [sys.executable, "-m", "drumbeat.agent_worker"])
         cmdline = " ".join(cmd)
         self.assertIn(drain.AGENT_TURN_MARKER, cmdline)
         self.assertIn(staleness._AGENT_TURN_MARKER, cmdline)
 
     def test_find_agent_turns_detects_a_real_process_carrying_the_marker(self) -> None:
-        """Live-turn detection survives the SDK cut, proven against a REAL
+        """Live-turn detection tracks the worker cmdline, proven against a REAL
         process -- not just a synthetically joined argv string.
 
-        The runner no longer spawns the agent with its own ``subprocess.Popen``;
-        the amplifier-agent-py SDK does, via
-        ``create_subprocess_exec(binary, *assemble_argv(...))``. That child's
-        ``/proc/<pid>/cmdline`` is ``<...>/amplifier-agent run --session-id
-        <id> ...`` -- carrying ``drain.AGENT_TURN_MARKER`` exactly as the old
-        hand-rolled command did (argv[0] basename ``amplifier-agent``, then
-        ``run`` then ``--session-id``, all adjacent). ``drain`` and ``staleness``
-        detect a live turn by substring-matching that marker in ``/proc``, and
-        that answer gates whether it is safe to stop the scheduler -- a false
-        all-clear is the failure this guards.
+        Every turn runs as ``python -m drumbeat.agent_worker`` (see
+        ``runner._submit_turn``), so that child's ``/proc/<pid>/cmdline`` carries
+        the dotted module name ``drumbeat.agent_worker`` -- exactly
+        ``drain.AGENT_TURN_MARKER``. ``drain`` and ``staleness`` detect a live
+        turn by substring-matching that marker in ``/proc``, and that answer
+        gates whether it is safe to stop the scheduler -- a false all-clear is
+        the failure this guards.
 
-        Spawn a stand-in whose argv reproduces that exact cmdline shape (the
-        trailing tokens are inert ``sys.argv`` to a sleeper) and assert
+        Spawn a stand-in whose argv reproduces that cmdline shape (the trailing
+        token is inert ``sys.argv`` to a sleeper) and assert
         ``drain.find_agent_turns`` finds it by pid. Read-only: ``drain`` never
         signals anything, and this test kills only its own child.
         """
@@ -170,10 +142,8 @@ class TestAgentCommandPreflight(unittest.TestCase):
                 sys.executable,
                 "-c",
                 "import time; time.sleep(30)",
-                "amplifier-agent",
-                "run",
-                "--session-id",
-                "probe-marker-test",
+                "-m",
+                "drumbeat.agent_worker",
             ],
         )
         try:

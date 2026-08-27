@@ -41,6 +41,7 @@ from drumbeat.management_api import EngineContext
 from drumbeat.runner import (
     AGENT_INSTALL_HINT,
     check_agent_command,
+    prewarm_engine,
     reap_stale_session_locks,
 )
 
@@ -239,6 +240,16 @@ def serve(
         _log(f"REFUSING TO START: {AGENT_INSTALL_HINT}")
         raise SystemExit(2)
     _log(f"agent command: {agent_path}")
+
+    # (4d) Pre-warm the bundle cache NOW, at startup, so the first scheduled turn
+    # never eats the cold prepare (which shells `uv pip install`). Best-effort:
+    # a failure is logged, not fatal -- the first turn would still (slowly)
+    # prepare its own cache. This is the same worker code path a real turn runs,
+    # so a warm cache here is a warm cache there.
+    warmed, warm_detail = prewarm_engine()
+    _log(
+        f"bundle prewarm: {'OK -- ' if warmed else 'WARNING (not fatal) -- '}{warm_detail}"
+    )
 
     # (5) Locks nobody holds, from processes that are gone.
     reaped, skipped_active = reap_stale_session_locks(ctx.runs_dir)

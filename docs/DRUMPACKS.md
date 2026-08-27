@@ -129,7 +129,7 @@ binaries.
 
 A tool needing anything beyond the base **declares it in its card and fails
 loud without it**. The shipped example: a meeting-transcript digest tool whose
-default mode needs `amplifier-agent` on PATH — it says so in its card, and
+default mode needs a summarizer CLI on PATH — it says so in its card, and
 exits non-zero naming it when it is absent, rather than degrading to a
 different answer.
 

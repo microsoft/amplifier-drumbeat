@@ -69,12 +69,13 @@ matched its own invoking shell and killed a live service four separate times.
 The engine's own in-flight check reads `/proc` entries in Python for exactly
 this reason and never shells out to `pkill`.
 
-There is a second, worse reason. The runner spawns `amplifier-agent` with no
-process group and `close_fds=True`. Kill the scheduler mid-turn and the child
-**keeps running and keeps writing the session transcript**, while the kernel
-releases the parent's per-session lock the instant the parent dies. The next
-scheduler then resumes that same session underneath the still-writing orphan —
-the exact transcript corruption the locks exist to prevent, performed
+There is a second, worse reason. The runner spawns each turn's worker in its
+**own process group** (so the turn's whole tool tree dies together when its
+watchdog fires) with `close_fds=True`. Kill the scheduler mid-turn and that
+worker **keeps running and keeps writing the session transcript**, while the
+kernel releases the parent's per-session lock the instant the parent dies. The
+next scheduler then resumes that same session underneath the still-writing
+orphan — the exact transcript corruption the locks exist to prevent, performed
 deliberately.
 
 So the stop procedure is three steps, in order:

@@ -21,7 +21,7 @@ That is the whole product. Five nouns:
 | Noun | What it is |
 |---|---|
 | **Automation** | A markdown file: YAML frontmatter (trigger, notify policy, requirements) plus an ordered list of natural-language steps |
-| **Turn** | One step, executed as one `amplifier-agent` OS process against a pinned session |
+| **Turn** | One step, executed in its own OS process — a worker that imports the agent's engine library — against a pinned session |
 | **Drumpack** | A directory of `bin/` executables plus a `drumpack.md` card, brought by the consumer. The engine ships no tools |
 | **Delivery intent** | A durable, reasoned event saying "this run's output should / should not reach a human, and here is why" |
 | **Run artifact** | Per-run directory holding the result, every step's output, and stderr |
@@ -50,7 +50,7 @@ and every gate that can silence output must write down why it fired.**
    │   scheduler · runner · pinned sessions · pre-run gate     │
    │   inject turns · rotation · session health · artifacts    │
    │   HTTP API on 127.0.0.1:<port>  (X-API-Key on writes)     │
-   │   └── spawns: amplifier-agent run   (one process/turn)    │
+   │   └── spawns: engine-library worker  (one process/turn)   │
    └───────┬──────────────────────────────────┬───────────────┘
            │ durable event outbox             │ POST /api/turns
            │ runs/engine-events.jsonl         │ (reply → exact session;
@@ -132,20 +132,35 @@ down every other automation's schedule.
 
 ### One OS process per turn
 
-Each step becomes one invocation:
+Each step becomes one isolated worker process:
 
 ```
-amplifier-agent run --session-id <pinned> [--fresh | --resume] "<step text>"
+python -m drumbeat.agent_worker      # task spec arrives on stdin as JSON:
+                                     #   {prompt, session_id, cwd, host_config_path, resume}
 ```
 
-The first turn of a session's life uses `--fresh`; every turn after it uses
-`--resume`. The agent's transcript lives on disk and is replayed between turns.
-The engine holds no in-memory conversation state — which is why an engine
-restart mid-day loses nothing but the currently-executing turn.
+The worker imports the agent's **engine library** and assembles its documented
+embedding surface — prepare the bundle, inject the provider, build the turn
+handler, boot the engine, submit the turn. Results come back over the worker's
+stdout: display events as NDJSON while the turn runs, then one terminal
+envelope carrying the reply and the engine's own token and cost counts.
 
-This also means **the engine is not a fork of the agent runtime.** It spawns a
-stock binary with stock arguments. Nothing in the engine depends on a modified
-agent underneath, which is the property that keeps it portable.
+Because the task spec travels on **stdin**, the prompt is never an OS argument,
+so a turn's text can be arbitrarily large.
+
+The first turn of a session's life starts fresh; every turn after it resumes.
+The agent's transcript lives on disk and is replayed between turns. The engine
+holds no in-memory conversation state — which is why an engine restart mid-day
+loses nothing but the currently-executing turn.
+
+One turn per process is the contract, not an implementation shortcut: it keeps
+the library's process-global state harmless by construction, and it means a
+wedged or runaway turn dies alone.
+
+This also means **the engine is not a fork of the agent runtime.** It uses the
+stock library through its documented embedding surface. Nothing in the engine
+depends on a modified agent underneath, which is the property that keeps it
+portable.
 
 ### Sessions are pinned, not per-run
 
@@ -422,8 +437,9 @@ Each fence rejects a specific temptation this design met and refused.
 - **Not a platform.** No multi-tenancy, no pack registry, no permission model
   beyond its API key, no trigger grammar beyond `schedule | manual`. The order
   is *connect → prove → generalize*, never *generalize → connect → hope*.
-- **Not a fork of the agent runtime.** One OS process per turn, `--fresh` once
-  and `--resume` forever, the compaction gap routed around via rotation.
+- **Not a fork of the agent runtime.** One OS process per turn, the stock
+  engine library through its documented embedding surface, a fresh session once
+  and resume forever, the compaction gap routed around via rotation.
 
 ### Where the line actually falls
 

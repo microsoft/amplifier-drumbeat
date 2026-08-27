@@ -54,10 +54,10 @@ every command or they read different directories.
 ## 1 · Install (one command)
 
 The engine installs from a git URL with [uv](https://docs.astral.sh/uv/), which
-also provisions Python 3.13. `amplifier-agent` — the engine every turn shells
-out to — is a dependency, so this single install co-installs it into the same
-tool venv. It is **not on PyPI**; there is nothing separate to install and
-nothing to put on PATH.
+also provisions Python 3.13. `amplifier-agent` — which ships the engine library
+every turn imports — is a dependency, so this single install co-installs it into
+the same tool venv. It is **not on PyPI**; there is nothing separate to install
+and nothing to put on PATH.
 
 ```bash
 uv tool install git+https://github.com/microsoft/amplifier-drumbeat
@@ -100,9 +100,9 @@ drumbeat serve --workspace ~/myspace --port 9100
 ```
 
 `init` refuses rather than overwrite (naming what exists); `--force` overwrites
-only the scaffold files. `serve` refuses to start, naming the fix, if
-`amplifier-agent` is not resolvable — an engine that cannot run a turn never
-reports itself healthy. Give each engine its own port; there is one engine per
+only the scaffold files. `serve` refuses to start, naming the fix, if the
+`amplifier-agent` engine library cannot be imported — an engine that cannot run
+a turn never reports itself healthy. Give each engine its own port; there is one engine per
 workspace.
 
 `prompts/auto-notify.md` is not decoration: it is the exact text a `notify:
@@ -127,7 +127,8 @@ drumbeat doctor --workspace ~/myspace
 ```
 
 What healthy looks like: `status: FRESH` (running process matches disk),
-`agent turns in flight: 0` between runs, `agent command:` naming a real path,
+`agent turns in flight: 0` between runs, `agent command:` naming the engine
+library and the interpreter that imports it, `bundle prewarm: OK`,
 `draining: no`, `orphan pins: 0`. Two notes are expected on a fresh workspace
 and mean nothing is broken: `workspace git: not a git checkout` (your policy has
 no archive yet) and a `CONTAINMENT WARNING` that the data dir sits inside the
@@ -234,7 +235,7 @@ The payoff line is the first `delivery_intent` whose `verdict` is not
 | Symptom | Cause → fix |
 |---|---|
 | Every automation replies `Error: No providers available` | No provider key in the engine's environment. Export it (or set the unit's `EnvironmentFile=`); verify per §2 |
-| `serve` refuses to start naming `amplifier-agent` | Agent not resolvable. Reinstall per §1; `doctor` shows `agent command: MISSING` with the install hint |
+| `serve` refuses to start naming `amplifier-agent` | The engine library does not import. Reinstall per §1; `doctor` shows `agent command: MISSING` with the install hint |
 | `doctor` says `STALE` | Process on old code. Restart with the drain procedure (§6) — never `pkill -f` |
 | `doctor`/`sessions` show `orphan pins: N` | An automation was renamed. `rotate-session` the old slug to retire it (§7) |
 | A tool the automation `requires:` is "not found" at run time | It is not on the constructed turn PATH. See PATH rules in [DRUMPACKS.md](https://github.com/microsoft/amplifier-drumbeat/blob/main/docs/DRUMPACKS.md); read the live base from `GET /api/capabilities` (`packs.path_base_pinned`) |

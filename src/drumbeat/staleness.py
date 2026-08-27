@@ -49,16 +49,14 @@ from drumbeat import drain, fsutil
 
 _CLOSURE_SUBPROCESS_TIMEOUT_SECONDS = 30
 _PS_TIMEOUT_SECONDS = 10
-# Real, exact substring of the command line every amplifier-agent turn is
-# invoked with (see runner._build_command: ["amplifier-agent", "run",
-# "--session-id", ...]). Matched in Python against `ps` output already
-# captured into this process's memory -- never via a shell `grep`, which
-# is how `pkill -f` has matched its own invoking shell and killed a
-# service before (see AGENTS.md). There is nothing here for a substring
-# match to accidentally hit: this process's own argv is a service or
-# operator command ("drumbeat serve", "drumbeat doctor", a consumer's
-# "notify-serve"), never "amplifier-agent run".
-_AGENT_TURN_MARKER = "amplifier-agent run --session-id"
+# Real, exact substring of the cmdline every agent turn's worker carries: every
+# turn runs as ``python -m drumbeat.agent_worker`` (see runner._submit_turn).
+# Single source of truth in ``drain`` so the two live-turn readers cannot drift.
+# There is nothing here for a substring match to accidentally hit: this
+# process's own argv is a service or operator command ("drumbeat serve",
+# "drumbeat doctor", a consumer's "notify-serve"), and the staleness closure
+# subprocess runs "-m drumbeat.staleness" -- none carry "drumbeat.agent_worker".
+_AGENT_TURN_MARKER = drain.AGENT_TURN_MARKER
 
 
 def _fingerprint_path(runs_dir: Path, service: str) -> Path:
@@ -450,8 +448,8 @@ def check_staleness(service: str, runs_dir: Path) -> StalenessReport:
 
 
 def count_agent_turns_in_flight() -> int | None:
-    """How many ``amplifier-agent run --session-id ...`` turns (any
-    automation, any session) are currently executing on this host.
+    """How many ``python -m drumbeat.agent_worker`` turns (any automation,
+    any session) are currently executing on this host.
 
     Reads ``/proc`` in Python via ``drain.find_agent_turns`` -- the same
     reader the drain check already trusts to answer "is it safe to kill the

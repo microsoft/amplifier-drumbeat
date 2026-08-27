@@ -1,15 +1,15 @@
 """Layered per-automation agent config -> ONE materialized host config per turn.
 
-``amplifier-agent run --config <file>`` reads a single host config that is the
-authoritative source for provider selection, model, MCP servers, skills, and
-debug knobs. This module resolves the ONE host config each automation turn is
-handed, by merging up to four layers, lowest precedence first:
+Every turn runs under a single host config -- the authoritative source for
+provider selection, model, MCP servers, skills, and debug knobs. This module
+resolves the ONE host config each automation turn is handed, by merging up to
+four layers, lowest precedence first:
 
   1. ``$AMPLIFIER_AGENT_CONFIG`` -- the operator's own debug/host config file,
-     folded in as the BASE. This layer is load-bearing: ``--config`` outranks
-     the environment inside amplifier-agent, so without folding this file in
-     the feature would SILENTLY defeat an operator who set that variable to
-     debug a run. Absent/empty variable contributes nothing.
+     folded in as the BASE. This layer is load-bearing: the host config a turn
+     is handed outranks the environment inside amplifier-agent, so without
+     folding this file in the feature would SILENTLY defeat an operator who set
+     that variable to debug a run. Absent/empty variable contributes nothing.
   2. the workspace ``agent-config.yaml`` ``default:`` block -- the owner's
      baseline for every automation in this workspace.
   3. a named ``profile`` (interactive/API turns) -- supplied by the caller;
@@ -45,10 +45,9 @@ merged:
     refusal is RECURSIVE, not top-level, precisely because the dangerous
     placement is nested.
 
-Back-compat is by construction: when every layer is empty, the merged config is
-``{}``, ``resolve()`` materializes NOTHING and returns a ``path`` of ``None`` --
-so the turn's argv carries no ``--config`` and is byte-identical to pre-feature
-behavior.
+The empty case is by construction: when every layer is empty, the merged config
+is ``{}``, ``resolve()`` materializes NOTHING and returns a ``path`` of ``None``
+-- so the turn is handed no host config and runs on the engine's own defaults.
 """
 
 from __future__ import annotations
@@ -133,9 +132,9 @@ class AgentConfigError(Exception):
 class ResolvedAgentConfig:
     """The single host config resolved for one automation's turns.
 
-    ``path`` is ``None`` when the merged config is empty -- the turn threads no
-    ``--config`` and runs on the engine defaults, byte-identical to pre-feature
-    behavior. When non-empty, ``path`` points at the materialized file and
+    ``path`` is ``None`` when the merged config is empty -- the turn is handed
+    no host config and runs on the engine defaults. When non-empty, ``path``
+    points at the materialized file and
     ``sha`` is the sha256 of its exact bytes (recorded in the run record).
     ``provider_module`` is always populated -- the explicit ``provider.module``
     or ``BUNDLE_DEFAULT_PROVIDER`` -- because provider-change rotation needs it
@@ -342,7 +341,7 @@ def resolve(
     ``<runs_dir>/automation_host_configs/<slug>.json`` (rewritten each run, so
     it can never drift from the sources on disk) and returns its path + sha.
     When the merged config is empty, returns a ``ResolvedAgentConfig`` with
-    ``path``/``sha`` ``None`` -- the turn threads no ``--config``.
+    ``path``/``sha`` ``None`` -- the turn is handed no host config.
 
     ``automation_config`` is trusted (already validated at parse time). Every
     other file/profile layer is validated here and a failure raises
@@ -478,9 +477,9 @@ def resolve_turn(
     listing the available profiles.
 
     When every layer is empty (no env config, no ``default:`` block, no
-    profile), the merged config is ``{}``: ``.path`` is ``None``, the turn
-    threads no ``--config``, and its argv is byte-identical to pre-profile
-    behavior. Otherwise the merged config is materialized to
+    profile), the merged config is ``{}``: ``.path`` is ``None`` and the turn is
+    handed no host config, running on the engine's own defaults. Otherwise the
+    merged config is materialized to
     ``<runs_dir>/turn_host_configs/<key>.json`` and its path + sha returned.
     """
     env = os.environ if env is None else env

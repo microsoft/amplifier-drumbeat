@@ -63,24 +63,19 @@ VALID_TRIGGER_TYPES = {"schedule", "manual", "event"}
 # "reference" (default, preferred): the engine injects the workspace-relative
 #   PATHS plus a mandatory "read these first" preamble; the agent loads the
 #   bodies itself with its file tools. The turn text stays a few hundred bytes
-#   no matter how large the guidance grows, so argv never approaches Linux's
-#   128 KiB per-argument ceiling (MAX_ARG_STRLEN). This is the whole reason the
-#   field exists: inlining a large guidance body into argv is a measured
-#   failure class (channels-check died silently at E2BIG because IDENTITY.md
-#   was inlined). Guidance files are becoming the per-user personalization
-#   layer, so referencing them -- rather than snapshotting a body into the
-#   transcript -- is also what keeps a resumed session reading the CURRENT file.
+#   no matter how large the guidance grows. Guidance files are the per-user
+#   personalization layer, so referencing them -- rather than snapshotting a
+#   body into the transcript -- is what keeps a resumed session reading the
+#   CURRENT file. That is the whole reason the field exists.
 #
-# "inline" (legacy): the engine embeds each guidance body verbatim in the turn
-#   text, as it always did. Kept working during migration so an automation that
-#   genuinely needs its guidance literally in the transcript can still ask for
-#   it. Subject to the same 128 KiB per-turn ceiling every turn has (the
-#   runner's turn-size belt guard fails loud, named, before the kernel's opaque
-#   E2BIG would).
+# "inline": the engine embeds each guidance body verbatim in the turn text, for
+#   an automation that genuinely needs its guidance literally in the
+#   transcript. The cost is that the transcript then carries a snapshot: a
+#   resumed session keeps reading the body as it was on the run that inlined it.
 #
 # Executable `requires:` tool cards are unaffected by this knob -- they ride
 # inline in both modes (they are pack documentation, not workspace files the
-# agent can read by relative path, and have never been the argv-size culprit).
+# agent can read by relative path).
 VALID_GUIDANCE_DELIVERY = {"reference", "inline"}
 DEFAULT_GUIDANCE_DELIVERY = "reference"
 
@@ -241,11 +236,11 @@ class Automation:
     # Empty tuple when the frontmatter has no `inject:` key.
     inject: tuple[InjectSpec, ...] = ()
     # How required guidance FILES reach the agent: "reference" (default,
-    # preferred -- inject paths + a read-first preamble, argv stays tiny) or
-    # "inline" (legacy -- embed bodies verbatim). See VALID_GUIDANCE_DELIVERY.
-    # Defaulted, so every existing automation (which never set it) is a
-    # reference-form automation from the moment this field ships -- which is
-    # precisely how the argv-inlining failure class is killed at the root.
+    # preferred -- inject paths + a read-first preamble, turn text stays tiny)
+    # or "inline" (embed bodies verbatim). See VALID_GUIDANCE_DELIVERY.
+    # Defaulted, so an automation that never names it is a reference-form
+    # automation -- which is how a resumed session keeps reading the CURRENT
+    # guidance file rather than a snapshot in its transcript.
     guidance_delivery: str = DEFAULT_GUIDANCE_DELIVERY
     # Cross-run conversation lifecycle: "continuous" (default), "fresh", or
     # "daily". See VALID_CONVERSATION_LIFECYCLES. Default "continuous" =
@@ -257,13 +252,13 @@ class Automation:
     conversation: str = DEFAULT_CONVERSATION_LIFECYCLE
     # Per-automation agent-config overlay (see ``drumbeat.agent_config``). The
     # highest-precedence layer merged into the ONE materialized amplifier-agent
-    # host config handed to ``--config`` on every turn of this automation. A
+    # host config handed to the engine on every turn of this automation. A
     # mapping in the closed top-level vocabulary
     # ``provider | providers | mcp | skills | debug``, validated at parse time
     # so a malformed block surfaces through ``load_all_tolerant`` -> ``doctor``
     # rather than at run time. ``None`` (the default) means this automation
-    # contributes no overlay -- unchanged behavior, a turn whose argv carries no
-    # ``--config`` at all.
+    # contributes no overlay -- its turns are handed whatever the lower layers
+    # resolve to, or no host config at all.
     agent_config: dict[str, Any] | None = None
     #
     # NOTE: there is deliberately no ``session`` / ``session_workspace``

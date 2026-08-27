@@ -8,23 +8,16 @@ description = "An automation engine for long-running agent sessions: scheduler, 
 requires-python = ">=3.13"
 dependencies = [
     "pyyaml>=6.0",
-    # amplifier-agent is the engine every turn shells out to. It is NOT on
-    # PyPI, so the git URL is the mechanism; and it is deliberately UNPINNED
-    # (floating main) to keep taking rapid upstream improvements -- the owner
-    # accepts the breakage risk that carries. Declaring it here is what makes a
-    # single `uv tool install git+<drumbeat repo>` co-install it into the same
-    # tool venv, where the runner resolves it as a sibling of its own
-    # interpreter (see runner._resolve_agent_command).
+    # amplifier-agent SHIPS THE ENGINE LIBRARY every turn imports (VISION §3):
+    # the isolated per-turn worker (drumbeat.agent_worker) imports
+    # amplifier_agent_lib + amplifier_agent_cli directly -- no CLI subprocess,
+    # no argv contract, no stream parsing. It is NOT on PyPI, so the git URL is
+    # the mechanism; and it is deliberately UNPINNED (floating main) to keep
+    # taking rapid upstream improvements -- the owner accepts the breakage risk
+    # that carries. Declaring it here is what makes a single
+    # `uv tool install git+<drumbeat repo>` install the library into the same
+    # environment, where the worker imports it under `sys.executable`.
     "amplifier-agent @ git+https://github.com/microsoft/amplifier-agent",
-    # amplifier-agent-py is the maintained SDK the runner drives every turn
-    # through (VISION §3: "the invocation goes through the maintained agent SDK
-    # rather than hand-rolled argv and stream parsing"). It ships in the SAME
-    # repo as the engine, under wrappers/python-py, and like the engine it is
-    # NOT on PyPI and deliberately UNPINNED (floating main) -- the two move
-    # together and the owner accepts the breakage risk. It is a pure Python
-    # package with no runtime deps of its own; it discovers the engine binary
-    # the runner resolves and hands it via `_binary_resolver`.
-    "amplifier-agent-py @ git+https://github.com/microsoft/amplifier-agent#subdirectory=wrappers/python-py",
 ]
 
 [project.scripts]

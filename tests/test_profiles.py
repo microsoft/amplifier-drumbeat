@@ -11,22 +11,20 @@ refusal as every other layer.
 Every test here is red-provable: delete the mechanism and the test fails.
 
 The load-bearing end-to-end pin is
-``test_quick_profile_runs_amplifier_agent_with_that_provider_model``: a real
-``resume_turn`` over a real ``agent-config.yaml`` profile, asserting the real
-argv carries ``--config`` pointing at a host config whose ``default_model`` is
-the profile's model. Its companions prove a profile-less turn uses the
-``default:`` layer, an unknown profile fails loud LISTING the available
-profiles, and credentials in a profile are refused.
+``test_quick_profile_runs_the_worker_with_that_provider_model``: a real
+``resume_turn`` over a real ``agent-config.yaml`` profile, asserting the turn
+hands the worker a ``host_config_path`` pointing at a host config whose
+``default_model`` is the profile's model. Its companions prove a profile-less
+turn uses the ``default:`` layer, an unknown profile fails loud LISTING the
+available profiles, and credentials in a profile are refused.
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Self
 
 import pytest
-from amplifier_agent_py import ResultEvent
 
 from drumbeat import agent_config, runner, turns
 from drumbeat.management_api import EngineContext
@@ -328,41 +326,58 @@ def test_submit_turn_refuses_unknown_profile_400_listing_available(
 # ---- end-to-end: a profiled turn runs amplifier-agent with that provider/model ----
 
 
-class _FakeSpawnHandle:
-    """Stand-in for the SDK's ``SyncSessionHandle`` (Strategy B fakes)."""
+class _FakeWorkerProc:
+    """Stand-in for the worker ``subprocess.Popen`` handle. Captures the
+    task-spec JSON written to stdin (which carries ``host_config_path`` -- the
+    materialized ``--config`` a profiled turn threads to the worker) and replays
+    one successful terminal envelope."""
 
-    def __init__(self, events: list[object], prompts: list[str]) -> None:
-        self._events = events
-        self._prompts = prompts
+    def __init__(self, captured: dict) -> None:
+        self.pid = 424243
+        sink: list[str] = []
+        captured["stdin_sink"] = sink
+        self.stdin = _Sink(sink)
+        term = {"drumbeat_result": {"ok": True, "reply": "ok", "error": None, "code": None,
+                                    "tokens_in": 1, "tokens_out": 1, "cost_usd": None,
+                                    "cache_read_tokens": None, "cache_write_tokens": None}}
+        self.stdout = iter([json.dumps(term) + "\n"])
+        self.stderr = iter([])
 
-    def __enter__(self) -> Self:
-        return self
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
 
-    def __exit__(self, *exc: object) -> bool:
-        return False
 
-    def submit(self, prompt: str):
-        self._prompts.append(prompt)
-        return iter(self._events)
+class _Sink:
+    def __init__(self, sink: list[str]) -> None:
+        self._sink = sink
+
+    def write(self, data: str) -> None:
+        self._sink.append(data)
+
+    def close(self) -> None:
+        pass
 
 
 def _capture_spawn(monkeypatch: pytest.MonkeyPatch) -> dict:
-    """Patch the SDK spawn seam (``runner.spawn_agent_sync``); capture each
-    call's kwargs -- notably ``config_path``, the ``--config`` a profiled turn
-    threads through the SDK -- and succeed with a fixed reply.
+    """Patch the worker spawn seam (``runner.subprocess.Popen``); capture the
+    task spec written to the worker's stdin -- notably ``host_config_path``, the
+    materialized config a profiled turn threads to the worker -- and succeed with
+    a fixed reply.
     """
     captured: dict = {}
-    prompts: list[str] = []
 
-    def fake_spawn(**kwargs):
-        captured.update(kwargs)
-        return _FakeSpawnHandle([ResultEvent(text="ok")], prompts)
+    def fake_popen(args, **kwargs):  # noqa: ANN001, ANN002
+        return _FakeWorkerProc(captured)
 
-    monkeypatch.setattr(runner, "spawn_agent_sync", fake_spawn)
+    monkeypatch.setattr(runner.subprocess, "Popen", fake_popen)
     return captured
 
 
-def test_quick_profile_runs_amplifier_agent_with_that_provider_model(
+def _spec_host_config_path(captured: dict) -> str | None:
+    return json.loads("".join(captured["stdin_sink"]))["host_config_path"]
+
+
+def test_quick_profile_runs_the_worker_with_that_provider_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -392,9 +407,9 @@ def test_quick_profile_runs_amplifier_agent_with_that_provider_model(
         host_config_path=host_config_path,
     )
 
-    config_path = captured.get("config_path")
+    config_path = _spec_host_config_path(captured)
     assert config_path is not None, (
-        "a profiled turn must hand the SDK a host config (config_path)"
+        "a profiled turn must hand the worker a host config (host_config_path)"
     )
     written = json.loads(Path(config_path).read_text(encoding="utf-8"))
     assert written["provider"]["config"]["default_model"] == QUICK_MODEL
@@ -423,6 +438,6 @@ def test_turn_without_profile_or_config_uses_no_config(
         host_config_path=host_config_path,
     )
 
-    assert captured.get("config_path") is None, (
+    assert _spec_host_config_path(captured) is None, (
         "a turn with no profile and no config must run unchanged, on the default model"
     )
