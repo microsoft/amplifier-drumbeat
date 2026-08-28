@@ -5,8 +5,8 @@ on-disk / in-return side effect. If one goes red, the mechanism it names is
 broken and the fix belongs in ``src/drumbeat/``, not in this file. Each is
 anchored to a specific failure measured on the owner's live box.
 
-1. SILENT-FAILURE LOUDNESS (f199 run half + gsuite-email-check 3/3)
-   Measured: channels-check and gsuite-email-check runs on disk with
+1. SILENT-FAILURE LOUDNESS (f199 run half + email-check 3/3)
+   Measured: channels-check and email-check runs on disk with
    ``result.json`` ``"failed": true`` while ``"error": null`` -- and a
    ``steps[].error`` of exactly ``"amplifier-agent exited 1"``. The failing
    step's error never reached the run's top-level ``error`` field, so
@@ -145,7 +145,7 @@ class _RunFixture(unittest.TestCase):
 class TestFailedRunSurfacesItsError(_RunFixture):
     """A failed run must carry a non-null top-level ``error`` (the failing
     turn's own error), not the silent ``failed: true, error: null`` shape
-    measured on channels-check and gsuite-email-check.
+    measured on channels-check and email-check.
     """
 
     def test_step_failure_error_reaches_top_level_and_result_json(self) -> None:
@@ -325,7 +325,7 @@ class TestInjectSkippedGuardCatchesOutboxError(_RunFixture):
 
 
 class TestMalformedInjectContentAbortsBeforeAnyTurn(_RunFixture):
-    """cortex-7152 symptom 3: an internal diagnostic sentence ("the injection
+    """The regression: an internal diagnostic sentence ("the injection
     that should have arrived ahead of step 2 is missing from this run")
     reached a real chat conversation, verbatim, because the "anything else"
     row of the hybrid-sentinel contract trusted inject stdout with no shape
@@ -346,7 +346,7 @@ class TestMalformedInjectContentAbortsBeforeAnyTurn(_RunFixture):
             text=None,
             abort_reason=(
                 "inject 'open items' (ledger-items) exited 0 with stdout that "
-                "does not begin with the declared expect_prefix 'The Cortex "
+                "does not begin with the declared expect_prefix 'The state "
                 "attention ledger' -- got: 'The injection that should have "
                 "arrived ahead of step 2 is missing from this run.' -- "
                 "aborting rather than trusting unverified content as ledger "
@@ -387,7 +387,7 @@ class TestMalformedInjectContentAbortsBeforeAnyTurn(_RunFixture):
         self.assertEqual(result.final_reply, "")
         self.assertEqual(result.steps, [])
 
-        # Durable too: the persisted run record a human / cortex doctor
+        # Durable too: the persisted run record a human / doctor
         # reads carries the same empty final_reply, never the leaked text.
         run_dir = self.runs_dir / self.automation.slug / result.run_id
         persisted = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))

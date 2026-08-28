@@ -330,6 +330,7 @@ front of every run without the engine ever acquiring the consumer's domain.
 | Exits non-zero | **Abort the run**, voiced |
 | Exits 0, stdout (whole, stripped) is byte-exactly `INJECT_IDLE` | **Inject nothing; the run proceeds.** A reasoned `inject_skipped` event is written |
 | Exits 0, stdout is bare-empty | **Abort, loud** |
+| Exits 0, `expect_prefix` declared, stdout does not start with it | **Abort, loud** — malformed inject content, never fed to the model |
 | Anything else | **Inject stdout verbatim** as a turn |
 
 Three things in that table were paid for:

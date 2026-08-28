@@ -102,9 +102,13 @@ def append_line_single_write(path: Path, line: str, *, fsync: bool = False) -> i
     call on an ``O_APPEND`` descriptor -- never through a buffered
     ``TextIOWrapper``, whose ``close()``/``flush()`` can issue several
     smaller ``write(2)`` calls for one logical line (exactly the gap that
-    let a SIGKILL tear a line in half). One call is one all-or-nothing
-    kernel operation: there is no window between two writes of the same
-    record for a kill signal to land in.
+    let a SIGKILL tear a line in half). One call closes the window that
+    existed between multiple buffered ``write(2)`` syscalls for one
+    logical line. It is NOT an unconditional crash-atomicity guarantee:
+    for very large lines the kernel's regular-file write path can return
+    a short write when a fatal signal lands mid-copy — ``heal_torn_tail``
+    is what bounds that residual case to one isolated unparseable line
+    instead of a fused, cascading corruption.
 
     Does NOT lock -- callers already hold whatever mutual-exclusion
     mechanism guards concurrent writers to ``path`` (every call site in

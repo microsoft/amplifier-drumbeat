@@ -128,7 +128,7 @@ def test_nothing_to_inject_returns_none_in_both_modes() -> None:
     assert format_requirements_turn([], mode="reference") is None
     assert format_requirements_turn([], mode="inline") is None
     # An executable-only check contributes no file guidance and no card here.
-    exe = RequirementCheck(item="m365", kind="executable", satisfied=True, detail="/x")
+    exe = RequirementCheck(item="example-cli", kind="executable", satisfied=True, detail="/x")
     assert format_requirements_turn([exe], mode="reference") is None
 
 

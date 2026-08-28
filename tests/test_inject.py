@@ -123,23 +123,23 @@ class TestInjectClassification(unittest.TestCase):
         """
         tool = _write_tool(
             self.cwd,
-            "printf 'The Cortex attention ledger currently has 2 OPEN item(s)\\n'",
+            "printf 'The state attention ledger currently has 2 OPEN item(s)\\n'",
         )
         spec = InjectSpec(
             argv=(str(tool),),
             label="open items",
-            expect_prefix="The Cortex attention ledger",
+            expect_prefix="The state attention ledger",
         )
         outcome = runner._run_inject_tool(
             spec, cwd=self.cwd, runs_dir=self.cwd / "runs"
         )
         self.assertIsNone(outcome.abort_reason)
         self.assertEqual(
-            outcome.text, "The Cortex attention ledger currently has 2 OPEN item(s)\n"
+            outcome.text, "The state attention ledger currently has 2 OPEN item(s)\n"
         )
 
     def test_expect_prefix_mismatch_aborts_loud_not_fed_to_model(self) -> None:
-        """cortex-7152 symptom 3, the core regression: a tool that exits 0
+        """The core regression: a tool that exits 0
         with non-empty stdout that is NOT the declared payload shape -- a
         stray diagnostic sentence, not ledger content -- must abort loud,
         exactly like the empty-stdout row, never reach ``InjectOutcome.text``
@@ -153,14 +153,14 @@ class TestInjectClassification(unittest.TestCase):
         spec = InjectSpec(
             argv=(str(tool),),
             label="open items",
-            expect_prefix="The Cortex attention ledger",
+            expect_prefix="The state attention ledger",
         )
         outcome = runner._run_inject_tool(
             spec, cwd=self.cwd, runs_dir=self.cwd / "runs"
         )
         assert outcome.abort_reason is not None
         self.assertIn("expect_prefix", outcome.abort_reason)
-        self.assertIn("The Cortex attention ledger", outcome.abort_reason)
+        self.assertIn("The state attention ledger", outcome.abort_reason)
         self.assertIn(
             "injection that should have arrived ahead of step 2", outcome.abort_reason
         )
@@ -177,7 +177,7 @@ class TestInjectClassification(unittest.TestCase):
         spec = InjectSpec(
             argv=(str(tool),),
             label="open items",
-            expect_prefix="The Cortex attention ledger",
+            expect_prefix="The state attention ledger",
         )
         outcome = runner._run_inject_tool(
             spec, cwd=self.cwd, runs_dir=self.cwd / "runs"

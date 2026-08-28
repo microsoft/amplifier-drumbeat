@@ -88,6 +88,11 @@ against it · the worked example. Status stays DRAFT and says why until then.
   implemented and merged, conformance fixtures green, worked example shipped —
   freeze bar 4/4 in-repo). Held loosely / un-frozen by owner decision while the
   sibling contracts are defined; VISION.md stays the leading doc.
+- **2026-08-28** — inject entries gained an optional `expect_prefix` key
+  (shipped in code first, contract recorded after — a governance-order miss,
+  corrected here): declared, exit-0 stdout not starting with it aborts the run
+  loud instead of being trusted verbatim. Vocabulary remains closed; the parser
+  refuses unknown inject keys. Schema reference: docs/AUTOMATIONS.md §6.
 - **2026-08-25** — v1 drafted. Encodes the negotiated decision: steps move from
   markdown body to frontmatter as minimal `{id, label?, prompt}` objects
   (Scout-informed: prompts as data, zero control-flow schema, config stays

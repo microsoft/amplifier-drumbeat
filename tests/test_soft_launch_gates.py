@@ -437,7 +437,7 @@ class TestBaselineToolsAreNotConsumerBranded(unittest.TestCase):
 class TestSourceTreeCarriesNoConsumerBrand(unittest.TestCase):
     """The permanent whole-source brand guard the councils demanded.
 
-    Case-insensitive scan of every ``.py`` under ``src/drumbeat`` for any
+    Case-insensitive scan of every ``.py`` under ``src/drumbeat`` and ``tests/`` for any
     consumer brand or pack vocabulary that must not survive into the
     standalone engine -- the token set is ``_BRAND_TOKENS`` below, built from
     fragments so this guard never itself plants a scannable brand literal.
@@ -460,9 +460,10 @@ class TestSourceTreeCarriesNoConsumerBrand(unittest.TestCase):
     ``BRAND_ENV`` and ``brand-1a2b`` while skipping a token embedded inside a
     longer English word.
 
-    SCOPED TO ``src/drumbeat`` (the repo's own source tree). It never scans
-    ``tests/`` -- which, together with the fragment-built token list, is why
-    this test file does not flag itself.
+    SCOPED TO ``src/drumbeat`` AND ``tests/``. The fragment-built token list
+    is why this test file does not flag itself. ``tests/`` joined the scan
+    after a real leak: consumer-branded fixture strings landed in tests/
+    through exactly the gap the old src-only scope documented.
 
     ``_KNOWN_BRAND_DEBT`` is a shrinking allowlist of source files that still
     carry pack-vocabulary example names (platform/connector illustrations)
@@ -488,14 +489,17 @@ class TestSourceTreeCarriesNoConsumerBrand(unittest.TestCase):
     _KNOWN_BRAND_DEBT = frozenset()
 
     @staticmethod
-    def _src_root() -> Path:
-        return Path(__file__).resolve().parent.parent / "src" / "drumbeat"
+    def _scan_roots() -> tuple[Path, ...]:
+        base = Path(__file__).resolve().parent.parent
+        return (base / "src" / "drumbeat", base / "tests")
 
     def test_no_consumer_brand_in_swept_source(self) -> None:
-        root = self._src_root()
-        self.assertTrue(root.is_dir(), f"source tree not found at {root}")
         offenders: list[str] = []
-        for py in sorted(root.rglob("*.py")):
+        files: list[Path] = []
+        for root in self._scan_roots():
+            self.assertTrue(root.is_dir(), f"swept tree not found at {root}")
+            files.extend(sorted(root.rglob("*.py")))
+        for py in files:
             if py.name in self._KNOWN_BRAND_DEBT:
                 continue
             for lineno, line in enumerate(

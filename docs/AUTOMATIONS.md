@@ -68,7 +68,7 @@ it never takes down the other automations' schedules.
 | `steps` | yes | Ordered list of step objects (`{id, prompt, label?}`); see §2.2 and §7 |
 | `notify` | no (default `auto`) | `always` · `auto` · `urgent-only` · `never`; see §4 |
 | `requires` | no (default `[]`) | List of strings: tool names and/or workspace-relative file paths; see §5 |
-| `inject` | no | List of `{argv, label}`; see §6 |
+| `inject` | no | List of `{argv, label, expect_prefix?}`; see §6 |
 | `conversation` | no (default `continuous`) | `continuous` · `fresh` · `daily` — how the conversation persists across runs; see §2.1 |
 | `guidance_delivery` | no (default `reference`) | `reference` · `inline` — how required guidance FILES reach the agent; see §5 |
 | `agent_config` | no | Mapping: a per-automation host-config overlay (provider, model, MCP, skills, debug); see §10 |
@@ -346,7 +346,14 @@ inject:
 | Exits non-zero | **Aborts the run**, voiced |
 | Exits 0, stdout (whole, stripped) is byte-exactly `INJECT_IDLE` | **Injects nothing; run proceeds.** A reasoned `inject_skipped` event is written |
 | Exits 0, stdout bare-empty | **Aborts, loud** |
+| Exits 0, `expect_prefix` declared, stdout does not start with it | **Aborts, loud** — malformed inject content is never fed to the model |
 | Anything else | **Injects stdout verbatim** as a turn |
+
+`expect_prefix` (optional, sibling to `argv`/`label`) declares the exact string
+a healthy tool's stdout must start with. Declared, it turns a stray diagnostic
+sentence on stdout — which would otherwise be trusted verbatim as state — into
+a loud abort. Unset (the default), exit-0 stdout keeps today's verbatim-trust
+behavior unchanged.
 
 If you are writing the tool, the contract is in
 [`DRUMPACKS.md`](DRUMPACKS.md#inject-tools--the-rules-are-contract-not-style). The short
