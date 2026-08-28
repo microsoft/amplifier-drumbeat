@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import os
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 
@@ -57,4 +58,89 @@ def atomic_write_with_backup(path: Path, content: str) -> None:
     atomic_write(path, content)
 
 
-__all__ = ["atomic_write", "atomic_write_with_backup"]
+def heal_torn_tail(fd: int) -> bool:
+    """If the open file's last byte is not ``\\n``, write one and return True.
+
+    A durable, append-only JSONL log (``engine-events.jsonl``,
+    ``automation_errors.jsonl``, ``vocabulary_errors.jsonl``,
+    ``session_rotations.jsonl`` -- every JSONL append in this codebase)
+    shares one crash-safety hazard: a writer killed mid-append (SIGKILL,
+    which cannot be caught) can leave a torn final line -- a valid-JSON
+    prefix with no trailing newline. Left alone, the NEXT append's bytes
+    land directly after that fragment with no separating newline, fusing
+    two events into one unparseable line and taking the new event down
+    with the old corruption.
+
+    Call this under whatever lock guards ``path`` (this function does not
+    lock), immediately before appending new content, on a file descriptor
+    opened for read+write. Sealing the torn line with its own newline
+    keeps the NEW append independent of it -- at the cost of one line the
+    reader will report as unparseable (the torn content itself, now
+    newline-terminated) rather than two.
+
+    Returns whether a heal happened, so the caller can log it: silence
+    here would hide exactly the class of event this function exists to
+    make visible.
+    """
+    size = os.lseek(fd, 0, os.SEEK_END)
+    if size == 0:
+        return False
+    os.lseek(fd, size - 1, os.SEEK_SET)
+    last_byte = os.read(fd, 1)
+    os.lseek(fd, 0, os.SEEK_END)
+    if last_byte == b"\n":
+        return False
+    os.write(fd, b"\n")
+    return True
+
+
+def append_line_single_write(path: Path, line: str, *, fsync: bool = False) -> int:
+    """Append ``line`` (newline included) to ``path`` in exactly one ``os.write``.
+
+    Heals a torn tail left by a prior killed writer first (see
+    ``heal_torn_tail``), then writes the WHOLE line as one ``os.write``
+    call on an ``O_APPEND`` descriptor -- never through a buffered
+    ``TextIOWrapper``, whose ``close()``/``flush()`` can issue several
+    smaller ``write(2)`` calls for one logical line (exactly the gap that
+    let a SIGKILL tear a line in half). One call is one all-or-nothing
+    kernel operation: there is no window between two writes of the same
+    record for a kill signal to land in.
+
+    Does NOT lock -- callers already hold whatever mutual-exclusion
+    mechanism guards concurrent writers to ``path`` (every call site in
+    this codebase uses a sidecar ``<path>.lock`` flock). ``fsync`` is the
+    caller's choice: durable event types warrant it, routine log lines
+    can ride the page cache like their siblings in the same file.
+
+    Returns the file's size (bytes) after the append.
+    """
+    path = Path(path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = line.encode("utf-8")
+    existed = path.is_file()
+    # O_RDWR (not O_WRONLY): heal_torn_tail reads the last byte first.
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        healed = existed and heal_torn_tail(fd)
+        os.write(fd, data)
+        if fsync:
+            os.fsync(fd)
+        size = os.fstat(fd).st_size
+    finally:
+        os.close(fd)
+    if healed:
+        sys.stderr.write(
+            f"[fsutil] healed a torn tail in {path} -- the previous writer "
+            "was killed mid-append; sealed its incomplete line with a "
+            "newline before appending this one. The healed line will read "
+            "as unparseable at its own offset; this append is not lost.\n"
+        )
+    return size
+
+
+__all__ = [
+    "append_line_single_write",
+    "atomic_write",
+    "atomic_write_with_backup",
+    "heal_torn_tail",
+]

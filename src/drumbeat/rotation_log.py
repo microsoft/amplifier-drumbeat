@@ -25,7 +25,7 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
-from drumbeat import error_log
+from drumbeat import error_log, fsutil
 
 # WHERE THIS LOG LIVES: a
 # data-dir resident, resolved through drumbeat.error_log's shared order --
@@ -79,12 +79,16 @@ def log_session_rotation(
         # processes over one workspace during the extraction): flocked
         # append -- engine code runs in two processes during the hybrid
         # window and this file is engine state shared between them.
+        #
+        # The line itself is written via `fsutil.append_line_single_write`:
+        # one `os.write` for the whole record, healing any torn tail left
+        # by a prior killed writer first -- same discipline as
+        # `error_log.py` and the outbox (`engine_events.append_event`).
         path.parent.mkdir(parents=True, exist_ok=True)
         lock_fd = os.open(str(path) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            with path.open("a", encoding="utf-8") as f:
-                f.write(line + "\n")
+            fsutil.append_line_single_write(path, line + "\n")
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)

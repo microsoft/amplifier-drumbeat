@@ -55,6 +55,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from drumbeat import fsutil
+
 OUTBOX_FILENAME = "engine-events.jsonl"
 
 
@@ -292,6 +294,26 @@ def append_event(runs_dir: Path, event_type: EventType, payload: dict[str, Any])
     trailing newline -- i.e. exactly what a consumer's cursor becomes once
     it has processed this event. Callers that do not need it may ignore it.
 
+    Two crash-safety properties, both load-bearing for the module
+    docstring's line-atomicity claim, neither of which the flock alone
+    provided (implemented in ``fsutil.append_line_single_write``, shared
+    with every other JSONL appender in this codebase -- see that
+    function's docstring for the full mechanism):
+
+    * **One event is one ``os.write`` call.** The previous implementation
+      wrote through a buffered ``TextIOWrapper`` and relied on ``close()``
+      to flush it -- for an event whose JSON exceeds the io buffer size
+      (``delivery_intent``/``automation_error`` carry the run's full final
+      output under ``text``, unbounded), that flush is not one write(2)
+      syscall but several, and a SIGKILL between them leaves a torn line:
+      valid JSON prefix, no trailing newline, gone mid-object.
+    * **A torn tail from a PRIOR kill is healed before this write, not
+      after.** The other observed failure mode: a previous append died
+      mid-write, and the NEXT append's bytes landed directly after the
+      partial content with no separating newline -- fusing two events
+      into one unparseable line and taking the new event down with the
+      old corruption.
+
     Raises:
         OutboxWriteError: a required field is missing/blank, or an enum
             value is unknown. Always a bug at the emit site.
@@ -311,11 +333,9 @@ def append_event(runs_dir: Path, event_type: EventType, payload: dict[str, Any])
 
     with _locked(path):
         existed = path.is_file()
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(line)
-            if event_type in _DURABLE_TYPES:
-                f.flush()
-                os.fsync(f.fileno())
+        size = fsutil.append_line_single_write(
+            path, line, fsync=event_type in _DURABLE_TYPES
+        )
         if not existed:
             # A brand-new file needs its directory entry on disk too, or the
             # fsync above guarantees the contents of a file that a crash
@@ -325,7 +345,7 @@ def append_event(runs_dir: Path, event_type: EventType, payload: dict[str, Any])
                 os.fsync(dir_fd)
             finally:
                 os.close(dir_fd)
-        return path.stat().st_size
+        return size
 
 
 @dataclass(frozen=True)

@@ -25,6 +25,8 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+from drumbeat import fsutil
+
 # WHERE THESE LOGS LIVE.
 #
 # These files are DATA-DIR residents: they must survive a reboot and be
@@ -100,14 +102,19 @@ def _append_jsonl(log_path: Path, record: dict) -> None:
     # do not arbitrate this file. The append happens inside an exclusive
     # flock on a sidecar .lock (the same convention the outbox uses) so two
     # processes can never interleave partial lines.
+    #
+    # The line itself is written via `fsutil.append_line_single_write`:
+    # one `os.write` for the whole record (never a buffered multi-write
+    # flush a SIGKILL could tear in half), and it heals a torn tail left by
+    # a prior killed writer before adding this line -- the same crash-
+    # safety discipline `engine_events.append_event` uses for the outbox.
     line = json.dumps(record)
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         lock_fd = os.open(str(log_path) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            with log_path.open("a", encoding="utf-8") as f:
-                f.write(line + "\n")
+            fsutil.append_line_single_write(log_path, line + "\n")
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)

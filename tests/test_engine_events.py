@@ -16,9 +16,13 @@ Covered here:
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import os
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from drumbeat import engine_events
@@ -188,6 +192,165 @@ class TestTornTail(unittest.TestCase):
             f.write(line[40:] + "\n")
         events, cursor = engine_events.read_since(self.runs_dir, cursor)
         self.assertEqual(len(events), 1)
+
+
+class TestSingleWriteAppendAndTornTailHeal(unittest.TestCase):
+    """The write side of the torn-tail contract.
+
+    Live incidents this covers: a SIGKILL mid-append tore a line (a
+    multi-write flush left a valid-JSON-prefix, no-trailing-newline
+    fragment on disk), and the NEXT append then fused its own bytes onto
+    that leftover fragment with no separating newline -- corrupting the
+    following line's parse boundary too. ``TestTornTail`` above proves the
+    READ side tolerates a torn tail; this proves the WRITE side never
+    produces one via its own multi-write flush, and heals one left behind
+    by a prior writer before adding to it.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.runs_dir = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_one_event_is_exactly_one_os_write_call(self) -> None:
+        """A single append must reach the kernel as a single ``os.write``.
+
+        Not a proxy metric: the multi-write flush this replaces is exactly
+        what let a SIGKILL land BETWEEN two writes of the same logical
+        line. Asserting the call count directly is what proves that
+        window is gone, rather than merely observing the end result looks
+        right (which the old implementation's happy path also produced).
+        """
+        calls: list[bytes] = []
+        real_write = os.write
+
+        def _counting_write(fd: int, data: bytes) -> int:
+            calls.append(data)
+            return real_write(fd, data)
+
+        with unittest.mock.patch.object(engine_events.os, "write", _counting_write):
+            engine_events.append_event(
+                self.runs_dir, engine_events.EventType.DELIVERY_INTENT, _intent()
+            )
+
+        self.assertEqual(len(calls), 1, f"expected exactly one os.write, got {calls!r}")
+        self.assertTrue(calls[0].endswith(b"\n"))
+        # The bytes actually landed -- this is a real write, not a stub.
+        path = engine_events.outbox_path(self.runs_dir)
+        self.assertEqual(path.read_bytes(), calls[0])
+
+    def test_one_write_holds_even_for_a_large_delivery_intent_text(self) -> None:
+        """The failure mode this exists for: a large ``text`` payload (the
+        run's full final output, unbounded) forced the old buffered writer
+        into multiple flush-loop writes. A large payload must still be one
+        ``os.write`` call.
+        """
+        calls: list[bytes] = []
+        real_write = os.write
+
+        def _counting_write(fd: int, data: bytes) -> int:
+            calls.append(data)
+            return real_write(fd, data)
+
+        large_text = "x" * 500_000
+        with unittest.mock.patch.object(engine_events.os, "write", _counting_write):
+            engine_events.append_event(
+                self.runs_dir,
+                engine_events.EventType.DELIVERY_INTENT,
+                _intent(text=large_text),
+            )
+
+        self.assertEqual(
+            len(calls), 1, f"expected exactly one os.write, got {len(calls)}"
+        )
+        self.assertIn(large_text.encode("utf-8"), calls[0])
+
+    def test_torn_tail_is_healed_before_the_next_append(self) -> None:
+        """A prior writer killed mid-line left no trailing newline. The
+        next append must seal that line with a newline FIRST, so its own
+        event lands on a fresh line rather than fused onto the wreckage.
+        """
+        path = engine_events.outbox_path(self.runs_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torn = '{"type": "delivery_intent", "run_id": "killed-mid-write", "auto'
+        path.write_text(torn, encoding="utf-8")
+
+        engine_events.append_event(
+            self.runs_dir, engine_events.EventType.DELIVERY_INTENT, _intent()
+        )
+
+        raw = path.read_text(encoding="utf-8")
+        lines = raw.split("\n")
+        # The torn fragment is now its own newline-terminated (if
+        # unparseable) line -- never fused with the new event's bytes.
+        self.assertEqual(lines[0], torn)
+        self.assertTrue(raw.startswith(torn + "\n"))
+        # The new event is intact, parseable, and readable on its own.
+        events, _ = engine_events.read_since(self.runs_dir, len(torn) + 1)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].run_id, "20260809T120000Z")
+
+    def test_torn_tail_heal_is_logged(self) -> None:
+        path = engine_events.outbox_path(self.runs_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"type": "delivery_intent", "incomplete', encoding="utf-8")
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            engine_events.append_event(
+                self.runs_dir, engine_events.EventType.DELIVERY_INTENT, _intent()
+            )
+
+        self.assertIn("healed a torn tail", stderr.getvalue())
+
+    def test_no_heal_when_the_file_already_ends_in_a_newline(self) -> None:
+        """The common case -- every prior append completed cleanly -- must
+        not grow the file by a spurious extra newline.
+        """
+        engine_events.append_event(
+            self.runs_dir, engine_events.EventType.DELIVERY_INTENT, _intent()
+        )
+        path = engine_events.outbox_path(self.runs_dir)
+        clean_size = path.stat().st_size
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            engine_events.append_event(
+                self.runs_dir,
+                engine_events.EventType.DELIVERY_INTENT,
+                _intent(run_id="second"),
+            )
+
+        self.assertNotIn("healed a torn tail", stderr.getvalue())
+        events, _ = engine_events.read_since(self.runs_dir, 0)
+        self.assertEqual(len(events), 2)
+        # No blank line was ever introduced between the two events.
+        raw = path.read_text(encoding="utf-8")
+        self.assertNotIn("\n\n", raw)
+        self.assertGreater(path.stat().st_size, clean_size)
+
+    def test_normal_append_path_is_byte_identical_to_before(self) -> None:
+        """The rewritten write path must not change what a healthy append
+        produces -- same bytes, same trailing newline, same fsync'd
+        durability for a DURABLE type. This is the non-regression half:
+        the crash-safety rewrite changes HOW the bytes get to disk, never
+        WHAT bytes land there.
+        """
+        end = engine_events.append_event(
+            self.runs_dir, engine_events.EventType.DELIVERY_INTENT, _intent()
+        )
+        path = engine_events.outbox_path(self.runs_dir)
+        raw = path.read_bytes()
+        self.assertEqual(len(raw), end)
+        self.assertTrue(raw.endswith(b"\n"))
+        record = json.loads(raw.rstrip(b"\n"))
+        self.assertEqual(record["type"], "delivery_intent")
+        self.assertEqual(record["run_id"], "20260809T120000Z")
+        events, cursor = engine_events.read_since(self.runs_dir, 0)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(cursor, end)
 
 
 class TestByteOffsetCursor(unittest.TestCase):
