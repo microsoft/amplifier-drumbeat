@@ -637,3 +637,21 @@ and sha256 are recorded in each run's
 always be tied back to the exact policy it executed under; both are `null` when
 no config was handed down.
 
+### Interactive/API turns do NOT read this automation's `agent_config:`
+
+**Everything above describes the SCHEDULED-run resolver (`agent_config.resolve`).**
+An interactive turn submitted via `POST /api/turns` — either a fresh turn naming
+`automation_slug` (e.g. a manual-trigger, chat-style automation's first message)
+or a reply that names an existing `session_id` — is resolved by a **separate,
+narrower function** (`agent_config.resolve_turn`) that merges only three layers:
+`$AMPLIFIER_AGENT_CONFIG`, the workspace `agent-config.yaml` `default:` block,
+and the request's own `profile:` (looked up in that same file's `profiles:`
+block). **It has no `automation_config` parameter at all, so an `agent_config:`
+block written into that automation's frontmatter is silently inert for every
+interactive/API turn against it** — including every turn a `trigger: manual`
+automation ever runs, since such an automation is *never* invoked any other way.
+To make a manual-trigger automation's turns select a model, add a named
+`profile:` in `agent-config.yaml` and have the caller pass
+`"profile": "<name>"` on `POST /api/turns` — an `agent_config:` block on the
+automation file itself only a *scheduled* run of that automation would read.
+

@@ -476,6 +476,17 @@ def resolve_turn(
     spec requires. An unknown profile name fails loud (``select_profile``),
     listing the available profiles.
 
+    **Deliberately no ``automation_config`` parameter, unlike ``resolve()``.**
+    Every interactive/API turn -- a fresh ``automation_slug`` turn or a
+    ``session_id`` reply -- runs through this function, never ``resolve()``, so
+    an automation's own ``agent_config:`` frontmatter (layer 4 of ``resolve()``)
+    is silently NOT part of this merge. A ``trigger: manual`` automation (e.g. a
+    chat-style conversational agent) is *only ever* invoked interactively, so its
+    ``agent_config:`` block -- if it had one -- would never take effect. The
+    model/provider knob for that class of automation is the named ``profile``
+    the caller passes here, resolved against ``agent-config.yaml``'s
+    ``profiles:`` block -- not a frontmatter block on the automation file.
+
     When every layer is empty (no env config, no ``default:`` block, no
     profile), the merged config is ``{}``: ``.path`` is ``None`` and the turn is
     handed no host config, running on the engine's own defaults. Otherwise the
