@@ -40,6 +40,38 @@ _MAX_RUN_REPLY_CHARS = 20_000
 _MAX_STDERR_LINES = 200
 _DEFAULT_RUNS_LIMIT = 50
 
+# The dead-brain outage class: a run can exit 0 (``failed: False``) while its
+# reply is itself a statement of failure ("Error: No providers available"),
+# and a consumer that only reads ``failed``/``notified`` off the run-record
+# contract has no way to tell. ``final_reply_preview`` closes that: a bounded
+# excerpt of the reply every run-record row carries (list AND detail, both
+# on-disk shapes), so a doctor-style consumer can classify a suspicious reply
+# without fetching every step body. Bounded so a megabyte reply from a
+# misbehaving turn cannot blow up the run listing it appears in.
+_FINAL_REPLY_PREVIEW_MAX_CHARS = 200
+# Never an invented string, and never indistinguishable from a genuinely
+# empty-but-real reply: a run that aborted before any turn ran (see
+# ``runner.FINAL_REPLY_RULE_ABORTED``) has ``final_reply == ""``, and an
+# in-flight run (``status.json``) has no ``final_reply`` key at all. Both
+# get this explicit marker rather than an empty string a consumer could
+# misread as "the model replied with nothing".
+_NO_REPLY_MARKER = "(no reply)"
+
+
+def _final_reply_preview(final_reply: Any) -> str:
+    """Bound ``final_reply`` (raw, possibly absent) to a single-line excerpt.
+
+    The ONE place this truncation happens -- every caller that needs a
+    reply preview (the run-record contract, the per-automation ``last_run``
+    summary) goes through here, so the bound and the no-reply marker can
+    never drift apart between surfaces the way the run-record contract
+    itself once did (see ``_RUN_RECORD_REQUIRED_FIELDS`` above).
+    """
+    if isinstance(final_reply, str) and final_reply.strip():
+        return final_reply.strip().replace("\n", " ")[:_FINAL_REPLY_PREVIEW_MAX_CHARS]
+    return _NO_REPLY_MARKER
+
+
 # Filename for an in-flight run's status record. Distinct from
 # ``result.json`` (written exactly once, at the very end, by
 # ``runner._persist_run``) -- this file exists solely to make a run
@@ -194,6 +226,12 @@ def _last_run_summary(entry: dict[str, Any] | None) -> dict[str, Any] | None:
     below) -- never the most recent *success*. Carrying ``error`` alongside
     ``failed`` is the whole point: a failed last run must be able to say why,
     not just that it happened.
+
+    ``final_reply_preview`` carries the same dead-brain signal here as on the
+    runs API row: this is the field a per-automation health scan (``list
+    automations`` -> each one's ``last_run``) sees WITHOUT a second request
+    per automation, and ``failed`` alone cannot show a reply that is itself
+    a statement of failure on an otherwise-exit-0 run.
     """
     if entry is None:
         return None
@@ -203,6 +241,7 @@ def _last_run_summary(entry: dict[str, Any] | None) -> dict[str, Any] | None:
         "finished_at": entry["finished_at"],
         "failed": entry["failed"],
         "error": entry.get("error"),
+        "final_reply_preview": _final_reply_preview(entry.get("final_reply")),
     }
 
 
@@ -865,11 +904,21 @@ def _run_contract_fields(
     detail endpoint used to serve the display name under ``automation``
     (whatever the run document happened to hold) -- the same field carrying
     two different things depending on which endpoint answered.
+
+    ``final_reply_preview`` is additive (not one of the five hard-required
+    fields above -- an older client that decodes only those five is
+    unaffected): a bounded excerpt of ``final_reply`` on both shapes, or
+    ``_NO_REPLY_MARKER`` when there is none yet (in-flight) or none at all
+    (a run that aborted before any turn ran). It exists so a dead-brain
+    reply ("Error: No providers available" on an otherwise-successful,
+    ``failed: False`` run) is visible from the run-record contract alone,
+    without a consumer needing to fetch full step bodies.
     """
     if "failed" in data:
         failed = bool(data.get("failed"))
     else:
         failed = str(data.get("status", "")) in {"failed", "error"}
+    final_reply_preview = _final_reply_preview(data.get("final_reply"))
     return {
         "run_id": data.get("run_id") or run_id_fallback,
         "automation": slug,
@@ -878,6 +927,7 @@ def _run_contract_fields(
         ),
         "failed": failed,
         "notified": bool(data.get("notified", False)),
+        "final_reply_preview": final_reply_preview,
     }
 
 
@@ -939,6 +989,10 @@ def _iter_run_records(
                     "failed": bool(data.get("failed", False)),
                     "error": data.get("error"),
                     "notified": bool(data.get("notified", False)),
+                    # Raw, un-truncated -- carried only so `list_runs` can
+                    # derive `final_reply_preview` via `_run_contract_fields`
+                    # (the one place bounding happens). Never served as-is.
+                    "final_reply": data.get("final_reply"),
                     "step_count": len(data.get("steps") or []),
                     "duration_seconds": _duration_seconds(
                         data.get("started_at"), data.get("finished_at")
@@ -985,7 +1039,12 @@ def list_runs(
                 f"{exc.message}\n"
             )
             continue
-        served.append({**entry, **contract})
+        # `entry["final_reply"]` is the raw, un-truncated reply -- carried
+        # only so `_run_contract_fields` above could derive the BOUNDED
+        # `final_reply_preview` now sitting in `contract`. Drop the raw key
+        # here so the listing never serves an unbounded reply body.
+        trimmed_entry = {k: v for k, v in entry.items() if k != "final_reply"}
+        served.append({**trimmed_entry, **contract})
         if len(served) == limit:
             break
     return served

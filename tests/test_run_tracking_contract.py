@@ -201,7 +201,14 @@ class _RunTrackingTestCase(unittest.TestCase):
         self._restore.append((obj, attr, getattr(obj, attr)))
         setattr(obj, attr, value)
 
-    def _write_result_json(self, run_id: str, *, failed: bool, notified: bool) -> None:
+    def _write_result_json(
+        self,
+        run_id: str,
+        *,
+        failed: bool,
+        notified: bool,
+        final_reply: str = "nothing on the calendar in the next two hours",
+    ) -> None:
         """A faithful ``result.json``: ``asdict`` over a real ``RunResult``."""
         result = runner.RunResult(
             automation=_NAME,
@@ -210,7 +217,7 @@ class _RunTrackingTestCase(unittest.TestCase):
             started_at="2026-08-17T23:35:01Z",
             finished_at="2026-08-17T23:35:44Z",
             steps=[],
-            final_reply="nothing on the calendar in the next two hours",
+            final_reply=final_reply,
             notified=notified,
             failed=failed,
         )
@@ -379,6 +386,119 @@ class TestTheClientCanTrackAManualRun(_RunTrackingTestCase):
         # tick, not the fourth.
         self.assertEqual(polled["finished_at"], "2026-08-17T23:35:02Z")
         self.assertGreater(polled["finished_at"], polled["started_at"])
+
+
+class TestFinalReplyPreviewExposesDeadBrainReplies(_RunTrackingTestCase):
+    """The dead-brain outage class: a run can exit 0 (``failed: False``)
+    while its reply is itself a statement of failure ("Error: No providers
+    available"), and a consumer reading only ``failed``/``notified`` off the
+    run-record contract has no way to tell. ``final_reply_preview`` closes
+    that on every surface that carries the run-record contract -- the runs
+    API row (list and detail) and the per-automation ``last_run`` summary.
+    """
+
+    def test_a_completed_run_carries_a_bounded_preview(self) -> None:
+        self._patch(management_api.threading, "Thread", _InlineThread)
+        long_reply = "Error: No providers available. " * 20  # > 200 chars
+
+        def _succeeding_run(*_args: Any, **kwargs: Any) -> None:
+            self._write_result_json(
+                kwargs["run_id"], failed=False, notified=True, final_reply=long_reply
+            )
+
+        self._patch(runner, "run", _succeeding_run)
+
+        accepted = run_automation_async(_SLUG, self.ctx)
+        polled = get_run_detail(_SLUG, accepted["run_id"], self.ctx)
+
+        self.assertIn("final_reply_preview", polled)
+        preview = polled["final_reply_preview"]
+        self.assertTrue(preview.startswith("Error: No providers available."))
+        self.assertLessEqual(len(preview), 200)
+        # The dead-brain signal survives truncation -- a consumer scanning
+        # only the preview can still classify this run as suspicious even
+        # though ``failed`` reads False.
+        self.assertIn("Error: No providers available", preview)
+        # The detail endpoint's full, untouched reply still rides along too
+        # (unchanged behavior) -- the preview is additive, not a replacement.
+        self.assertEqual(polled["final_reply"], long_reply)
+
+        listed = list_runs(limit=10, automation_filter=_SLUG, ctx=self.ctx)
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0]["final_reply_preview"], preview)
+        # The listing must never carry the raw, unbounded reply -- only the
+        # bounded preview derived from it.
+        self.assertNotIn("final_reply", listed[0])
+
+    def test_a_run_aborted_before_any_turn_gets_the_no_reply_marker(self) -> None:
+        """``final_reply == ""`` (the empty-but-real, aborted-before-any-turn
+        case) must read as the explicit marker, never an empty string a
+        consumer could misread as "the model replied with nothing".
+        """
+        self._patch(management_api.threading, "Thread", _InlineThread)
+
+        def _aborted_run(*_args: Any, **kwargs: Any) -> None:
+            self._write_result_json(
+                kwargs["run_id"], failed=True, notified=False, final_reply=""
+            )
+
+        self._patch(runner, "run", _aborted_run)
+
+        accepted = run_automation_async(_SLUG, self.ctx)
+        polled = get_run_detail(_SLUG, accepted["run_id"], self.ctx)
+        self.assertEqual(polled["final_reply_preview"], management_api._NO_REPLY_MARKER)
+
+        listed = list_runs(limit=10, automation_filter=_SLUG, ctx=self.ctx)
+        self.assertEqual(
+            listed[0]["final_reply_preview"], management_api._NO_REPLY_MARKER
+        )
+
+    def test_an_in_flight_run_gets_the_no_reply_marker(self) -> None:
+        """``status.json`` has no ``final_reply`` key at all -- the marker,
+        not a KeyError and not an empty string.
+        """
+        released = threading.Event()
+        reached = threading.Event()
+
+        def _blocking_run(*_args: Any, **_kwargs: Any) -> None:
+            reached.set()
+            released.wait(timeout=30)
+
+        self._patch(runner, "run", _blocking_run)
+        accepted = run_automation_async(_SLUG, self.ctx)
+        try:
+            self.assertTrue(reached.wait(timeout=30), "background run never started")
+            polled = get_run_detail(_SLUG, accepted["run_id"], self.ctx)
+            self.assertEqual(polled["status"], "running")
+            self.assertEqual(
+                polled["final_reply_preview"], management_api._NO_REPLY_MARKER
+            )
+        finally:
+            released.set()
+
+    def test_last_run_summary_also_carries_the_preview(self) -> None:
+        """The per-automation ``last_run`` field (``list_automations``) is
+        the other surface a doctor-style consumer scans across every
+        automation at once -- it must carry the same signal.
+        """
+        self._patch(management_api.threading, "Thread", _InlineThread)
+
+        def _succeeding_run(*_args: Any, **kwargs: Any) -> None:
+            self._write_result_json(
+                kwargs["run_id"],
+                failed=False,
+                notified=True,
+                final_reply="Error: No providers available",
+            )
+
+        self._patch(runner, "run", _succeeding_run)
+        run_automation_async(_SLUG, self.ctx)
+
+        automations = management_api.list_automations(self.ctx)
+        entry = next(a for a in automations if a["slug"] == _SLUG)
+        self.assertEqual(
+            entry["last_run"]["final_reply_preview"], "Error: No providers available"
+        )
 
 
 class TestBothEndpointsAgree(_RunTrackingTestCase):
