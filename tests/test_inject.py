@@ -104,6 +104,87 @@ class TestInjectClassification(unittest.TestCase):
         self.assertIsNone(outcome.abort_reason)
         self.assertEqual(outcome.text, "line one\nline two\n")
 
+    def test_undeclared_expect_prefix_keeps_verbatim_trust(self) -> None:
+        """No `expect_prefix` declared (the default, `None`) -- an inject tool
+        that never opted in keeps today's unchanged verbatim-trust behavior,
+        even for content that looks nothing like ledger truth. Backward
+        compatibility for every existing automation that never sets it.
+        """
+        tool = _write_tool(self.cwd, "printf 'anything at all, unchecked'")
+        outcome = runner._run_inject_tool(
+            self._spec(tool), cwd=self.cwd, runs_dir=self.cwd / "runs"
+        )
+        self.assertIsNone(outcome.abort_reason)
+        self.assertEqual(outcome.text, "anything at all, unchecked")
+
+    def test_expect_prefix_match_injects_verbatim(self) -> None:
+        """A declared `expect_prefix` that the real stdout satisfies changes
+        nothing about the outcome -- still injected verbatim, full text.
+        """
+        tool = _write_tool(
+            self.cwd,
+            "printf 'The Cortex attention ledger currently has 2 OPEN item(s)\\n'",
+        )
+        spec = InjectSpec(
+            argv=(str(tool),),
+            label="open items",
+            expect_prefix="The Cortex attention ledger",
+        )
+        outcome = runner._run_inject_tool(
+            spec, cwd=self.cwd, runs_dir=self.cwd / "runs"
+        )
+        self.assertIsNone(outcome.abort_reason)
+        self.assertEqual(
+            outcome.text, "The Cortex attention ledger currently has 2 OPEN item(s)\n"
+        )
+
+    def test_expect_prefix_mismatch_aborts_loud_not_fed_to_model(self) -> None:
+        """cortex-7152 symptom 3, the core regression: a tool that exits 0
+        with non-empty stdout that is NOT the declared payload shape -- a
+        stray diagnostic sentence, not ledger content -- must abort loud,
+        exactly like the empty-stdout row, never reach ``InjectOutcome.text``
+        (the only path that becomes a trusted turn).
+        """
+        tool = _write_tool(
+            self.cwd,
+            "printf 'The injection that should have arrived ahead of step 2 "
+            "is missing from this run.\\n'",
+        )
+        spec = InjectSpec(
+            argv=(str(tool),),
+            label="open items",
+            expect_prefix="The Cortex attention ledger",
+        )
+        outcome = runner._run_inject_tool(
+            spec, cwd=self.cwd, runs_dir=self.cwd / "runs"
+        )
+        assert outcome.abort_reason is not None
+        self.assertIn("expect_prefix", outcome.abort_reason)
+        self.assertIn("The Cortex attention ledger", outcome.abort_reason)
+        self.assertIn(
+            "injection that should have arrived ahead of step 2", outcome.abort_reason
+        )
+        self.assertFalse(outcome.idle)
+        self.assertIsNone(outcome.text)
+
+    def test_expect_prefix_mismatch_message_truncates_long_content(self) -> None:
+        """The mismatched content is quoted in the abort reason for
+        diagnosability, but capped -- an inject tool that goes rogue and
+        emits megabytes must not blow up the abort message (and, downstream,
+        the persisted run record / automation_error event) with it.
+        """
+        tool = _write_tool(self.cwd, "python3 -c \"print('x' * 5000)\"")
+        spec = InjectSpec(
+            argv=(str(tool),),
+            label="open items",
+            expect_prefix="The Cortex attention ledger",
+        )
+        outcome = runner._run_inject_tool(
+            spec, cwd=self.cwd, runs_dir=self.cwd / "runs"
+        )
+        assert outcome.abort_reason is not None
+        self.assertLess(len(outcome.abort_reason), 1000)
+
     def test_timeout_aborts_voiced(self) -> None:
         tool = _write_tool(self.cwd, "sleep 5")
         spec = self._spec(tool)
@@ -190,6 +271,52 @@ class TestInjectFrontmatter(unittest.TestCase):
     def test_non_list_inject_fails_loud(self) -> None:
         with self.assertRaises(AutomationError):
             self._load("  inject: yes\n")
+
+    def test_valid_inject_with_expect_prefix_parses(self) -> None:
+        """The optional shape-guard field: declaring it parses into
+        ``InjectSpec.expect_prefix``, distinct from the absent-by-default
+        case covered by ``test_valid_inject_parses`` above.
+        """
+        automation = self._load(
+            "  inject:\n"
+            '    - argv: ["items-cli", "inject-turn"]\n'
+            '      label: "open items"\n'
+            '      expect_prefix: "The attention ledger"\n'
+        )
+        self.assertEqual(
+            automation.inject,
+            (
+                InjectSpec(
+                    argv=("items-cli", "inject-turn"),
+                    label="open items",
+                    expect_prefix="The attention ledger",
+                ),
+            ),
+        )
+
+    def test_expect_prefix_absent_defaults_to_none(self) -> None:
+        automation = self._load('  inject:\n    - argv: ["tool"]\n      label: "x"\n')
+        self.assertIsNone(automation.inject[0].expect_prefix)
+
+    def test_expect_prefix_empty_string_fails_loud(self) -> None:
+        """An empty ``expect_prefix`` would match any stdout and silently
+        defeat the shape check it exists to add -- reject it at parse time
+        rather than shipping a no-op guard.
+        """
+        with self.assertRaises(AutomationError) as ctx:
+            self._load(
+                '  inject:\n    - argv: ["tool"]\n      label: "x"\n'
+                '      expect_prefix: ""\n'
+            )
+        self.assertIn("expect_prefix", str(ctx.exception))
+
+    def test_expect_prefix_wrong_type_fails_loud(self) -> None:
+        with self.assertRaises(AutomationError) as ctx:
+            self._load(
+                '  inject:\n    - argv: ["tool"]\n      label: "x"\n'
+                "      expect_prefix: 5\n"
+            )
+        self.assertIn("expect_prefix", str(ctx.exception))
 
 
 class TestMinimalPackExemplar(unittest.TestCase):

@@ -1451,6 +1451,25 @@ def _run_inject_tool(spec: InjectSpec, *, cwd: Path, runs_dir: Path) -> InjectOu
                 "must not share an observable). Aborting loud."
             )
         )
+    # Malformed inject content: the "anything else" row of the
+    # hybrid-sentinel contract trusts stdout VERBATIM with no shape
+    # validation -- the hole that lets a stray diagnostic sentence (not the
+    # tool's real payload) reach a real conversation as if it were trusted
+    # state. `expect_prefix` is the one shape check the engine can make on
+    # content it otherwise never parses: OPTIONAL, so an automation that
+    # never declares it keeps today's unchanged verbatim-trust behavior.
+    # When declared, a non-matching stdout is classified EXACTLY like
+    # bare-empty stdout above -- abort loud, never fed to the model as a turn.
+    if spec.expect_prefix is not None and not stripped.startswith(spec.expect_prefix):
+        return InjectOutcome(
+            abort_reason=(
+                f"inject {spec.label!r} ({argv[0]}) exited 0 with stdout that "
+                f"does not begin with the declared expect_prefix "
+                f"{spec.expect_prefix!r} -- got: {stripped[:200]!r} -- aborting "
+                "rather than trusting unverified content as ledger truth. "
+                "Malformed inject content, not a real payload."
+            )
+        )
     return InjectOutcome(text=stdout)
 
 

@@ -189,13 +189,24 @@ class InjectSpec:
     ``argv`` is executed before step 1 of every run; its stdout becomes an
     injected turn under the hybrid-sentinel contract (timeout -> exit code
     -> stdout; ``INJECT_IDLE`` skips with a recorded reason; bare-empty
-    stdout aborts loud). Both fields are required with no defaults: an
-    inject with no label would make its ``inject_skipped`` events
-    unattributable (failure class 13).
+    stdout aborts loud). Both ``argv`` and ``label`` are required with no
+    defaults: an inject with no label would make its ``inject_skipped``
+    events unattributable (failure class 13).
+
+    ``expect_prefix`` is OPTIONAL and defaults to None -- unset, every
+    inject tool keeps today's verbatim-trust behavior unchanged. When set,
+    it is the one shape check the engine can make on content it otherwise
+    never parses: real inject stdout is trusted content authored by the
+    tool's own contract, not the tool's incidental stderr-shaped prose
+    that happened to reach stdout. A tool declaring this closes the hole
+    where a stray diagnostic sentence (not the tool's real payload) would
+    otherwise be trusted as ledger truth and relayed to the user verbatim.
+    See ``_run_inject_tool``'s classification of the "anything else" branch.
     """
 
     argv: tuple[str, ...]
     label: str
+    expect_prefix: str | None = None
 
 
 @dataclass(frozen=True)
@@ -479,12 +490,12 @@ def _parse_inject(path: Path, raw: object) -> tuple[InjectSpec, ...]:
             raise AutomationError(
                 path, f"automation.inject[{i}] must be a mapping with argv and label"
             )
-        unknown = set(entry) - {"argv", "label"}
+        unknown = set(entry) - {"argv", "label", "expect_prefix"}
         if unknown:
             raise AutomationError(
                 path,
                 f"automation.inject[{i}] has unknown key(s) {sorted(unknown)}; "
-                "only argv and label are allowed",
+                "only argv, label, and expect_prefix are allowed",
             )
         argv = entry.get("argv")
         if (
@@ -505,7 +516,27 @@ def _parse_inject(path: Path, raw: object) -> tuple[InjectSpec, ...]:
                 "string -- an unlabeled injection's skip events would be "
                 "unattributable",
             )
-        specs.append(InjectSpec(argv=tuple(argv), label=label.strip()))
+        # `expect_prefix` is OPTIONAL (unlike argv/label): absent means "keep
+        # today's verbatim-trust behavior", so every existing automation that
+        # never sets it is unaffected. When present it must be a non-empty
+        # string -- an empty prefix would match anything and silently defeat
+        # the check it exists to add.
+        expect_prefix: str | None = None
+        if "expect_prefix" in entry:
+            raw_expect_prefix = entry.get("expect_prefix")
+            if not isinstance(raw_expect_prefix, str) or not raw_expect_prefix.strip():
+                raise AutomationError(
+                    path,
+                    f"automation.inject[{i}].expect_prefix, when present, must be "
+                    "a non-empty string -- an empty prefix would match any "
+                    "stdout and silently defeat the shape check it exists to add",
+                )
+            expect_prefix = raw_expect_prefix
+        specs.append(
+            InjectSpec(
+                argv=tuple(argv), label=label.strip(), expect_prefix=expect_prefix
+            )
+        )
     return tuple(specs)
 
 

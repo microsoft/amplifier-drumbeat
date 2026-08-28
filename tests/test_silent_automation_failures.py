@@ -324,6 +324,77 @@ class TestInjectSkippedGuardCatchesOutboxError(_RunFixture):
         self.assertIsNone(result.error)
 
 
+class TestMalformedInjectContentAbortsBeforeAnyTurn(_RunFixture):
+    """cortex-7152 symptom 3: an internal diagnostic sentence ("the injection
+    that should have arrived ahead of step 2 is missing from this run")
+    reached a real chat conversation, verbatim, because the "anything else"
+    row of the hybrid-sentinel contract trusted inject stdout with no shape
+    validation. When an automation declares ``expect_prefix`` and the inject
+    tool's stdout does not match it, the run must abort exactly like the
+    empty-stdout row -- ``failed=True``, a non-null ``error`` naming the
+    mismatch, and critically ``final_reply == ""``: the malformed content
+    must never reach ``_invoke_turn`` (mocked here to prove it -- if the
+    abort didn't happen before the first turn, the mocked success envelope
+    below would make this run report success).
+    """
+
+    def test_malformed_inject_content_aborts_with_empty_final_reply(self) -> None:
+        self._write_automation(_INJECT_AUTOMATION, "inject-guard-check.md")
+        # Simulate the actual observed leak: exit 0, non-empty stdout, but
+        # not the ledger payload shape -- a stray diagnostic sentence.
+        malformed_outcome = runner.InjectOutcome(
+            text=None,
+            abort_reason=(
+                "inject 'open items' (ledger-items) exited 0 with stdout that "
+                "does not begin with the declared expect_prefix 'The Cortex "
+                "attention ledger' -- got: 'The injection that should have "
+                "arrived ahead of step 2 is missing from this run.' -- "
+                "aborting rather than trusting unverified content as ledger "
+                "truth. Malformed inject content, not a real payload."
+            ),
+        )
+        with (
+            mock.patch.object(
+                runner, "_run_inject_tool", return_value=malformed_outcome
+            ),
+            # If the abort did not happen before any turn ran, this mocked
+            # SUCCESS would make the run report success -- so a passing test
+            # here proves the turn was never reached, not merely that no
+            # step happened to fail.
+            mock.patch.object(
+                runner,
+                "_submit_turn",
+                return_value=runner._TurnOutcome(
+                    reply="ok", tokens_in=3, tokens_out=3, duration_ms=5
+                ),
+            ),
+            redirect_stderr(io.StringIO()),
+        ):
+            result = runner.run(
+                self.automation,
+                cwd=self.workspace,
+                runs_dir=self.runs_dir,
+                prompts_dir=self.prompts_dir,
+            )
+
+        self.assertTrue(result.failed)
+        self.assertIsNotNone(result.error)
+        assert result.error is not None
+        self.assertIn("expect_prefix", result.error)
+        # THE regression invariant: an aborted-on-inject run can never
+        # produce a non-empty final_reply -- the malformed content is never
+        # fed to the model, and nothing else fills the reply in on abort.
+        self.assertEqual(result.final_reply, "")
+        self.assertEqual(result.steps, [])
+
+        # Durable too: the persisted run record a human / cortex doctor
+        # reads carries the same empty final_reply, never the leaked text.
+        run_dir = self.runs_dir / self.automation.slug / result.run_id
+        persisted = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+        self.assertTrue(persisted["failed"])
+        self.assertEqual(persisted["final_reply"], "")
+
+
 class TestScheduleStateRoundTrip(unittest.TestCase):
     """The persistence primitive: save/load is lossless, and load is
     fail-loud-not-fail-silent on a corrupt file (returns {} rather than
