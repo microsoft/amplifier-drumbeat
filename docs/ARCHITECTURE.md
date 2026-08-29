@@ -162,6 +162,36 @@ stock library through its documented embedding surface. Nothing in the engine
 depends on a modified agent underneath, which is the property that keeps it
 portable.
 
+### Session-init module failures are visible, not fatal
+
+Booting the engine mounts every declared provider, tool, and hook. A
+provider/tool/hook that fails to load or fails its own module validation is
+**not fatal to the turn**: the engine library keeps booting with a reduced
+module set, logs the failure once (`Failed to load <type> '<module_id>':
+<reason>`), and the turn can still produce a real reply — just without
+whatever that module would have provided. Measured on a real deployment,
+2026-08-28: 96 of 96 runs in one morning carried exactly this warning on
+their stderr while every run's own record read `"failed": false, "error":
+null` — an independent watcher scanning stderr correctly flagged the
+failures; the engine's own verdict never did.
+
+Whether a degraded session should count as a run *failure* is a judgment call
+for the automation author or a consuming watcher — the engine does not know
+what a missing tool means to any given automation, and manufacturing a
+`failed: true` for a run that legitimately answered would be its own kind of
+lie. What the engine **does** own is visibility: every turn's stderr is
+scanned for that exact warning line, and any matches are recorded — deduped,
+sorted, as `"<type>:<module_id>"` — on the turn's own run-record entry and
+(aggregated across the whole run) at the run's top level, persisted to
+`result.json` and the `RUN_COMPLETED` event as `module_failures`. See
+`docs/AUTOMATIONS.md` §11 for the consumer-facing field reference.
+
+An **unhandled** exception during session init (one the engine library does
+not catch internally) is a different, unrelated path: it still produces
+`failed: true` with the real exception text in `error`, exactly like any
+other turn failure (§10) — this section covers only the failure mode that
+does *not* raise.
+
 ### Sessions are pinned, not per-run
 
 Each automation resumes **one long-lived conversation**, across runs, for weeks.

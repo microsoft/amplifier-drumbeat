@@ -277,6 +277,10 @@ class StepResult:
     # RUN_COMPLETED event so a run's turns can be tied back to the step that
     # produced them by identity, surviving a later reordering of the steps.
     step_id: str | None = None
+    # Carried verbatim from ``_TurnOutcome.module_failures`` (see that field's
+    # docstring and ``_detect_module_load_failures``): this turn's own
+    # session-init module degradation, never a run-failure signal on its own.
+    module_failures: tuple[str, ...] = ()
 
 
 @dataclass
@@ -337,6 +341,16 @@ class RunResult:
     # under. Set on the normal run path (aborts before any turn leave them None).
     effective_config_path: str | None = None
     effective_config_sha: str | None = None
+    # Session-init module degradation, aggregated across every turn this run
+    # fired (see ``_detect_module_load_failures`` and ``StepResult.module_failures``).
+    # Deduped, sorted ``"<type>:<module_id>"`` entries. Computed ONCE, at the
+    # ``_persist_run`` choke point, from ``steps[].module_failures`` -- the same
+    # discipline ``_persist_run`` already applies to ``error`` -- so no
+    # RunResult-constructing call site needs to remember to aggregate it
+    # itself. NEVER flips ``failed``: a degraded-but-answering run is a
+    # visibility concern, not this engine's failure verdict (see
+    # docs/AUTOMATIONS.md's "Session-init module failures" section).
+    module_failures: tuple[str, ...] = ()
 
 
 # The run id's shape is load-bearing in exactly two ways and opaque in every
@@ -1573,6 +1587,74 @@ class _TurnOutcome:
     cost_usd: str | None = None
     duration_ms: int = 0
     stderr_text: str = ""
+    # Session-init module degradation (see ``_detect_module_load_failures``):
+    # ``"<type>:<module_id>"`` entries for every provider/tool/hook this turn's
+    # engine reported (via its own WARNING log line) as failing to load/validate
+    # during boot. NEVER implies the turn itself failed -- amplifier-core keeps
+    # booting with a reduced module set, and the turn can still produce a real
+    # reply. Empty for every turn whose worker stderr carried no such line,
+    # which is every ordinary turn today.
+    module_failures: tuple[str, ...] = ()
+
+
+# Session-init module-load degradation (measured on a real deployment,
+# 2026-08-28: 96 of 96 runs in one morning carried a module validation
+# failure in stderr.log while every result.json recorded
+# ``"failed": false, "error": null``). amplifier-core's own per-turn session
+# init (``initialize_session`` in amplifier_core/_session_init.py) treats a
+# provider/tool/hook that raises during load/validate as NON-FATAL: it logs
+# ``logger.warning(f"Failed to load {module_type} '{module_id}': {exc}", ...)``
+# and emits a ``module:load_failed`` hook event, then keeps booting with a
+# reduced module set. Neither reaches this worker as a raised exception (an
+# unhandled exception during init IS already caught -- see
+# ``agent_worker.main``'s outer ``except BaseException`` -- and already
+# produces ``ok: False`` with a real error; this is the OTHER case, where
+# nothing raises at all) nor as a forwarded display event (the engine's
+# Display protocol point only carries engine-generated notifications, not
+# kernel hook events -- amplifier-agent never wires ``module:load_failed``
+# to it). The WARNING log line is this run's only trace, and it lands on
+# stderr because Python's logging "handler of last resort" writes
+# unconfigured WARNING+ records there -- which is exactly where an
+# independent watcher scanning stderr.log found it while every run's own
+# verdict stayed silent.
+#
+# This is a MECHANISM gap, not a policy one (KERNEL_PHILOSOPHY: "mechanism,
+# not policy"): whether a degraded session should be treated as a run
+# failure is a judgment call for the automation author / a consuming
+# watcher, not something this engine should decide unilaterally. The honest
+# minimum this engine owes is VISIBILITY -- naming which modules failed to
+# load on the run record -- without manufacturing a false ``"failed": true``
+# for a run that legitimately produced a real reply. See
+# ``_execute_turn``/``_persist_run`` for how this reaches ``StepResult``/
+# ``RunResult``, and docs/AUTOMATIONS.md's "Session-init module failures"
+# section for the consumer-facing contract.
+_MODULE_LOAD_FAILURE_RE = re.compile(r"Failed to load (provider|tool|hook) '([^']+)':")
+
+
+def _detect_module_load_failures(stderr_text: str) -> tuple[str, ...]:
+    """Scan one turn's captured stderr for amplifier-core's own
+    ``Failed to load <type> '<module_id>':`` warning line and return the
+    deduped, sorted ``"<type>:<module_id>"`` entries found.
+
+    A best-effort SECOND signal, not the primary defense against a
+    session-init crash -- an exception that actually escapes ``_run_turn``
+    (agent_worker.py) is already caught there and reported as ``ok: False``
+    with a real ``error`` (see ``_error_payload``). This function exists for
+    the case that is NOT an unhandled exception at all: amplifier-core's own
+    module loader catches a module's validation/mount failure internally,
+    per module, and never raises it back to this worker -- see the module
+    docstring above ``_MODULE_LOAD_FAILURE_RE``.
+    """
+    if not stderr_text:
+        return ()
+    return tuple(
+        sorted(
+            {
+                f"{kind}:{module_id}"
+                for kind, module_id in _MODULE_LOAD_FAILURE_RE.findall(stderr_text)
+            }
+        )
+    )
 
 
 def _worker_env(
@@ -1757,6 +1839,11 @@ def _submit_turn(
 
     duration_ms = _elapsed_ms()
     stderr_text = "".join(stderr_parts).strip()
+    # Scanned on EVERY path below (timeout, spawn failure, success, plain
+    # engine error) -- a degraded session init can precede any of these
+    # outcomes, and the worker's stderr is the only place it is visible. See
+    # ``_detect_module_load_failures``'s module-level docstring.
+    module_failures = _detect_module_load_failures(stderr_text)
 
     # Timeout wins over every other classification: the group was SIGKILLed, so
     # there is no terminal envelope, but this is a timeout, not a spawn failure.
@@ -1767,6 +1854,7 @@ def _submit_turn(
             timed_out=True,
             duration_ms=duration_ms,
             stderr_text=stderr_text,
+            module_failures=module_failures,
         )
 
     if terminal is None:
@@ -1779,6 +1867,7 @@ def _submit_turn(
             spawn_failed=True,
             duration_ms=duration_ms,
             stderr_text=stderr_text,
+            module_failures=module_failures,
         )
 
     tok_in = terminal.get("tokens_in")
@@ -1798,6 +1887,7 @@ def _submit_turn(
             cost_usd=cost,
             duration_ms=duration_ms,
             stderr_text=stderr_text,
+            module_failures=module_failures,
         )
 
     # The turn ran but failed. ``engine_library_unavailable`` is the one code the
@@ -1806,13 +1896,16 @@ def _submit_turn(
     error = terminal.get("error")
     code = terminal.get("code")
     return _TurnOutcome(
-        error=error if isinstance(error, str) and error else "the turn failed with no reported reason",
+        error=error
+        if isinstance(error, str) and error
+        else "the turn failed with no reported reason",
         spawn_failed=code == "engine_library_unavailable",
         tokens_in=tok_in,
         tokens_out=tok_out,
         cost_usd=cost,
         duration_ms=duration_ms,
         stderr_text=stderr_text,
+        module_failures=module_failures,
     )
 
 
@@ -2229,6 +2322,7 @@ def _execute_turn(
                 duration_ms=outcome.duration_ms,
                 tokens_in=None,
                 tokens_out=None,
+                module_failures=outcome.module_failures,
             ),
             outcome.stderr_text,
         )
@@ -2243,6 +2337,7 @@ def _execute_turn(
                 duration_ms=_STEP_TIMEOUT_SECONDS * 1000,
                 tokens_in=None,
                 tokens_out=None,
+                module_failures=outcome.module_failures,
             ),
             outcome.stderr_text,
         )
@@ -2261,6 +2356,7 @@ def _execute_turn(
             tokens_in=outcome.tokens_in,
             tokens_out=outcome.tokens_out,
             cost_usd=outcome.cost_usd,
+            module_failures=outcome.module_failures,
         ),
         outcome.stderr_text,
     )
@@ -4592,6 +4688,18 @@ def _persist_run(
             "stderr.log and step artifacts",
         )
 
+    # Session-init module degradation, aggregated ONCE here -- same choke-point
+    # discipline as the ``result.error`` normalization just above, so no
+    # RunResult-constructing call site needs to remember to roll its own turns'
+    # ``module_failures`` up to the run level. Deduped and sorted across every
+    # turn this run fired; empty when no turn's stderr carried the warning line
+    # (see ``_detect_module_load_failures``). Unlike ``error``, this is never
+    # guarded by ``failed`` -- it is independent, additive visibility, not a
+    # failure verdict, so it is safe (and correct) to compute unconditionally.
+    result.module_failures = tuple(
+        sorted({m for step in result.steps for m in step.module_failures})
+    )
+
     engine_events.append_event(
         runs_dir,
         engine_events.EventType.RUN_COMPLETED,
@@ -4606,6 +4714,7 @@ def _persist_run(
             "error": result.error,
             "final_reply_rule": final_reply_rule,
             "final_reply": result.final_reply,
+            "module_failures": result.module_failures,
             "steps": [
                 {
                     "index": step.index,
@@ -4616,6 +4725,7 @@ def _persist_run(
                     "tokens_in": step.tokens_in,
                     "tokens_out": step.tokens_out,
                     "cost_usd": step.cost_usd,
+                    "module_failures": step.module_failures,
                 }
                 for step in result.steps
             ],
