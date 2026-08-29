@@ -644,6 +644,33 @@ and sha256 are recorded in each run's
 always be tied back to the exact policy it executed under; both are `null` when
 no config was handed down.
 
+### Session-init module failures
+
+`result.json` (and each turn's own entry under `steps:`, and the
+`RUN_COMPLETED` event) carries a `module_failures` list — deduped, sorted
+`"<type>:<module_id>"` entries (`type` is one of `provider`, `tool`, `hook`)
+naming every module that failed to load or failed its own validation while
+this run's session was booting. Empty for the overwhelming majority of runs.
+
+This is **visibility, not a verdict**: a non-empty `module_failures` does
+**not** mean `failed: true`. Booting the engine tolerates a provider, tool,
+or hook that fails to load — it keeps going with a reduced module set, and
+the run can still produce a real, useful reply (just without whatever that
+module would have provided; a tool that failed to load, for instance, means
+that run had no way to call it). Whether that degradation matters for a
+given automation is a call only the automation's own author or a consuming
+watcher can make — the engine records what happened and lets you decide.
+Measured on a real deployment, 2026-08-28: 96 of 96 runs in one morning
+carried the same module-load warning on stderr while every run's own record
+read `"failed": false, "error": null`; this field is what makes that
+degradation visible on the record itself, not just recoverable by grepping
+`stderr.log`. See `docs/ARCHITECTURE.md` §4 ("Session-init module failures
+are visible, not fatal") for the mechanism.
+
+A run that instead hits a genuinely **unhandled** exception during session
+init is unaffected by any of this — it still records `failed: true` with the
+real exception text in `error`, the same as any other turn failure.
+
 ### Interactive/API turns do NOT read this automation's `agent_config:`
 
 **Everything above describes the SCHEDULED-run resolver (`agent_config.resolve`).**
