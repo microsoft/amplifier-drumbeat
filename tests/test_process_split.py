@@ -480,3 +480,171 @@ def test_unknown_route_is_404_not_a_guess(engine_server):
     status, payload = _get(f"{base}/api/nope")
     assert status == 404
     assert "no such route" in payload["error"]
+
+
+# ------------------------------------------- drain: non-Linux portability ----
+#
+# field report #504, failure 4: ``drain.py`` read ``/proc`` unconditionally.
+# macOS has no ``/proc`` AT ALL, so ``drumbeat drain --status/--wait`` --
+# the DOCUMENTED safe-shutdown procedure -- raised FileNotFoundError out of
+# ``Path("/proc").iterdir()`` and could not be completed on that platform.
+#
+# SIMULATION ONLY. This lane has no macOS host: ``sys.platform`` is
+# monkeypatched and ``ps`` output is faked. That proves the non-Linux branch
+# is taken and parses correctly; it does not prove macOS's own ``ps``.
+# Its format is POSIX (``ps -eo pid,ppid,args``), which is why it was chosen.
+
+_FAKE_PS = """\
+  PID  PPID COMMAND
+    1     0 /sbin/launchd
+  400     1 /usr/bin/python3 -m drumbeat.serve --workspace /w
+  512   400 /usr/bin/python3 -m drumbeat.agent_worker --session s-1
+  700     1 /usr/bin/python3 -m drumbeat.agent_worker --session s-2
+"""
+
+
+class _FakePs:
+    """Stands in for ``subprocess.run(["ps", ...])``, counting invocations."""
+
+    def __init__(self, stdout: str = _FAKE_PS, returncode: int = 0, stderr: str = ""):
+        self.stdout = stdout
+        self.returncode = returncode
+        self.stderr = stderr
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        import subprocess as _sp
+
+        return _sp.CompletedProcess(
+            argv, self.returncode, stdout=self.stdout, stderr=self.stderr
+        )
+
+
+def _simulate_darwin(monkeypatch, ps: _FakePs) -> None:
+    monkeypatch.setattr(drain.sys, "platform", "darwin")
+    monkeypatch.setattr(drain.subprocess, "run", ps)
+
+
+def test_non_linux_finds_agent_turns_via_ps(monkeypatch):
+    """The whole point: the marker match still works with no /proc."""
+    ps = _FakePs()
+    _simulate_darwin(monkeypatch, ps)
+    turns = drain.find_agent_turns()
+    assert [t.pid for t in turns] == [512, 700]
+    assert all(drain.AGENT_TURN_MARKER in t.cmdline for t in turns)
+    assert turns[0].ppid == 400
+
+
+def test_non_linux_never_shells_out_through_a_shell(monkeypatch):
+    """Never `pkill -f`/`grep`: this project has killed a live service that
+    way four times. argv is a list, matched in Python."""
+    ps = _FakePs()
+    _simulate_darwin(monkeypatch, ps)
+    drain.find_agent_turns()
+    assert ps.calls and ps.calls[0] == ["ps", "-eo", "pid,ppid,args"]
+    assert not any("pkill" in " ".join(c) or "grep" in " ".join(c) for c in ps.calls)
+
+
+def test_non_linux_takes_one_ps_snapshot_per_sweep(monkeypatch):
+    """One `ps` for the whole sweep -- not one per pid, and not two different
+    snapshots halfway through an ancestry walk."""
+    ps = _FakePs()
+    _simulate_darwin(monkeypatch, ps)
+    drain.find_agent_turns(ancestor_pid=400)
+    assert len(ps.calls) == 1
+
+
+def test_non_linux_ancestry_walk_still_attributes_descendants(monkeypatch):
+    ps = _FakePs()
+    _simulate_darwin(monkeypatch, ps)
+    turns = drain.find_agent_turns(ancestor_pid=400)
+    by_pid = {t.pid: t for t in turns}
+    assert by_pid[512].is_descendant is True  # child of the scheduler
+    assert by_pid[700].is_descendant is False  # someone else's turn
+
+
+def test_non_linux_ps_header_and_junk_lines_are_skipped(monkeypatch):
+    ps = _FakePs(stdout="  PID  PPID COMMAND\n\nnot a row\n  9  1 /bin/sleep 1\n")
+    _simulate_darwin(monkeypatch, ps)
+    assert drain._live_pids() == [9]
+
+
+def test_non_linux_cmdline_and_ppid_readers_agree_with_ps(monkeypatch):
+    ps = _FakePs()
+    _simulate_darwin(monkeypatch, ps)
+    assert "drumbeat.agent_worker" in (drain._read_cmdline(512) or "")
+    assert drain._read_ppid(512) == 400
+    # A pid that is not live reads as absent, not as a crash.
+    assert drain._read_cmdline(99999) is None
+    assert drain._read_ppid(99999) is None
+
+
+def test_missing_ps_is_a_named_failure_not_an_empty_all_clear(monkeypatch):
+    """An empty list here would read as 'nothing in flight' -- the exact
+    false all-clear this module exists to refuse."""
+    monkeypatch.setattr(drain.sys, "platform", "darwin")
+
+    def no_ps(argv, **kwargs):
+        raise FileNotFoundError("No such file or directory: 'ps'")
+
+    monkeypatch.setattr(drain.subprocess, "run", no_ps)
+    with pytest.raises(OSError) as excinfo:
+        drain.find_agent_turns()
+    assert "cannot inspect processes" in str(excinfo.value)
+
+
+def test_non_linux_check_drained_degrades_to_a_blocker_not_a_traceback(
+    monkeypatch, tmp_path: Path
+):
+    """`drumbeat drain --status` must COMPLETE on a host it cannot inspect --
+    saying NOT DRAINED, naming why. That is the whole failure-4 fix."""
+    monkeypatch.setattr(drain.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        drain.subprocess,
+        "run",
+        lambda argv, **kw: (_ for _ in ()).throw(FileNotFoundError("no ps")),
+    )
+    drain.set_drain(tmp_path, reason="test")
+    status = drain.check_drained(tmp_path, scheduler_pid=400)
+    assert not status.drained
+    assert any("cannot inspect" in b for b in status.blockers)
+    # and it still renders, which is what the CLI actually prints.
+    assert "NOT DRAINED" in status.render()
+
+
+def test_non_linux_check_drained_reports_in_flight_turns(monkeypatch, tmp_path: Path):
+    ps = _FakePs()
+    _simulate_darwin(monkeypatch, ps)
+    drain.set_drain(tmp_path, reason="test")
+    status = drain.check_drained(tmp_path, scheduler_pid=400)
+    assert not status.drained
+    assert any("still running under scheduler pid 400" in b for b in status.blockers)
+    assert status.scheduler_cmdline is not None
+    assert "drumbeat.serve" in status.scheduler_cmdline
+
+
+def test_non_linux_check_drained_passes_when_nothing_is_in_flight(
+    monkeypatch, tmp_path: Path
+):
+    ps = _FakePs(stdout="  PID  PPID COMMAND\n    1     0 /sbin/launchd\n  400 1 /usr/bin/python3 -m drumbeat.serve\n")
+    _simulate_darwin(monkeypatch, ps)
+    drain.set_drain(tmp_path, reason="test")
+    status = drain.check_drained(tmp_path, scheduler_pid=400)
+    assert status.drained, status.blockers
+
+
+def test_linux_proc_fast_path_is_untouched(monkeypatch):
+    """Linux must keep reading /proc and must NEVER shell out -- a minimal
+    container ships no `ps`, which is why staleness moved onto this reader."""
+    monkeypatch.setattr(drain.sys, "platform", "linux")
+    monkeypatch.setattr(
+        drain.subprocess,
+        "run",
+        lambda *a, **k: pytest.fail("Linux must not shell out to ps"),
+    )
+    pids = drain._live_pids()
+    assert os.getpid() in pids
+    assert drain._read_cmdline(os.getpid()) is not None
+    assert drain._read_ppid(os.getpid()) == os.getppid()
+    drain.find_agent_turns()  # completes without touching subprocess

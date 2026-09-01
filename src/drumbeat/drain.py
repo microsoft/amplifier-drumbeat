@@ -37,6 +37,8 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -121,44 +123,145 @@ def is_draining(runs_dir: Path) -> bool:
     return drain_flag_path(runs_dir).is_file()
 
 
-# ---- drain verification ----
+# ---- process inspection (platform-neutral) ----
+#
+# Linux keeps the /proc fast-path: it needs no external binary, which is the
+# whole reason ``staleness.count_agent_turns_in_flight`` was moved onto this
+# reader in the first place (a minimal container ships no ``ps``).
+#
+# Every OTHER platform gets a ``ps`` path. macOS has no ``/proc`` AT ALL, so
+# the /proc-only reader did not degrade there -- it raised FileNotFoundError
+# out of ``Path("/proc").iterdir()`` and tracebacked ``drumbeat drain
+# --status/--wait``, i.e. the documented safe-shutdown procedure could not be
+# completed on the platform (field report #504). ``ps -eo pid,ppid,args`` is
+# POSIX-portable and needs no new dependency.
+#
+# Still never a shell ``pkill -f``/``grep``: the argv is built as a list, run
+# without a shell, and matched in Python. A shell match has caught its own
+# invoking shell and killed a live service in this project four times.
 
 
-def _read_cmdline(pid: int) -> str | None:
+def _uses_proc() -> bool:
+    """True where ``/proc`` is the authoritative process table (Linux only)."""
+    return sys.platform.startswith("linux")
+
+
+@dataclass(frozen=True)
+class _ProcessRow:
+    """One live process, as read from whichever inspection path is in use."""
+
+    pid: int
+    ppid: int | None
+    cmdline: str
+
+
+def _ps_rows() -> list[_ProcessRow]:
+    """Every live process via portable ``ps -eo pid,ppid,args``.
+
+    Raises ``OSError`` -- naming the real cause -- when the sweep cannot be
+    performed at all (no ``ps`` on PATH, non-zero exit). It never returns an
+    empty list to mean "could not look": an empty list here reads as "nothing
+    is in flight", which is precisely the false all-clear this module exists
+    to refuse.
+    """
+    argv = ["ps", "-eo", "pid,ppid,args"]
     try:
-        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-    except OSError:
+        result = subprocess.run(argv, capture_output=True, text=True, check=False)
+    except (OSError, ValueError) as exc:  # ps absent, not executable, ...
+        raise OSError(f"cannot inspect processes: `{' '.join(argv)}` failed: {exc}")
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "<no stderr>"
+        raise OSError(
+            f"cannot inspect processes: `{' '.join(argv)}` exited "
+            f"{result.returncode}: {detail}"
+        )
+    rows: list[_ProcessRow] = []
+    for raw in result.stdout.splitlines():
+        parts = raw.strip().split(None, 2)
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            # The header row ("PID PPID COMMAND"), or any line ps wrapped.
+            continue
+        rows.append(
+            _ProcessRow(pid=pid, ppid=ppid, cmdline=parts[2].strip() if len(parts) > 2 else "")
+        )
+    return rows
+
+
+def _process_table() -> dict[int, _ProcessRow] | None:
+    """One whole-host process snapshot, or ``None`` on Linux (/proc is used).
+
+    Taken ONCE per sweep: the ``ps`` path must not re-run ``ps`` per pid (that
+    would be one subprocess per process on the host) and must not read a
+    different snapshot halfway through an ancestry walk.
+    """
+    if _uses_proc():
         return None
-    return raw.replace(b"\0", b" ").decode("utf-8", errors="replace").strip()
+    return {row.pid: row for row in _ps_rows()}
 
 
-def _read_ppid(pid: int) -> int | None:
+def _read_cmdline(pid: int, table: dict[int, _ProcessRow] | None = None) -> str | None:
+    """This pid's full argv as one string, or ``None`` if it is not live.
+
+    ``table``: a snapshot from ``_process_table()``. Omitted, one is taken --
+    correct for a single lookup, wasteful inside a loop, which is why the
+    sweeps below thread their own snapshot through.
+    """
+    if _uses_proc():
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            return None
+        return raw.replace(b"\0", b" ").decode("utf-8", errors="replace").strip()
+    if table is None:
+        table = _process_table()
+    row = (table or {}).get(pid)
+    return row.cmdline if row is not None else None
+
+
+def _read_ppid(pid: int, table: dict[int, _ProcessRow] | None = None) -> int | None:
     """Parent pid from /proc/<pid>/stat, parsed from the RIGHT of comm.
 
     The process name field is parenthesised and may itself contain spaces
     and parentheses, so the fields are located relative to the LAST ')' --
     splitting the line on whitespace is the classic way to misread this file
     for any process whose name has a space in it.
+
+    Off Linux the answer comes from the ``ps`` snapshot instead; see
+    ``_read_cmdline`` for the ``table`` argument.
     """
-    try:
-        stat_text = Path(f"/proc/{pid}/stat").read_text(
-            encoding="utf-8", errors="replace"
-        )
-    except OSError:
-        return None
-    close = stat_text.rfind(")")
-    if close == -1:
-        return None
-    fields = stat_text[close + 2 :].split()
-    if len(fields) < 2:
-        return None
-    try:
-        return int(fields[1])
-    except ValueError:
-        return None
+    if _uses_proc():
+        try:
+            stat_text = Path(f"/proc/{pid}/stat").read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            return None
+        close = stat_text.rfind(")")
+        if close == -1:
+            return None
+        fields = stat_text[close + 2 :].split()
+        if len(fields) < 2:
+            return None
+        try:
+            return int(fields[1])
+        except ValueError:
+            return None
+    if table is None:
+        table = _process_table()
+    row = (table or {}).get(pid)
+    return row.ppid if row is not None else None
 
 
-def _live_pids() -> list[int]:
+def _live_pids(table: dict[int, _ProcessRow] | None = None) -> list[int]:
+    if not _uses_proc():
+        if table is None:
+            table = _process_table()
+        return sorted(table or {})
     pids: list[int] = []
     for entry in Path("/proc").iterdir():
         if entry.name.isdigit():
@@ -184,13 +287,20 @@ def find_agent_turns(*, ancestor_pid: int | None = None) -> list[AgentTurn]:
     scheduler still has work in flight" from "notify-serve is executing a
     reply right now" -- during the migration's hybrid window both are true
     at once, and only the first blocks a kill.
+
+    Raises ``OSError`` when this host's process table cannot be read at all
+    (no ``/proc`` on Linux, no ``ps`` elsewhere). That is the established
+    contract -- ``staleness.count_agent_turns_in_flight`` turns it into "I
+    could not tell", never a confident zero -- and ``check_drained`` turns it
+    into a named blocker rather than a traceback.
     """
+    table = _process_table()
     turns: list[AgentTurn] = []
-    for pid in _live_pids():
-        cmdline = _read_cmdline(pid)
+    for pid in _live_pids(table):
+        cmdline = _read_cmdline(pid, table)
         if not cmdline or AGENT_TURN_MARKER not in cmdline:
             continue
-        ppid = _read_ppid(pid)
+        ppid = _read_ppid(pid, table)
         descendant = False
         if ancestor_pid is not None:
             walker: int | None = pid
@@ -200,7 +310,7 @@ def find_agent_turns(*, ancestor_pid: int | None = None) -> list[AgentTurn]:
                 if walker == ancestor_pid:
                     descendant = True
                     break
-                walker = _read_ppid(walker)
+                walker = _read_ppid(walker, table)
         turns.append(
             AgentTurn(pid=pid, ppid=ppid, cmdline=cmdline, is_descendant=descendant)
         )
@@ -300,10 +410,27 @@ def check_drained(runs_dir: Path, *, scheduler_pid: int | None = None) -> DrainS
     """
     runs_dir = Path(runs_dir).expanduser()
     draining = is_draining(runs_dir)
-    turns = find_agent_turns(ancestor_pid=scheduler_pid)
+
+    # Process inspection can be impossible (no /proc, no `ps`). That is never
+    # a traceback and never an empty turn list that reads "all clear": it is a
+    # NAMED blocker, so `drumbeat drain --status/--wait` still completes and
+    # still says NOT DRAINED. Losing this distinction is how a safe-shutdown
+    # procedure certifies a host it could not actually look at.
+    inspection_error: str | None = None
+    try:
+        turns = find_agent_turns(ancestor_pid=scheduler_pid)
+    except OSError as exc:
+        turns = []
+        inspection_error = str(exc)
+
     locks = held_session_locks(runs_dir)
 
     blockers: list[str] = []
+    if inspection_error:
+        blockers.append(
+            f"cannot inspect this host's processes ({inspection_error}) -- so "
+            "'no agent turn is in flight' cannot be proven"
+        )
     if not draining:
         blockers.append(
             "drain flag is NOT set -- the scheduler can start a new run at any "
@@ -320,12 +447,22 @@ def check_drained(runs_dir: Path, *, scheduler_pid: int | None = None) -> DrainS
             f"{len(locks)} session lock(s) currently held: " + ", ".join(locks)
         )
 
-    cmdline = _read_cmdline(scheduler_pid) if scheduler_pid is not None else None
-    if scheduler_pid is not None and cmdline is None:
-        blockers.append(
-            f"pid {scheduler_pid} has no /proc entry -- it is already gone; "
-            "verify you are killing the process you think you are"
-        )
+    cmdline: str | None = None
+    if scheduler_pid is not None and inspection_error is None:
+        try:
+            cmdline = _read_cmdline(scheduler_pid)
+        except OSError as exc:
+            blockers.append(
+                f"cannot read pid {scheduler_pid}'s command line ({exc}) -- "
+                "verify you are killing the process you think you are"
+            )
+        else:
+            if cmdline is None:
+                blockers.append(
+                    f"pid {scheduler_pid} is not in this host's process table "
+                    "-- it is already gone; verify you are killing the process "
+                    "you think you are"
+                )
 
     return DrainStatus(
         drained=not blockers,
