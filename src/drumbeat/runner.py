@@ -4476,6 +4476,134 @@ def run_chat_message(
                     )
                     failed = True
 
+    # ledger-injection-compaction-fault.md section 3c / section 6 item 3:
+    # this function is exactly the "replay/resume path that re-enters the
+    # step sequence" the fix calls for -- every message resumes the pinned
+    # session directly, WITHOUT ever running this automation's declared
+    # `inject:` tools, on either a brand-new session or (every message
+    # since) a resumed one. Unlike the `requires:` turn above -- fired once
+    # ever, deliberately not repeated per message, because guidance files
+    # rarely change and re-injecting is a pure LLM-turn cost with no
+    # freshness benefit -- `inject:` is fired on EVERY message, matching
+    # run()'s "before every use of this session" discipline: the
+    # hybrid-sentinel contract (docs/ARCHITECTURE.md section 6) defines
+    # inject: as state that must be validated fresh at the point of use,
+    # not a static file safe to assume unchanged since the transcript last
+    # saw it. An automation that declares no `inject:` (the common case --
+    # including the built-in chat automation) pays nothing extra: this
+    # loop is empty for it.
+    if not failed:
+        for spec in chat_automation.inject:
+            outcome = _run_inject_tool(spec, cwd=cwd, runs_dir=runs_dir)
+            if outcome.abort_reason is not None:
+                abort_message = outcome.abort_reason
+                print(
+                    f"[{chat_automation.name}] ABORTED: {abort_message}",
+                    file=sys.stderr,
+                )
+                finished_at = _iso8601_now()
+                result = RunResult(
+                    automation=chat_automation.name,
+                    run_id=run_id,
+                    session_id=session_id,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    steps=turns,
+                    final_reply="",
+                    notified=False,
+                    failed=True,
+                    error=abort_message,
+                    session_resumed=not is_new_session,
+                )
+                _persist_run(
+                    automation=chat_automation,
+                    result=result,
+                    runs_dir=runs_dir,
+                    stderr_chunks=stderr_chunks,
+                    intent=_aborted_run_intent(abort_message),
+                    final_reply_rule=FINAL_REPLY_RULE_ABORTED,
+                )
+                return result
+            if outcome.idle:
+                print(
+                    f"[{chat_automation.name}] inject {spec.label!r}: tool "
+                    f"reported {INJECT_IDLE} -- no turn injected, message "
+                    "proceeds",
+                    file=sys.stderr,
+                )
+                try:
+                    engine_events.append_event(
+                        runs_dir,
+                        engine_events.EventType.INJECT_SKIPPED,
+                        {
+                            "run_id": run_id,
+                            "automation": chat_automation.name,
+                            "automation_slug": chat_automation.slug,
+                            "session_id": session_id,
+                            "tool": spec.argv[0],
+                            "label": spec.label,
+                            "reason": (
+                                f"tool reported idle: exit 0 with stdout "
+                                f"exactly {INJECT_IDLE} -- the skip is this "
+                                "record, never an inference"
+                            ),
+                        },
+                    )
+                except (engine_events.OutboxError, OSError) as exc:
+                    print(
+                        f"[{chat_automation.name}] failed to write "
+                        f"inject_skipped event: {exc}",
+                        file=sys.stderr,
+                    )
+                continue
+            assert outcome.text is not None
+            print(
+                f"[{chat_automation.name}] inject turn {spec.label!r} "
+                f"({len(outcome.text)} chars from {spec.argv[0]})",
+                file=sys.stderr,
+            )
+            index = next(turn_index)
+            inject_result, inject_stderr = _execute_turn(
+                session_id=session_id,
+                fresh=False,
+                cwd=cwd,
+                text=outcome.text,
+                index=index,
+                runs_dir=runs_dir,
+                wait_seconds=resolved_wait_seconds,
+                progress_callback=progress_callback,
+                host_config_path=host_config_path,
+            )
+            turns.append(inject_result)
+            stderr_chunks.append((index, inject_stderr))
+            if inject_result.error:
+                print(
+                    f"[{chat_automation.name}] inject turn {spec.label!r} "
+                    f"FAILED: {inject_result.error} -- aborting",
+                    file=sys.stderr,
+                )
+                failed = True
+                break
+            try:
+                engine_events.append_event(
+                    runs_dir,
+                    engine_events.EventType.TURN_COMPLETED,
+                    {
+                        "run_id": run_id,
+                        "automation": chat_automation.name,
+                        "automation_slug": chat_automation.slug,
+                        "session_id": session_id,
+                        "origin": "inject",
+                        "label": spec.label,
+                    },
+                )
+            except OSError as exc:
+                print(
+                    f"[{chat_automation.name}] failed to write "
+                    f"turn_completed event: {exc}",
+                    file=sys.stderr,
+                )
+
     final_reply = ""
     if not failed:
         index = next(turn_index)
