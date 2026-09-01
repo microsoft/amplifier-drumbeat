@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import IO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from drumbeat import ci_events, drain, schedule_state, staleness
+from drumbeat import ci_events, drain, owner_priority, schedule_state, session_pins, staleness
 from drumbeat.automation import AutomationError, load_all_tolerant
 from drumbeat.capabilities import server_timezone
 from drumbeat.prompts import DEFAULT_PROMPTS_DIR
@@ -497,6 +497,34 @@ def serve(
                 continue
 
             if now >= next_due[automation.slug]:
+                # Owner-priority deferral. Read-only, side-effect-free
+                # lookup of whatever session this automation would resume -- the
+                # SAME lookup `run()` itself performs a moment later. A never-run
+                # automation has no pin yet and therefore no session to be
+                # contended over (mirrors turns.submit_turn's own "a brand-new
+                # session cannot be contended by anything"), so it is never
+                # deferred. `next_due` is left UNTOUCHED on a defer: the
+                # occurrence stays due and is retried next tick (10s), never
+                # dropped and never pushed a full schedule interval out --
+                # only a REAL run attempt (below) reschedules that far.
+                pin = session_pins.get(automation.slug, runs_dir=runs_dir)
+                target_session = pin.session_id if pin else None
+                if target_session and owner_priority.should_defer(target_session):
+                    _log(
+                        f"{automation.name}: due, but deferring to the owner "
+                        f"(session {target_session!r} is contended) -- retrying "
+                        "next tick, not dropped"
+                    )
+                    ci_events.emit(
+                        "drumbeat:owner_priority_deferred",
+                        {
+                            "automation": automation.name,
+                            "session_id": target_session,
+                        },
+                        cwd=cwd,
+                    )
+                    continue
+
                 _log(f"{automation.name}: due, running now")
                 if state is not None:
                     state.runs_started += 1
