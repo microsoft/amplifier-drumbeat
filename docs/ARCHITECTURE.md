@@ -332,6 +332,46 @@ don't have that context" phrase.
 The transcript is sediment, not memory. What must survive a rotation is
 re-injected on every run anyway — which is exactly why `inject:` exists.
 
+### A related, unresolved question: chronic compaction overrun
+
+Every `stderr.log` examined across a day of runs for one automation — healthy
+and failing alike — showed the agent runtime's own compaction landing 120–154%
+over its own stated target on effectively every turn, e.g. (paraphrased, the
+runtime's own wording):
+
+```
+Compaction finished OVER BUDGET at level 8: 169,904 tokens against a budget
+of 163,104 (104% of budget, target 81,552) — the un-compactable system floor
+is 511 tokens against a target of 81,552; the rest is protected content
+(last user message, last 5 tool results, tool_use/tool_result pairs) that
+compaction is not permitted to drop.
+```
+
+This engine has no code, and no source, that computes a compaction budget,
+a target size, or a protected-content window — none of that arithmetic
+exists in this repository or in amplifier-agent (the git dependency this
+engine embeds as a library, see the top-level `pyproject.toml`). Both are
+plain-text, fully readable Python. The message above is emitted by
+amplifier-core, a compiled dependency of amplifier-agent (an ABI3 wheel on
+PyPI, no source distribution vendored anywhere this engine can reach) —
+two dependency hops from this repo, and opaque to it. This engine cannot
+inspect, patch, or tune that arithmetic; it can only observe the runtime's
+own stderr after the fact, exactly as the ceiling/ID-survival measurements
+above already do.
+
+**Honest verdict, not a fix:** whether 120–154%-over-target is a real
+miscalibration or deliberate headroom (the runtime may compact in discrete
+"levels" that overshoot a continuous target by construction, similar to how
+a garbage collector's actual pause can overshoot its target heap size) is a
+question for amplifier-core/amplifier-agent, not for this engine. Filed
+upstream rather than guessed at here. What this engine *can* do, and does
+(see `inject_recap_blocks` in `runner._run_body`), is stop depending on any
+single turn surviving compaction at all — an automation's `inject:` state is
+now carried forward on every subsequent turn of the same run, so the exact
+overrun percentage stops being load-bearing for this engine's own
+correctness even though it remains an open question about the runtime it
+embeds.
+
 ---
 
 ## 6. `inject:` — the only aperture for consumer state

@@ -3542,6 +3542,35 @@ def _run_body(
     # added is the same now-context line every turn gets in _execute_turn.
     has_inject_turns = bool(inject_turns)
 
+    # ledger-injection-compaction-fault.md section 3a/3b: the inject turn is
+    # ONE turn, submitted once, ahead of step 1 -- but every automation.step
+    # that follows is a SEPARATE turn, and the agent runtime's own context
+    # policy is free to evict or truncate that earlier turn (compaction's
+    # "protected content" window covers only the last few tool results) long
+    # before the run is done consuming it. A step three or four turns later
+    # can find the injected state gone or cut off mid-payload even though the
+    # inject tool itself succeeded and was validated.
+    #
+    # This engine cannot see or control that policy (it lives in the agent
+    # runtime the worker embeds, not here) -- so instead of trying to detect
+    # eviction after the fact, every validated inject text is carried forward
+    # as a PREAMBLE on every turn submitted for the rest of THIS run. A
+    # preamble rides on the turn's own prompt text, which is by construction
+    # always the most recent message -- the one slot compaction can never
+    # evict (see ``_execute_turn``'s existing ``preamble_blocks``, the same
+    # mechanism turn-context injectors already use). That makes the injected
+    # state available at the point of use on every step, regardless of what
+    # happened to the turn where it first arrived.
+    inject_recap_blocks: tuple[str, ...] = tuple(
+        f"[drumbeat] Reminder -- state injected earlier in this run via "
+        f"`inject:` ({spec.label!r}). The turn that first delivered it may "
+        "since have been evicted or truncated by context compaction; treat "
+        "the block below as the current, authoritative value for this run, "
+        "not whatever remains (or is missing) of that earlier turn:\n\n"
+        f"{text}"
+        for spec, text in inject_turns
+    )
+
     # The very first turn of a brand-new session must use `--fresh`.
     # Priority for claiming that one slot: system prompt (if configured) ->
     # requirements turn (if any file-based `requires:`) -> first inject turn
@@ -3831,6 +3860,10 @@ def _run_body(
                 runs_dir=runs_dir,
                 wait_seconds=None,
                 host_config_path=host_config_path,
+                # Carry every validated inject: turn forward onto every step
+                # (see inject_recap_blocks above) -- a no-op tuple when this
+                # automation declares no inject:.
+                preamble_blocks=inject_recap_blocks,
             )
             # Identity, not control flow: tie this turn's record back to the
             # declared step by id (contract automation-file.v1, rule 4).
@@ -3871,6 +3904,9 @@ def _run_body(
                 runs_dir=runs_dir,
                 wait_seconds=None,
                 host_config_path=host_config_path,
+                # Same carry-forward as the automation.steps loop above --
+                # the auto-notify judgment reads the same injected state.
+                preamble_blocks=inject_recap_blocks,
             )
             step_results.append(check_result)
             stderr_chunks.append((check_index, check_stderr))
@@ -4439,6 +4475,134 @@ def run_chat_message(
                         file=sys.stderr,
                     )
                     failed = True
+
+    # ledger-injection-compaction-fault.md section 3c / section 6 item 3:
+    # this function is exactly the "replay/resume path that re-enters the
+    # step sequence" the fix calls for -- every message resumes the pinned
+    # session directly, WITHOUT ever running this automation's declared
+    # `inject:` tools, on either a brand-new session or (every message
+    # since) a resumed one. Unlike the `requires:` turn above -- fired once
+    # ever, deliberately not repeated per message, because guidance files
+    # rarely change and re-injecting is a pure LLM-turn cost with no
+    # freshness benefit -- `inject:` is fired on EVERY message, matching
+    # run()'s "before every use of this session" discipline: the
+    # hybrid-sentinel contract (docs/ARCHITECTURE.md section 6) defines
+    # inject: as state that must be validated fresh at the point of use,
+    # not a static file safe to assume unchanged since the transcript last
+    # saw it. An automation that declares no `inject:` (the common case --
+    # including the built-in chat automation) pays nothing extra: this
+    # loop is empty for it.
+    if not failed:
+        for spec in chat_automation.inject:
+            outcome = _run_inject_tool(spec, cwd=cwd, runs_dir=runs_dir)
+            if outcome.abort_reason is not None:
+                abort_message = outcome.abort_reason
+                print(
+                    f"[{chat_automation.name}] ABORTED: {abort_message}",
+                    file=sys.stderr,
+                )
+                finished_at = _iso8601_now()
+                result = RunResult(
+                    automation=chat_automation.name,
+                    run_id=run_id,
+                    session_id=session_id,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    steps=turns,
+                    final_reply="",
+                    notified=False,
+                    failed=True,
+                    error=abort_message,
+                    session_resumed=not is_new_session,
+                )
+                _persist_run(
+                    automation=chat_automation,
+                    result=result,
+                    runs_dir=runs_dir,
+                    stderr_chunks=stderr_chunks,
+                    intent=_aborted_run_intent(abort_message),
+                    final_reply_rule=FINAL_REPLY_RULE_ABORTED,
+                )
+                return result
+            if outcome.idle:
+                print(
+                    f"[{chat_automation.name}] inject {spec.label!r}: tool "
+                    f"reported {INJECT_IDLE} -- no turn injected, message "
+                    "proceeds",
+                    file=sys.stderr,
+                )
+                try:
+                    engine_events.append_event(
+                        runs_dir,
+                        engine_events.EventType.INJECT_SKIPPED,
+                        {
+                            "run_id": run_id,
+                            "automation": chat_automation.name,
+                            "automation_slug": chat_automation.slug,
+                            "session_id": session_id,
+                            "tool": spec.argv[0],
+                            "label": spec.label,
+                            "reason": (
+                                f"tool reported idle: exit 0 with stdout "
+                                f"exactly {INJECT_IDLE} -- the skip is this "
+                                "record, never an inference"
+                            ),
+                        },
+                    )
+                except (engine_events.OutboxError, OSError) as exc:
+                    print(
+                        f"[{chat_automation.name}] failed to write "
+                        f"inject_skipped event: {exc}",
+                        file=sys.stderr,
+                    )
+                continue
+            assert outcome.text is not None
+            print(
+                f"[{chat_automation.name}] inject turn {spec.label!r} "
+                f"({len(outcome.text)} chars from {spec.argv[0]})",
+                file=sys.stderr,
+            )
+            index = next(turn_index)
+            inject_result, inject_stderr = _execute_turn(
+                session_id=session_id,
+                fresh=False,
+                cwd=cwd,
+                text=outcome.text,
+                index=index,
+                runs_dir=runs_dir,
+                wait_seconds=resolved_wait_seconds,
+                progress_callback=progress_callback,
+                host_config_path=host_config_path,
+            )
+            turns.append(inject_result)
+            stderr_chunks.append((index, inject_stderr))
+            if inject_result.error:
+                print(
+                    f"[{chat_automation.name}] inject turn {spec.label!r} "
+                    f"FAILED: {inject_result.error} -- aborting",
+                    file=sys.stderr,
+                )
+                failed = True
+                break
+            try:
+                engine_events.append_event(
+                    runs_dir,
+                    engine_events.EventType.TURN_COMPLETED,
+                    {
+                        "run_id": run_id,
+                        "automation": chat_automation.name,
+                        "automation_slug": chat_automation.slug,
+                        "session_id": session_id,
+                        "origin": "inject",
+                        "label": spec.label,
+                    },
+                )
+            except OSError as exc:
+                print(
+                    f"[{chat_automation.name}] failed to write "
+                    f"turn_completed event: {exc}",
+                    file=sys.stderr,
+                )
 
     final_reply = ""
     if not failed:
