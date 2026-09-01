@@ -3542,6 +3542,35 @@ def _run_body(
     # added is the same now-context line every turn gets in _execute_turn.
     has_inject_turns = bool(inject_turns)
 
+    # ledger-injection-compaction-fault.md section 3a/3b: the inject turn is
+    # ONE turn, submitted once, ahead of step 1 -- but every automation.step
+    # that follows is a SEPARATE turn, and the agent runtime's own context
+    # policy is free to evict or truncate that earlier turn (compaction's
+    # "protected content" window covers only the last few tool results) long
+    # before the run is done consuming it. A step three or four turns later
+    # can find the injected state gone or cut off mid-payload even though the
+    # inject tool itself succeeded and was validated.
+    #
+    # This engine cannot see or control that policy (it lives in the agent
+    # runtime the worker embeds, not here) -- so instead of trying to detect
+    # eviction after the fact, every validated inject text is carried forward
+    # as a PREAMBLE on every turn submitted for the rest of THIS run. A
+    # preamble rides on the turn's own prompt text, which is by construction
+    # always the most recent message -- the one slot compaction can never
+    # evict (see ``_execute_turn``'s existing ``preamble_blocks``, the same
+    # mechanism turn-context injectors already use). That makes the injected
+    # state available at the point of use on every step, regardless of what
+    # happened to the turn where it first arrived.
+    inject_recap_blocks: tuple[str, ...] = tuple(
+        f"[drumbeat] Reminder -- state injected earlier in this run via "
+        f"`inject:` ({spec.label!r}). The turn that first delivered it may "
+        "since have been evicted or truncated by context compaction; treat "
+        "the block below as the current, authoritative value for this run, "
+        "not whatever remains (or is missing) of that earlier turn:\n\n"
+        f"{text}"
+        for spec, text in inject_turns
+    )
+
     # The very first turn of a brand-new session must use `--fresh`.
     # Priority for claiming that one slot: system prompt (if configured) ->
     # requirements turn (if any file-based `requires:`) -> first inject turn
@@ -3831,6 +3860,10 @@ def _run_body(
                 runs_dir=runs_dir,
                 wait_seconds=None,
                 host_config_path=host_config_path,
+                # Carry every validated inject: turn forward onto every step
+                # (see inject_recap_blocks above) -- a no-op tuple when this
+                # automation declares no inject:.
+                preamble_blocks=inject_recap_blocks,
             )
             # Identity, not control flow: tie this turn's record back to the
             # declared step by id (contract automation-file.v1, rule 4).
@@ -3871,6 +3904,9 @@ def _run_body(
                 runs_dir=runs_dir,
                 wait_seconds=None,
                 host_config_path=host_config_path,
+                # Same carry-forward as the automation.steps loop above --
+                # the auto-notify judgment reads the same injected state.
+                preamble_blocks=inject_recap_blocks,
             )
             step_results.append(check_result)
             stderr_chunks.append((check_index, check_stderr))
