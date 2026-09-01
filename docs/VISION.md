@@ -53,8 +53,9 @@ public turn-handler API and no process-global writes.
 
 The enemy is the successful-looking run that did nothing. Every failure is
 loud, recorded, and carries a remedy. Verification gates prove real behavior —
-a service install is verified by executing a real turn, not by a health
-endpoint. Numbers the engine reports are real or absent; a metric that is
+a service install is verified by executing a real turn that must answer a known
+sentinel, not by a health endpoint and not by the turn merely replying
+something. Numbers the engine reports are real or absent; a metric that is
 silently always zero is a defect.
 
 ### 5. The repo teaches agents

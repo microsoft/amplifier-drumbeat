@@ -66,8 +66,11 @@ elsewhere. `drumbeat doctor` prints a containment warning until you split them.
 
 **Never `pkill -f drumbeat`.** In this project a pattern-matching kill has
 matched its own invoking shell and killed a live service four separate times.
-The engine's own in-flight check reads `/proc` entries in Python for exactly
-this reason and never shells out to `pkill`.
+The engine's own in-flight check builds its process list in Python for exactly
+this reason and matches the marker there — never through a shell `pkill`/`grep`.
+On Linux it reads `/proc` directly (so it needs no external binary, and works in
+a minimal container that ships no `ps`); elsewhere — macOS has no `/proc` at all
+— it parses `ps -eo pid,ppid,args`.
 
 There is a second, worse reason. The runner spawns each turn's worker in its
 **own process group** (so the turn's whole tool tree dies together when its
@@ -87,7 +90,8 @@ So the stop procedure is three steps, in order:
 drumbeat drain --workspace ~/myspace --reason "picking up engine edits" --wait
 
 # 2. Kill the scheduler BY EXPLICIT PID. Get it from the drain output or from
-#    `drumbeat doctor`; confirm it with `cat /proc/<pid>/cmdline`.
+#    `drumbeat doctor`; confirm it with `cat /proc/<pid>/cmdline` (Linux) or
+#    `ps -p <pid> -o args=` (macOS).
 kill <pid>
 
 # 3. Start again, and CLEAR THE DRAIN.
@@ -130,6 +134,20 @@ scheduler lock.** An install that started a unit which never bound its port is
 exactly the "up but useless" state the health probe exists to catch; you get a
 named failure with a `journalctl` pointer, not a false green.
 
+**Then it runs one real turn and checks the answer.** Health proves the HTTP
+face is up; it says nothing about whether a scheduled run would work. So
+install submits one turn through the running unit against a throwaway
+automation, and the turn is asked for a **sentinel**: the single word `READY`.
+
+The gate passes only if the reply *is* that sentinel — markdown decoration
+around it (`**READY**`) is tolerated, prose containing it is not. Anything
+else fails, naming expected-vs-got. This is deliberate and it is the point:
+a gate that accepted any non-empty reply would certify the reply
+`Error: No providers available` as a verified turn — an engine with no brain,
+reporting three green signals. A false FAIL costs you one re-run; a false PASS
+is the whole failure class (`docs/VISION.md` §4). Pass `--skip-turn-verify` to
+install without the check; it prints an unmissable notice that it did not look.
+
 ```bash
 drumbeat service status      # unit state + a live health probe
 drumbeat service uninstall   # stop (drains first), disable, remove, verify gone
@@ -152,7 +170,8 @@ what it is:
 - **The provider key goes in the unit's environment**, via an optional
   `EnvironmentFile=-%h/.config/drumbeat/drumbeat.env`. A login shell's `export`
   is invisible to a service; put `ANTHROPIC_API_KEY` (and any pack config)
-  there.
+  there. macOS reads that same file through a generated exec wrapper — see
+  section 5.
 - **`AMPLIFIER_AGENT_WORKSPACE` is never set.** It silently re-buckets every
   session id under a slug no other launch path derives; the unit pins
   `WorkingDirectory` to the workspace instead. `drumbeat doctor` reports when
@@ -197,11 +216,42 @@ lock.
 - **There is no systemd; `launchd` is the native answer.** The same command
   installs it — `drumbeat service install` writes a LaunchAgent to
   `~/Library/LaunchAgents/drumbeat.plist`, loads it, and verifies `/api/health`
-  the same way it does on Linux. `status` and `uninstall` work the same too.
-  `RunAtLoad` starts it now and at login; `KeepAlive` restarts it on a non-clean
-  exit (launchd's `Restart=on-failure`). launchd has no `ExecStop` hook, so the
-  graceful drain-on-stop is Linux-only — on macOS a stop is a plain `SIGTERM`,
-  so prefer stopping the engine when nothing is mid-turn.
+  and the one real turn the same way it does on Linux. `status` and `uninstall`
+  work the same too. `RunAtLoad` starts it now and at login; `KeepAlive`
+  restarts it on a non-clean exit (launchd's `Restart=on-failure`). launchd has
+  no `ExecStop` hook, so the graceful drain-on-stop is Linux-only — on macOS a
+  stop is a plain `SIGTERM`, so prefer stopping the engine when nothing is
+  mid-turn.
+
+- **The provider key reaches the unit through a generated exec wrapper.**
+  launchd has no `EnvironmentFile=`. Its only env hook is the plist's
+  `EnvironmentVariables` dict — literal values, in a world-readable file that
+  `service install` rewrites on every run. So the key is *not* put there.
+  Instead `install` also writes
+  `~/.config/drumbeat/drumbeat-launchd-exec.sh`, makes it
+  `ProgramArguments[0]`, and that wrapper sources
+  **`~/.config/drumbeat/drumbeat.env` — the same file the systemd unit
+  references** — before `exec`ing the real invocation. One env file, one
+  semantics, both platforms; the secret never enters the plist.
+
+  Put `ANTHROPIC_API_KEY` (and any pack config) in that env file as plain
+  `KEY=value` lines. A missing file is a no-op, exactly like systemd's leading
+  `-`. The wrapper is regenerated by every `install`, so a plist regeneration
+  can never silently drop it — and `uninstall` removes the wrapper while
+  leaving your env file alone.
+
+- **The unit's `PATH` includes Homebrew.** `install` bakes a `PATH` resolved
+  from the installing shell. On macOS it also adds `/opt/homebrew/bin` and
+  `/opt/homebrew/sbin` — the Apple Silicon prefix, which no service manager's
+  default `PATH` contains (the defaults name `/usr/local`, Homebrew's *Intel*
+  prefix). Without it a LaunchAgent cannot see any brew-installed tool a turn
+  shells out to, while `/api/health` still answers `ok`.
+
+- **`drumbeat drain --status/--wait` works here.** macOS has no `/proc`, so
+  process inspection falls back to `ps -eo pid,ppid,args` — never a shell
+  `pkill -f`/`grep`. If inspection is impossible at all (no `ps`), the drain
+  check reports `NOT DRAINED` naming that as the blocker rather than returning
+  an empty turn list that would read as "all clear".
 
 - **A closed lid is not unattended.** A sleeping Mac does not run your
   scheduler. Interval schedules (`every 30 minutes`) resume from the moment the
