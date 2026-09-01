@@ -26,7 +26,10 @@ generated systemd unit looks the way it does, not incidental):
   clear on the *start* path (not the stop path) means a crash-restart cannot
   strand the engine drained-but-healthy-looking.
 - The provider key belongs in the unit's environment via ``EnvironmentFile=`` --
-  a login shell's ``export`` is invisible to a service.
+  a login shell's ``export`` is invisible to a service. launchd has no such
+  directive, so macOS reaches the SAME file through an install-generated exec
+  wrapper that sources it and ``exec``s the real argv; the key is never written
+  into the plist. See ``render_launchd_exec_wrapper``.
 - ``AMPLIFIER_AGENT_WORKSPACE`` is never set: it silently re-buckets session ids
   under a slug no other launch path derives. ``WorkingDirectory`` is pinned to
   the workspace instead, so the service's cwd-derived slug matches a hand-run
@@ -77,6 +80,21 @@ STOP_TIMEOUT_SECONDS = 2000
 # time -- see ``resolve_service_path`` for why that is not optional.
 _DEFAULT_SERVICE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
+# macOS only. `_DEFAULT_SERVICE_PATH` is systemd's default, which is honest on
+# Linux and a lie on Apple Silicon: Homebrew installs to /opt/homebrew there
+# (not /usr/local, which IS already in the default and is the Intel prefix), so
+# a LaunchAgent given only the default cannot see any brew-installed tool a turn
+# shells out to. Same class of problem as the missing ~/.local/bin that
+# `resolve_service_path` already exists to fix -- fixed the same way, at install
+# time, from the shell that can actually see them.
+_DARWIN_EXTRA_PATH = ("/opt/homebrew/bin", "/opt/homebrew/sbin")
+
+# The one env file both platforms read, by reference, at service start. The
+# systemd unit names it with systemd's own ``%h`` expansion; the launchd exec
+# wrapper needs it as a real path. Kept as one relative constant so the two can
+# never drift apart (there is a test that asserts they agree).
+ENV_FILE_RELATIVE = ".config/drumbeat/drumbeat.env"
+
 # The turn-verify gate: after health passes, `service install` proves the
 # supervised unit can execute ONE REAL turn (not merely answer /api/health)
 # before reporting success. A real agent turn is seconds-to-minutes of work;
@@ -94,9 +112,59 @@ TURN_VERIFY_POLL_SECONDS = 1.0
 # this defect's own evidence: one PATH-caused failure left a real pin in an
 # ambiguous state and wedged every subsequent run).
 _VERIFY_AUTOMATION_NAME = "Drumbeat Install Check"
+
+# The sentinel the verify turn is asked for, and the gate's whole verdict.
+#
+# WHY A SENTINEL AND NOT "the reply was non-empty": a non-empty check passes on
+# the reply "Error: No providers available" -- the engine answering that it has
+# no brain. That is the exact dead-brain outage class management_api.py names
+# (see its ``final_reply_preview`` note, same example string), and certifying it
+# as "turn verified" is the successful-looking run that did nothing which
+# docs/VISION.md section 4 calls the enemy. The prompt has always demanded the
+# sentinel; the gate simply never asserted it.
+#
+# GATE PHILOSOPHY: a false FAIL is loud, safe, and costs the operator one
+# re-run. A false PASS is the defect class itself. When in doubt this gate
+# fails.
+_VERIFY_SENTINEL = "READY"
+
+# DOCUMENTED TOLERANCE (the choice (a) requires be pinned):
+#
+#   The reply must be the sentinel and NOTHING ELSE -- but markdown decoration
+#   around it is accepted, because the agent writes markdown. This follows the
+#   URGENT-marker precedent in runner.py (``_URGENT_MARKER_RE``, fix 2026-08-07),
+#   where an exact-literal match silently demoted a genuinely urgent finding the
+#   model had rendered as ``**URGENT: ...**``. The same class of false negative
+#   applies here: a model told to answer READY may answer ``**READY**``, and
+#   failing that install would be a false FAIL with no defect behind it.
+#
+#   It is NOT a substring search. ``"Error: No providers available. READY?"``
+#   must fail, and a substring search would pass it -- the same reason the
+#   URGENT regex stayed anchored rather than widening to a bare ``in``.
+#
+#   Tolerated: leading/trailing whitespace, a bullet/blockquote/heading prefix,
+#   emphasis or backticks either side, one trailing period or exclamation mark,
+#   and any case. Everything else fails, naming expected-vs-got.
+_VERIFY_SENTINEL_RE = re.compile(
+    r"\A[ \t]*"
+    r"(?:[-+*>#]+[ \t]+)?"  # bullet / blockquote / heading prefix ("- ", "## ")
+    r"(?:[*_`]{1,3})?[ \t]*"  # opening emphasis / code span ("**", "__", "`")
+    r"READY"
+    r"[ \t]*(?:[*_`]{1,3})?"  # closing emphasis / code span
+    r"[ \t]*[.!]?[ \t]*\Z",
+    re.IGNORECASE,
+)
+
+# Belt to the sentinel's braces: a reply that OPENS with a failure signature is
+# reported as such rather than as a generic sentinel mismatch, so the operator
+# reads the engine's own words instead of guessing. The sentinel check alone
+# already fails these -- this only makes the failure legible.
+_VERIFY_FAILURE_SIGNATURES = ("error:", "traceback (most recent call last)")
+
 _VERIFY_TURN_PROMPT = (
-    "Reply with the single word READY and nothing else. This turn exists only "
-    "to confirm the supervised engine can execute one real agent turn end to end."
+    f"Reply with the single word {_VERIFY_SENTINEL} and nothing else. This turn "
+    "exists only to confirm the supervised engine can execute one real agent "
+    "turn end to end."
 )
 _VERIFY_AUTOMATION_CONTENT = f"""\
 ---
@@ -155,6 +223,18 @@ class ServiceSpec:
     # launchd only: where the supervised process's stdout/stderr are written.
     stdout_path: str | None = None
     stderr_path: str | None = None
+    # launchd only: the install-generated exec wrapper that sources the env
+    # file before exec'ing the real argv. When set it becomes
+    # ``ProgramArguments[0]`` and the real argv follows it as arguments. When
+    # ``None`` the plist invokes the real argv directly (behavior-preserving
+    # for callers that do not supply it) and the unit gets NO provider key --
+    # which is the defect. Every launchd install path sets it. See
+    # ``render_launchd_exec_wrapper``.
+    wrapper_path: str | None = None
+    # The env file the wrapper sources, absolute. ``None`` => the default
+    # (``~/.config/drumbeat/drumbeat.env``), the same file the systemd unit's
+    # ``EnvironmentFile=`` names.
+    env_file: str | None = None
 
 
 def resolve_exec_argv() -> tuple[str, ...]:
@@ -175,6 +255,7 @@ def resolve_service_path(
     *,
     exec_argv: tuple[str, ...] | None = None,
     default_path: str = _DEFAULT_SERVICE_PATH,
+    system: str | None = None,
 ) -> str:
     """The ``PATH`` to bake into a unit/plist, resolved AT INSTALL TIME.
 
@@ -198,7 +279,16 @@ def resolve_service_path(
     Duplicates are collapsed preserving first-seen order. If ``uv`` cannot be
     found on the installer's PATH the unit is still given (2) and (3) plus the
     default -- an honest best effort rather than a silent omission.
+
+    On macOS, ``/opt/homebrew/bin`` and ``/opt/homebrew/sbin`` are appended
+    after those three and ahead of the default: the default is systemd's, and
+    it names ``/usr/local`` (Homebrew's INTEL prefix) but not ``/opt/homebrew``
+    (its Apple Silicon prefix), so a LaunchAgent on any recent Mac cannot see a
+    brew-installed tool at all. ``system`` overrides the platform detection --
+    that is how a Linux host proves the Darwin branch. The Linux result is
+    unchanged.
     """
+    system = system or platform.system()
     leading: list[str] = []
 
     uv_found = shutil.which("uv")
@@ -213,6 +303,9 @@ def resolve_service_path(
 
     if exec_argv:
         leading.append(str(Path(exec_argv[0]).resolve().parent))
+
+    if system == "Darwin":
+        leading.extend(_DARWIN_EXTRA_PATH)
 
     ordered: list[str] = []
     for entry in [*leading, *default_path.split(":")]:
@@ -305,8 +398,10 @@ def render_systemd_unit(spec: ServiceSpec) -> str:
         # resolve_service_path. Omitted only when no env_path was resolved.
         *([_fmt_env_assignment("PATH", spec.env_path)] if spec.env_path else []),
         # Optional: the provider key (and any pack config) lives here, not in a
-        # login shell. `-` => a missing file is not a start failure.
-        "EnvironmentFile=-%h/.config/drumbeat/drumbeat.env",
+        # login shell. `-` => a missing file is not a start failure. macOS
+        # reaches the SAME file through the generated exec wrapper -- see
+        # ENV_FILE_RELATIVE and render_launchd_exec_wrapper.
+        f"EnvironmentFile=-%h/{ENV_FILE_RELATIVE}",
         # Clear a drain a previous ExecStop set, on the START path so a
         # crash-restart cannot strand the engine drained. `-` => no-op if absent.
         f"ExecStartPre=-{pre_line}",
@@ -349,6 +444,68 @@ def extract_systemd_exec_start(unit_text: str) -> list[str] | None:
 # --------------------------------------------------------------------------- #
 
 
+def env_file_path() -> Path:
+    """The env file both generated units read the provider key from."""
+    return Path.home() / ENV_FILE_RELATIVE
+
+
+def render_launchd_exec_wrapper(spec: ServiceSpec) -> str:
+    """The install-generated ``sh`` wrapper launchd runs instead of the engine.
+
+    THE PROBLEM: systemd has ``EnvironmentFile=``; launchd has nothing like it.
+    A LaunchAgent's only env hook is the plist's ``EnvironmentVariables`` dict
+    -- literal values, in a file that is world-readable and that
+    ``service install`` REWRITES on every run. So the plist got a PATH and no
+    provider key, and every scheduled run on macOS failed with
+    ``Error: No providers available`` while /api/health answered ok (field
+    report #504).
+
+    THE FIX, and why it is a wrapper: baking the key into the plist would put a
+    secret at rest in that world-readable XML. Instead the plist points at this
+    wrapper, and the wrapper reads the SAME env file the systemd unit
+    references -- BY REFERENCE, at start time. One file, one semantics, both
+    platforms; the secret never leaves it.
+
+    WHY ``service install`` GENERATES IT: the field reporter wrote this wrapper
+    by hand and it worked -- until the next ``service install`` regenerated the
+    plist and dropped the reference to it. A wrapper the operator maintains is
+    a wrapper the installer can silently un-wire. This one is regenerated,
+    byte-identical, by the same command that writes the plist.
+
+    ``set -a`` exports every assignment the file makes (the file is plain
+    ``KEY=value`` lines, exactly as systemd's ``EnvironmentFile=`` expects); the
+    ``[ -f ]`` guard makes a missing file a no-op, matching systemd's leading
+    ``-``. The real argv arrives as this script's own arguments and is
+    ``exec``'d, so the wrapper replaces itself and launchd still supervises one
+    process -- and the plist keeps carrying the full, readable invocation, so
+    ``service status`` can still recover ``--port``/``--host`` from it.
+    """
+    env_file = spec.env_file or str(env_file_path())
+    return (
+        "#!/bin/sh\n"
+        "# Generated by `drumbeat service install`. Do not hand-edit -- re-run\n"
+        "# the command to regenerate it. `drumbeat service uninstall` removes it.\n"
+        "#\n"
+        "# launchd has no EnvironmentFile=. This wrapper is that mechanism: it\n"
+        "# sources the same env file the systemd unit references, then execs the\n"
+        "# real argv it was handed. The provider key stays in that file and is\n"
+        "# never written into the plist.\n"
+        "set -e\n"
+        "\n"
+        'if [ "$#" -eq 0 ]; then\n'
+        '    echo "drumbeat: exec wrapper invoked with no argv -- the plist that'
+        ' calls it is malformed; re-run \\`drumbeat service install\\`" >&2\n'
+        "    exit 64\n"
+        "fi\n"
+        "\n"
+        "set -a\n"
+        f"[ -f {shlex.quote(env_file)} ] && . {shlex.quote(env_file)}\n"
+        "set +a\n"
+        "\n"
+        'exec "$@"\n'
+    )
+
+
 def render_launchd_plist(spec: ServiceSpec) -> str:
     """The LaunchAgent ``.plist`` content for macOS ``launchd``.
 
@@ -356,8 +513,15 @@ def render_launchd_plist(spec: ServiceSpec) -> str:
     a non-clean exit (the launchd analogue of ``Restart=on-failure``). launchd
     has no ExecStop hook, so a graceful drain-on-stop is systemd-only; ``stop``
     on macOS is a plain SIGTERM.
+
+    When ``spec.wrapper_path`` is set it leads ``ProgramArguments`` and the real
+    invocation follows it as arguments -- that is how the provider key reaches
+    the unit at all (see ``render_launchd_exec_wrapper``). No secret VALUE is
+    ever written here; only the path of the wrapper that reads one.
     """
     program_args = list(spec.exec_argv) + _serve_tokens(spec)
+    if spec.wrapper_path:
+        program_args = [spec.wrapper_path] + program_args
     args_xml = "\n".join(
         f"        <string>{xml_escape(arg)}</string>" for arg in program_args
     )
@@ -680,6 +844,50 @@ def _read_engine_api_key(runs_dir: Path) -> str:
     return key
 
 
+def judge_verify_reply(reply: str | None) -> TurnVerifyResult:
+    """The turn-verify verdict for one finished turn's reply.
+
+    PASS iff the reply is the ``READY`` sentinel and nothing else (markdown
+    decoration tolerated -- see ``_VERIFY_SENTINEL_RE`` for the pinned
+    tolerance and why it is not an exact literal and not a substring).
+
+    Every failure names EXPECTED vs GOT, because the operator's next move
+    depends entirely on which reply they got: an empty one points at the
+    agent binary, ``Error: No providers available`` points at the unit's
+    environment, and unrelated prose points at the automation content.
+    """
+    text = (reply or "").strip()
+    if not text:
+        return TurnVerifyResult(
+            False,
+            "the turn finished but produced an EMPTY reply "
+            f"(expected the {_VERIFY_SENTINEL!r} sentinel, got '')",
+        )
+
+    got = text.splitlines()[0][:120]
+    if _VERIFY_SENTINEL_RE.match(text):
+        return TurnVerifyResult(
+            True,
+            f"one real turn completed and answered the {_VERIFY_SENTINEL} "
+            f"sentinel (reply: {got!r})",
+        )
+
+    lowered = text.lower()
+    if any(lowered.startswith(sig) for sig in _VERIFY_FAILURE_SIGNATURES):
+        return TurnVerifyResult(
+            False,
+            "the turn finished, but the reply is itself a statement of "
+            f"failure -- expected the {_VERIFY_SENTINEL!r} sentinel, got "
+            f"{got!r}. The unit ran a turn and the ENGINE answered; the agent "
+            "behind it did not.",
+        )
+    return TurnVerifyResult(
+        False,
+        f"the turn finished but did not answer the {_VERIFY_SENTINEL!r} "
+        f"sentinel -- expected {_VERIFY_SENTINEL!r}, got {got!r}",
+    )
+
+
 def _poll_turn_to_terminal(
     base_url: str,
     api_key: str,
@@ -699,14 +907,7 @@ def _poll_turn_to_terminal(
             status = payload.get("status")
             if status == "done":
                 reply = payload.get("reply")
-                if isinstance(reply, str) and reply.strip():
-                    snippet = reply.strip().splitlines()[0][:60]
-                    return TurnVerifyResult(
-                        True, f"one real turn completed (agent replied {snippet!r})"
-                    )
-                return TurnVerifyResult(
-                    False, "the turn finished but produced an empty reply"
-                )
+                return judge_verify_reply(reply if isinstance(reply, str) else None)
             if status == "failed":
                 return TurnVerifyResult(
                     False, f"the turn failed: {payload.get('error')}"
@@ -826,6 +1027,15 @@ def systemd_unit_path(label: str = SERVICE_LABEL) -> Path:
 
 def launchd_plist_path(label: str = SERVICE_LABEL) -> Path:
     return Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+
+
+def launchd_wrapper_path(label: str = SERVICE_LABEL) -> Path:
+    """Where ``service install`` writes the launchd exec wrapper.
+
+    Beside the env file it sources rather than in ``LaunchAgents/`` -- that
+    directory is launchd's own, and a non-plist there is at best noise.
+    """
+    return Path.home() / ".config" / "drumbeat" / f"{label}-launchd-exec.sh"
 
 
 # --------------------------------------------------------------------------- #
@@ -982,9 +1192,11 @@ def _verify_turn_or_report(spec: ServiceSpec, *, skip: bool, log_hint: str) -> b
         f"{result.detail}\n"
         "  This is the failure /api/health cannot see -- the unit serves its "
         "port, but a scheduled run would fail the same way. Common causes:\n"
-        "    - the provider key is missing from the unit's EnvironmentFile "
-        "(~/.config/drumbeat/drumbeat.env)\n"
-        "    - a tool the engine shells out to (e.g. uv) is not on the unit's PATH\n"
+        f"    - the provider key is missing from the unit's env file "
+        f"(~/{ENV_FILE_RELATIVE}) -- on Linux read via EnvironmentFile=, on "
+        "macOS via the generated exec wrapper\n"
+        "    - a tool the engine shells out to (e.g. uv, or anything under "
+        "/opt/homebrew) is not on the unit's PATH\n"
         f"  logs: {log_hint}\n"
         "  Once fixed, re-run `drumbeat service install`. To install without "
         "this check (not recommended), pass --skip-turn-verify."
@@ -1047,7 +1259,26 @@ def _install_launchd(
         env_path=base.env_path,
         stdout_path=str(log_dir / "serve.out.log"),
         stderr_path=str(log_dir / "serve.err.log"),
+        wrapper_path=str(launchd_wrapper_path(base.label)),
+        env_file=str(env_file_path()),
     )
+
+    # The wrapper FIRST, and unconditionally regenerated: the plist about to be
+    # written names it, and a plist pointing at an absent or stale wrapper is
+    # the regression this install-generated form exists to make impossible.
+    wrapper_path = Path(spec.wrapper_path or "")
+    wrapper_path.parent.mkdir(parents=True, exist_ok=True)
+    wrapper_path.write_text(render_launchd_exec_wrapper(spec), encoding="utf-8")
+    wrapper_path.chmod(0o755)
+    _print(f"wrote exec wrapper: {wrapper_path}")
+    if not Path(spec.env_file or "").is_file():
+        _print(
+            f"note: no env file at {spec.env_file} -- the unit will start "
+            "without a provider key and the turn-verify gate below will fail. "
+            f"Put ANTHROPIC_API_KEY (and any pack config) there as KEY=value "
+            "lines; the wrapper sources it at every start."
+        )
+
     plist_path = launchd_plist_path(spec.label)
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     plist_path.write_text(render_launchd_plist(spec), encoding="utf-8")
@@ -1232,6 +1463,14 @@ def _uninstall_launchd() -> int:
     plist_path.unlink()
     _print(f"removed plist: {plist_path}")
 
+    # The install-generated wrapper is ours; remove it too. The env file it
+    # sourced is the OPERATOR's and is never touched -- uninstalling a service
+    # must not delete the provider key.
+    wrapper_path = launchd_wrapper_path(SERVICE_LABEL)
+    if wrapper_path.is_file():
+        wrapper_path.unlink()
+        _print(f"removed exec wrapper: {wrapper_path}")
+
     listing = _run(["launchctl", "list", SERVICE_LABEL])
     combined = listing.stdout if listing.returncode == 0 else listing.stderr
     agent = parse_launchctl_list(combined)
@@ -1247,6 +1486,7 @@ def _uninstall_launchd() -> int:
 
 __all__ = [
     "DEFAULT_PORT",
+    "ENV_FILE_RELATIVE",
     "HEALTH_TIMEOUT_SECONDS",
     "SERVICE_LABEL",
     "TURN_VERIFY_TIMEOUT_SECONDS",
@@ -1255,14 +1495,18 @@ __all__ = [
     "ServiceSpec",
     "ServiceStatus",
     "TurnVerifyResult",
+    "env_file_path",
     "extract_launchd_program_arguments",
     "extract_systemd_exec_start",
     "find_flag_value",
     "install",
     "interpret_health",
+    "judge_verify_reply",
+    "launchd_wrapper_path",
     "parse_launchctl_list",
     "parse_systemctl_show",
     "probe_health_once",
+    "render_launchd_exec_wrapper",
     "render_launchd_plist",
     "render_systemd_unit",
     "resolve_exec_argv",
