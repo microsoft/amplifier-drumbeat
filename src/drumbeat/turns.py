@@ -55,6 +55,22 @@ A caller that passes 0 (or omits it) gets the immediate 423 instead. Same
 for ``ceiling_seconds``: the consumer owns its own outer bound and states
 it per request, rather than this module growing an opinion about how long
 somebody else's user should wait.
+
+**The owner-priority marker.** ``priority`` is an OPTIONAL
+field, one valid value today (``"owner"``), absent by default -- a caller
+that never sends it is unaffected byte-for-byte. It exists because the
+423 branch below is a bare lock probe with no ordering: whoever calls
+``flock`` first wins, so a scheduled automation sharing a session with the
+owner's own conversation can keep winning that race purely on timing while
+a consumer retries the honest 423 (see ``docs/ISSUE_CASE_STUDIES.md``-style
+incident: an owner-typed message rejected 16 times over ~4m42s). When a
+423 is about to be raised for a ``priority="owner"`` request, this module
+records "the owner is contending for this session" in
+``drumbeat.owner_priority`` -- a short-lived, in-process latch the
+scheduler consults before STARTING a new automation turn on that same
+session, deferring it (never dropping it) for a bounded number of ticks.
+This module never waits, never queues, and never learns whether the
+scheduler actually deferred anything -- it only leaves the signal.
 """
 
 from __future__ import annotations
@@ -74,6 +90,7 @@ from drumbeat import (
     agent_config,
     fsutil,
     injectors,
+    owner_priority,
     runner,
     session_pins,
 )
@@ -116,6 +133,13 @@ RETRY_AFTER_SECONDS = 5
 
 _VALID_ORIGINS = frozenset({"reply", "item_reply", "message", "chat", "manual"})
 
+# The owner-priority marker. One value today; open to grow
+# (e.g. a future non-owner priority tier) without touching every caller,
+# same discipline as `_VALID_ORIGINS`. Absent (`None`) is the default and
+# preserves today's behavior byte-for-byte -- see `owner_priority`.
+PRIORITY_OWNER = "owner"
+_VALID_PRIORITIES = frozenset({PRIORITY_OWNER})
+
 # Re-exported so a consumer branching on a turn's ``failure_kind`` compares
 # against a named constant rather than a copied string literal.
 FAILURE_KIND_SESSION_LOCKED = runner.ERROR_KIND_SESSION_LOCKED
@@ -150,6 +174,7 @@ class TurnRequest:
     ceiling_seconds: float
     new_session: bool
     profile: str | None
+    priority: str | None
 
 
 def _iso_now() -> str:
@@ -321,6 +346,23 @@ def parse_request(body: dict[str, Any]) -> TurnRequest:
             raise TurnError(400, "'profile' must be a non-empty string when present")
         profile = profile.strip()
 
+    # ``priority`` is OPTIONAL and, unlike ``profile``, CLOSED:
+    # it names a mechanism internal to this engine (the owner-priority
+    # latch, see ``owner_priority``), not an owner-defined vocabulary, so an
+    # unknown value is refused here rather than silently accepted and
+    # silently doing nothing. Absent is the default and changes nothing.
+    priority = body.get("priority")
+    if priority is not None:
+        if not isinstance(priority, str) or not priority.strip():
+            raise TurnError(400, "'priority' must be a non-empty string when present")
+        priority = priority.strip()
+        if priority not in _VALID_PRIORITIES:
+            raise TurnError(
+                400,
+                f"unknown priority {priority!r} -- must be one of: "
+                f"{', '.join(sorted(_VALID_PRIORITIES))}",
+            )
+
     return TurnRequest(
         session_id=session_id or None,
         automation_slug=automation_slug or None,
@@ -338,6 +380,7 @@ def parse_request(body: dict[str, Any]) -> TurnRequest:
         ),
         new_session=new_session,
         profile=profile,
+        priority=priority,
     )
 
 
@@ -738,6 +781,14 @@ def submit_turn(body: dict[str, Any], ctx: EngineContext) -> dict[str, Any]:
         and request.lock_wait_seconds <= 0
         and runner.session_lock_is_held(target_session, runs_dir=ctx.runs_dir)
     ):
+        # A priority="owner" caller refused here is exactly the
+        # signal the scheduler needs -- "the owner is contending for this
+        # session right now" -- so a due automation about to START on the
+        # SAME session can defer instead of winning the next unordered race.
+        # This never blocks or slows this response; it is a single dict
+        # write (see owner_priority.mark_waiting) before the honest 423.
+        if request.priority == PRIORITY_OWNER:
+            owner_priority.mark_waiting(target_session)
         raise TurnError(
             423,
             f"session {target_session!r} is locked by another in-flight turn "
@@ -756,6 +807,7 @@ def submit_turn(body: dict[str, Any], ctx: EngineContext) -> dict[str, Any]:
         "automation_slug": request.automation_slug,
         "origin": request.origin,
         "profile": request.profile,
+        "priority": request.priority,
         "text": request.text,
         "reply": None,
         "error": None,
@@ -864,6 +916,7 @@ __all__ = [
     "PHASE_EXECUTING",
     "PHASE_FINISHED",
     "PHASE_WAITING_FOR_LOCK",
+    "PRIORITY_OWNER",
     "RETRY_AFTER_SECONDS",
     "STATUS_DONE",
     "STATUS_FAILED",
