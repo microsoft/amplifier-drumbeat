@@ -295,6 +295,148 @@ def test_locked_session_with_wait_budget_is_accepted(
     assert started.wait(timeout=5), "the accepted turn never started executing"
 
 
+# ------------------------------------------------------- owner priority ----
+
+
+@pytest.fixture(autouse=True)
+def _reset_owner_priority():
+    """owner_priority is process-global, in-memory state -- reset around
+    every test in this module so a prior test's mark can never leak into
+    the next one's assertions (module-scoped, not just this class's).
+    """
+    from drumbeat import owner_priority
+
+    owner_priority._reset_for_tests()
+    yield
+    owner_priority._reset_for_tests()
+
+
+def test_priority_owner_marks_owner_waiting_on_423(ctx: EngineContext):
+    """The whole mechanism's entry point: a priority='owner' turn refused
+    with 423 must leave a live owner_priority signal for that session --
+    this is what lets the scheduler defer a same-session automation start
+    instead of winning the next unordered lock race.
+    """
+    from drumbeat import owner_priority
+
+    _make_session(ctx, "locked-session")
+    fd = _hold_session_lock(ctx, "locked-session")
+    try:
+        assert not owner_priority.is_waiting("locked-session")
+        with pytest.raises(turns.TurnError) as exc:
+            turns.submit_turn(
+                {
+                    "text": "hi",
+                    "origin": "reply",
+                    "session_id": "locked-session",
+                    "lock_wait_seconds": 0,
+                    "priority": "owner",
+                },
+                ctx,
+            )
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    assert exc.value.status == 423
+    assert owner_priority.is_waiting("locked-session")
+
+
+def test_unmarked_423_does_not_touch_owner_priority(ctx: EngineContext):
+    """The hard 'unmarked callers are unaffected' invariant: an ordinary
+    reply (no 'priority' field -- today's only shape, and every existing
+    caller) refused with 423 must NOT set the owner-priority latch. If this
+    goes red, adding the marker changed behaviour for callers that never
+    asked for it.
+    """
+    from drumbeat import owner_priority
+
+    _make_session(ctx, "locked-session")
+    fd = _hold_session_lock(ctx, "locked-session")
+    try:
+        with pytest.raises(turns.TurnError):
+            turns.submit_turn(
+                {
+                    "text": "hi",
+                    "origin": "reply",
+                    "session_id": "locked-session",
+                    "lock_wait_seconds": 0,
+                },
+                ctx,
+            )
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    assert not owner_priority.is_waiting("locked-session")
+
+
+def test_unknown_priority_value_is_400(ctx: EngineContext):
+    with pytest.raises(turns.TurnError) as exc:
+        turns.submit_turn(
+            {
+                "text": "hi",
+                "origin": "reply",
+                "session_id": "some-session",
+                "priority": "urgent",
+            },
+            ctx,
+        )
+    assert exc.value.status == 400
+    assert "priority" in exc.value.message
+
+
+def test_priority_absent_is_none_on_parsed_request():
+    request = turns.parse_request(
+        {"text": "hi", "origin": "reply", "session_id": "s1"}
+    )
+    assert request.priority is None
+
+
+def test_priority_owner_round_trips_on_parsed_request():
+    request = turns.parse_request(
+        {
+            "text": "hi",
+            "origin": "reply",
+            "session_id": "s1",
+            "priority": "owner",
+        }
+    )
+    assert request.priority == turns.PRIORITY_OWNER
+
+
+def test_accepted_turn_record_carries_priority(
+    ctx: EngineContext, monkeypatch: pytest.MonkeyPatch
+):
+    """The marker rides the turn record too -- an operator inspecting
+    GET /api/turns/{id} can see which turns asked for priority.
+    """
+
+    def _fake_resume_turn(*args, **kwargs):
+        return runner.StepResult(
+            index=0,
+            text="",
+            reply="ok",
+            error=None,
+            duration_ms=1,
+            tokens_in=0,
+            tokens_out=0,
+        )
+
+    monkeypatch.setattr(runner, "resume_turn", _fake_resume_turn)
+    _make_session(ctx, "free-session")
+
+    accepted = turns.submit_turn(
+        {
+            "text": "hi",
+            "origin": "reply",
+            "session_id": "free-session",
+            "priority": "owner",
+        },
+        ctx,
+    )
+    record = turns.get_turn(accepted["turn_id"], ctx)
+    assert record["priority"] == "owner"
+
+
 # ------------------------------------------------------ record lifecycle ----
 
 
