@@ -546,3 +546,283 @@ def test_verify_one_real_turn_missing_api_key_is_a_failure(
     result = service.verify_one_real_turn(_spec(workspace=str(tmp_path)))
     assert not result.ok
     assert "API key" in result.detail
+
+
+# --------------------------------------------------------------------------- #
+# field report #504 -- the four compounding failures, each pinned
+#
+# NO macOS HOST EXISTS IN THIS LANE. Every Darwin claim below is proven by
+# unit-level SIMULATION: the platform is monkeypatched, `ps` output is faked,
+# and the plist/wrapper are asserted as rendered text. That proves the branch
+# is taken and the content is right; it does not prove launchd loads it. A
+# macOS operator must re-verify end to end.
+# --------------------------------------------------------------------------- #
+
+
+# ---- (a) the turn-verify gate asserts the READY sentinel ----
+#
+# The verdict matrix. The gate used to pass on ANY non-empty reply, so it
+# certified `Error: No providers available` as "turn verified" -- three green
+# signals over an engine with no brain.
+
+
+def test_verify_verdict_ready_passes() -> None:
+    result = service.judge_verify_reply("READY")
+    assert result.ok
+    assert "READY" in result.detail
+
+
+def test_verify_verdict_no_providers_fails_naming_expected_vs_got() -> None:
+    """THE defect. Non-empty is not a verdict; the sentinel is."""
+    result = service.judge_verify_reply("Error: No providers available")
+    assert not result.ok
+    # expected-vs-got, both named, so the operator does not have to guess.
+    assert "READY" in result.detail
+    assert "No providers available" in result.detail
+
+
+def test_verify_verdict_empty_fails() -> None:
+    result = service.judge_verify_reply("   \n  ")
+    assert not result.ok
+    assert "EMPTY" in result.detail
+    assert "READY" in result.detail
+
+
+def test_verify_verdict_decorated_ready_passes() -> None:
+    """The PINNED tolerance: markdown decoration around the sentinel passes.
+
+    Chosen deliberately, following runner._URGENT_MARKER_RE (fix 2026-08-07),
+    where an exact-literal match silently demoted a real `**URGENT: ...**`.
+    A model told to answer READY may answer `**READY**`; failing that install
+    would be a false FAIL with no defect behind it.
+    """
+    for decorated in ("**READY**", "`READY`", "- READY", "> READY", "READY.", "ready"):
+        assert service.judge_verify_reply(decorated).ok, decorated
+
+
+def test_verify_verdict_sentinel_buried_in_prose_fails() -> None:
+    """The other half of the pin: tolerance is NOT a substring search.
+
+    A substring search would pass every string below -- including the
+    no-providers reply the gate exists to catch.
+    """
+    for prose in (
+        "Error: No providers available. READY?",
+        "Sure, READY",
+        "I am READY to help. What would you like?",
+        "The system is not READY",
+    ):
+        assert not service.judge_verify_reply(prose).ok, prose
+
+
+def test_poll_turn_rejects_a_non_sentinel_reply(monkeypatch) -> None:
+    """The matrix reaches the real poller, not just the pure judge."""
+    monkeypatch.setattr(
+        service,
+        "_http_json",
+        lambda *a, **k: (200, {"status": "done", "reply": "Error: No providers available"}),
+    )
+    result = service._poll_turn_to_terminal("http://x", "k", "t-1", timeout=5, poll=0.01)
+    assert not result.ok
+    assert "READY" in result.detail
+
+
+def test_verify_turn_prompt_asks_for_the_sentinel_it_asserts() -> None:
+    """The prompt and the gate must never drift apart."""
+    assert service._VERIFY_SENTINEL in service._VERIFY_TURN_PROMPT
+
+
+# ---- (b) launchd gets the provider key BY REFERENCE, via an exec wrapper ----
+
+
+def _launchd_spec(**over: object) -> service.ServiceSpec:
+    base: dict[str, object] = {
+        "wrapper_path": "/home/u/.config/drumbeat/drumbeat-launchd-exec.sh",
+        "env_file": "/home/u/.config/drumbeat/drumbeat.env",
+        "env_path": "/opt/uv/bin:/usr/bin",
+    }
+    base.update(over)
+    return _spec(**base)
+
+
+def test_launchd_plist_invokes_the_wrapper_first_then_the_real_argv() -> None:
+    args = service.extract_launchd_program_arguments(
+        service.render_launchd_plist(_launchd_spec())
+    )
+    assert args is not None
+    assert args[0] == "/home/u/.config/drumbeat/drumbeat-launchd-exec.sh"
+    assert args[1] == _EXEC[0]
+    assert "serve" in args
+
+
+def test_launchd_plist_still_carries_port_and_host_for_status_recovery() -> None:
+    """`service status` recovers --port/--host by reading the plist back.
+
+    Hiding the argv inside the wrapper would have broken that silently, so
+    the real invocation stays in ProgramArguments after the wrapper.
+    """
+    args = service.extract_launchd_program_arguments(
+        service.render_launchd_plist(_launchd_spec(port=9137))
+    )
+    assert service.find_flag_value(args or [], "--port") == "9137"
+    assert service.find_flag_value(args or [], "--host") == "127.0.0.1"
+
+
+def test_launchd_plist_contains_no_secret_value() -> None:
+    """The whole reason this is by-reference: the plist is world-readable and
+    is REWRITTEN on every install. Only the env file's PATH may appear."""
+    plist = service.render_launchd_plist(
+        _launchd_spec(env_file="/home/u/.config/drumbeat/drumbeat.env")
+    )
+    assert "drumbeat.env" not in plist  # not even the env file is named here
+    for secret_ish in ("ANTHROPIC", "API_KEY", "sk-ant"):
+        assert secret_ish not in plist
+
+
+def test_launchd_wrapper_sources_the_env_file_then_execs_the_real_argv() -> None:
+    wrapper = service.render_launchd_exec_wrapper(_launchd_spec())
+    assert wrapper.startswith("#!/bin/sh")
+    # set -a / source / set +a: the systemd EnvironmentFile= semantics, by hand.
+    assert "set -a" in wrapper
+    assert "/home/u/.config/drumbeat/drumbeat.env" in wrapper
+    assert "set +a" in wrapper
+    # A missing env file is a no-op, exactly like systemd's leading `-`.
+    assert "[ -f /home/u/.config/drumbeat/drumbeat.env ]" in wrapper
+    # and then it gets out of the way -- launchd supervises ONE process.
+    assert 'exec "$@"' in wrapper
+
+
+def test_launchd_wrapper_fails_loud_when_handed_no_argv() -> None:
+    """A hand-edited plist that drops the argv must not exec nothing quietly."""
+    wrapper = service.render_launchd_exec_wrapper(_launchd_spec())
+    assert 'if [ "$#" -eq 0 ]' in wrapper
+    assert "exit 64" in wrapper
+
+
+def test_launchd_wrapper_is_a_runnable_shell_script_that_exports(tmp_path) -> None:
+    """Executed for real (sh is portable; this assertion is not macOS-only).
+
+    Proves the three claims that matter: the env file's assignment reaches the
+    exec'd process's ENVIRONMENT (not just the wrapper's shell), the real argv
+    runs, and a missing env file is survivable.
+    """
+    import os
+    import subprocess
+
+    env_file = tmp_path / "drumbeat.env"
+    env_file.write_text("DRUMBEAT_TEST_TOKEN=from-the-env-file\n", encoding="utf-8")
+    wrapper = tmp_path / "exec.sh"
+    wrapper.write_text(
+        service.render_launchd_exec_wrapper(_launchd_spec(env_file=str(env_file))),
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+
+    proc = subprocess.run(
+        [str(wrapper), "/bin/sh", "-c", 'printf %s "$DRUMBEAT_TEST_TOKEN"'],
+        capture_output=True,
+        text=True,
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "from-the-env-file"
+
+    # Missing env file: still runs. `-` semantics, honoured.
+    env_file.unlink()
+    proc = subprocess.run(
+        [str(wrapper), "/bin/sh", "-c", "printf ok"],
+        capture_output=True,
+        text=True,
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "ok"
+
+
+def test_launchd_wrapper_regeneration_is_byte_identical() -> None:
+    """The reporter's hand-written wrapper was fragile because `install`
+    regenerated the plist and dropped it. Install now regenerates BOTH, so
+    a second install must reproduce the same wrapper exactly."""
+    spec = _launchd_spec()
+    assert service.render_launchd_exec_wrapper(spec) == (
+        service.render_launchd_exec_wrapper(spec)
+    )
+    assert service.render_launchd_plist(spec) == service.render_launchd_plist(spec)
+
+
+def test_launchd_plist_without_a_wrapper_is_unchanged() -> None:
+    """The pure generator stays behaviour-preserving for callers that supply
+    no wrapper (the systemd-only and test paths)."""
+    args = service.extract_launchd_program_arguments(
+        service.render_launchd_plist(_spec())
+    )
+    assert args is not None
+    assert args[0] == _EXEC[0]
+
+
+def test_both_platforms_name_the_same_env_file() -> None:
+    """One file, one semantics. Drift here is how macOS lost the key."""
+    unit = service.render_systemd_unit(_spec(env_path="/x"))
+    assert f"EnvironmentFile=-%h/{service.ENV_FILE_RELATIVE}" in unit
+    assert str(service.env_file_path()).endswith(service.ENV_FILE_RELATIVE)
+    wrapper = service.render_launchd_exec_wrapper(
+        _launchd_spec(env_file=str(service.env_file_path()))
+    )
+    assert str(service.env_file_path()) in wrapper
+
+
+def test_launchd_wrapper_path_sits_beside_the_env_file_not_in_launchagents() -> None:
+    path = service.launchd_wrapper_path("drumbeat")
+    assert path.parent == service.env_file_path().parent
+    assert "LaunchAgents" not in str(path)
+
+
+# ---- (c) the unit's PATH is honest about Homebrew on macOS ----
+
+
+def test_resolve_service_path_on_darwin_includes_homebrew(monkeypatch) -> None:
+    monkeypatch.setattr(service.shutil, "which", lambda name: None)
+    monkeypatch.setattr(service.sys, "executable", "/usr/bin/python")
+    entries = service.resolve_service_path(system="Darwin").split(":")
+    assert "/opt/homebrew/bin" in entries
+    assert "/opt/homebrew/sbin" in entries
+
+
+def test_resolve_service_path_on_linux_is_unchanged(monkeypatch) -> None:
+    """The Darwin fix must not leak a nonexistent directory onto Linux units."""
+    monkeypatch.setattr(service.shutil, "which", lambda name: None)
+    monkeypatch.setattr(service.sys, "executable", "/usr/bin/python")
+    entries = service.resolve_service_path(system="Linux").split(":")
+    assert "/opt/homebrew/bin" not in entries
+    assert "/opt/homebrew/sbin" not in entries
+    # Exactly the pre-fix answer: the interpreter's own bin dir, then the
+    # default, deduped -- no new entry, no reordering.
+    expected = ["/usr/bin"] + [
+        e for e in service._DEFAULT_SERVICE_PATH.split(":") if e != "/usr/bin"
+    ]
+    assert entries == expected
+
+
+def test_resolve_service_path_defaults_to_this_platform(monkeypatch) -> None:
+    """The branch is wired to the real platform, not only to the argument."""
+    monkeypatch.setattr(service.shutil, "which", lambda name: None)
+    monkeypatch.setattr(service.sys, "executable", "/usr/bin/python")
+    monkeypatch.setattr(service.platform, "system", lambda: "Darwin")
+    assert "/opt/homebrew/bin" in service.resolve_service_path().split(":")
+    monkeypatch.setattr(service.platform, "system", lambda: "Linux")
+    assert "/opt/homebrew/bin" not in service.resolve_service_path().split(":")
+
+
+def test_darwin_homebrew_entries_rank_below_the_resolved_tool_dirs(
+    monkeypatch,
+) -> None:
+    """uv and the agent bin dir must still win -- Homebrew is a fallback, not
+    an override of the interpreter this install actually runs from."""
+    monkeypatch.setattr(
+        service.shutil, "which", lambda name: "/home/u/.local/bin/uv" if name == "uv" else None
+    )
+    monkeypatch.setattr(service.sys, "executable", "/home/u/.local/share/uv/tools/bin/python")
+    entries = service.resolve_service_path(system="Darwin").split(":")
+    assert entries.index("/home/u/.local/bin") < entries.index("/opt/homebrew/bin")
+    # ... and above the systemd default, which names only the Intel prefix.
+    assert entries.index("/opt/homebrew/bin") < entries.index("/usr/local/bin")
