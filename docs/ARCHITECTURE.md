@@ -495,6 +495,47 @@ one API call, not an investigation.
 `automation_error` events are part of this: a dead automation was log-only once
 and stayed dead for 27 hours. The consumer is expected to surface them.
 
+### A crashed pass must not read as a quiet one
+
+An intent event says what happened to a run's output. It does not, on its own,
+close the sharper version of the same failure: a **notify-capable** automation
+that crashes mid-pass reports `notified: false`, which is byte-for-byte what a
+healthy run reports when it judges nothing needs the owner. Measured: a run
+died on `ContextLengthError` at step 5 of 8 and was operationally identical to
+a calm day. The evidence existed — `result.json`'s `failed: true`,
+a `failures.log` line, an `automation_error` event — but answering *"is this
+automation's most recent run a crash?"* meant walking every run directory or
+replaying the outbox from a cursor.
+
+`<data-dir>/failed_passes.json` is the standing one-read answer. At most one
+record per automation slug — *its most recent run failed, and nothing has
+succeeded since* — written at the same `_persist_run` choke point every run
+already passes through. Two edges, both of them: a failed run records,
+a successful run clears. A crash flag that never clears is a stuck alarm, which
+is its own untrustworthy surface.
+
+Consecutive failures **replace** rather than accumulate, which is what makes
+the second consumer of that record correct: the next run of the same automation
+carries a plain-language notice on its **first turn** saying the previous run
+did not complete, when, which run, and with what error — riding as a preamble
+on whichever turn actually runs first, so it can never be skipped because a
+system-prompt, requirements, or inject turn came ahead of step 1. The notice
+tells the agent to treat that interval as **unchecked** rather than quiet, and
+explicitly not to reconstruct what the failed pass would have said: a
+fabricated stand-in would be the same defect with better manners.
+
+Scoped to notify-capable automations. A `notify: never` run's silence was never
+going to be read as a verdict, so it has no ambiguity to resolve — its failures
+stay loud exactly where they already were.
+
+The store's posture is deliberately the *opposite* of `session_pins.json`: that
+one refuses to be read as empty, because reading-as-empty there is a silent
+mass rotation. Here, raising would take down healthy runs to protect a notice,
+so a damaged store is reported loudly on stderr, read as empty, and replaced by
+the next write. The cost of that fallback is one missed notice; the cost of the
+alternative is every run of every automation failing because a marker file got
+truncated.
+
 ### Outbox semantics
 
 - **The file** is an append-only, lock-guarded `runs/engine-events.jsonl`. One
@@ -650,6 +691,7 @@ destroying server state, not merely unlikely to.**
   <slug>/<run_id>/         result.json, step-NN.txt, stderr.log
   engine-events.jsonl      the delivery-intent outbox (engine-written)
   session_pins.json        which conversation each automation resumes
+  failed_passes.json       notify-capable automations whose latest run crashed
   session_rotations.jsonl
   session_contracts.json
   automation_errors.jsonl

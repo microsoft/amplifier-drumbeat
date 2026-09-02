@@ -282,6 +282,36 @@ Two things to write into any `urgent-only` automation's steps:
 2. **Most passes should not carry the marker.** If you are unsure whether
    something clears the bar, it does not.
 
+### A crashed pass is not a quiet pass
+
+Every policy above except `never` means an absence of output can be *read as a
+judgment*: "nothing needed you." A run that crashes mid-pass also delivers
+nothing — so without help, the two are the same observable, and the more
+alarming one hides inside the reassuring one.
+
+The engine keeps them apart in two places, and neither needs anything in your
+automation file:
+
+- **`<data-dir>/failed_passes.json`** holds at most one record per automation:
+  *its most recent run failed, and nothing has succeeded since*. One small
+  read answers "which automations are currently in a crashed state" — no
+  walking `runs/<slug>/<run_id>/`, no outbox cursor. A successful run clears
+  the record, so it is a live state and not a growing pile.
+- **The next run of that automation is told**, in plain language, on its first
+  turn: when the previous run failed, which run it was, and the recorded
+  error. It is told to treat that interval as **unchecked** rather than quiet,
+  and explicitly *not* to reconstruct or guess at what the failed pass would
+  have said.
+
+Write your steps so that notice is usable: an automation whose output includes
+an honest accounting line ("checked X through Y") has somewhere to put it.
+
+`notify: never` automations are deliberately outside this. Their failures are
+still recorded in `failures.log` and still emit an `automation_error` event —
+that is a safety property and bypasses notify policy entirely — but their
+silence was never going to be mistaken for a verdict, so there is nothing to
+disambiguate.
+
 ### Choosing
 
 | Situation | Policy |
