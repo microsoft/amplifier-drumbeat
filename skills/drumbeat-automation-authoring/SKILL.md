@@ -48,6 +48,7 @@ The filename stem is the automation's **slug** (`email-check.md` →
 | `inject` | no | List of `{argv, label}`; see §6 |
 | `conversation` | no (default `continuous`) | `continuous` · `fresh` · `daily`; see §7 |
 | `guidance_delivery` | no (default `reference`) | `reference` · `inline` — how required guidance FILES reach the agent |
+| `priority` | no (default `normal`) | `high` · `normal` — dispatch order among automations due at the same tick. Ordering only: it changes who waits, never how many runs complete |
 | `agent_config` | no | Per-automation host-config overlay (provider, model, mcp, skills, debug); see §8 |
 
 There is **no `session:` key** — session pins are engine state in

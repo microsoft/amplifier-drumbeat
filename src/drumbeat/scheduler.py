@@ -20,8 +20,20 @@ from pathlib import Path
 from typing import IO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from drumbeat import ci_events, drain, owner_priority, schedule_state, session_pins, staleness
-from drumbeat.automation import AutomationError, load_all_tolerant
+from drumbeat import (
+    ci_events,
+    drain,
+    owner_priority,
+    schedule_state,
+    session_pins,
+    staleness,
+)
+from drumbeat.automation import (
+    PRIORITY_RANK,
+    Automation,
+    AutomationError,
+    load_all_tolerant,
+)
 from drumbeat.capabilities import server_timezone
 from drumbeat.prompts import DEFAULT_PROMPTS_DIR
 from drumbeat.runner import reap_stale_session_locks, run
@@ -203,6 +215,32 @@ def seconds_until_next_fire(schedule: Schedule, now: float) -> float:
     if candidate <= now_local:
         candidate += timedelta(days=1)
     return (candidate - now_local).total_seconds()
+
+
+def _dispatch_order(scheduled: list[Automation]) -> list[Automation]:
+    """Order this tick's scheduled automations by priority tier, high first.
+
+    WHAT THIS BUYS, AND WHAT IT DOES NOT. Runs are dispatched sequentially from
+    this list, so on a tick where several automations are due, this decides
+    WHO WAITS. It cannot decide how many get to run: it adds no concurrency,
+    preempts no running turn, and never drops or defers a normal automation
+    beyond what the backlog already imposes. Measured on the reference
+    deployment, the fleet demands ~412 runs/day and completes ~127 -- this key
+    does not change that number, and pretending otherwise would make it the
+    kind of reassuring-but-inert knob this project refuses. The capacity fix
+    (concurrency, or fewer automations) is a separate architecture decision.
+
+    ``sorted`` is STABLE, and that is load-bearing rather than incidental:
+    within a tier the prior order survives untouched, so a fleet where nothing
+    declares ``priority:`` dispatches in byte-identical order to before this
+    key existed.
+
+    Owner-turn precedence is upstream of this and unaffected: the
+    owner-priority latch is consulted per automation at dispatch time (below)
+    and still defers ANY automation, of any tier, whose session the owner is
+    using. The tier orders scheduled work strictly beneath that.
+    """
+    return sorted(scheduled, key=lambda a: PRIORITY_RANK.get(a.priority, 1))
 
 
 def _describe_schedule(schedule: Schedule) -> str:
@@ -457,9 +495,9 @@ def serve(
             )
 
         now = time.time()
-        scheduled = [
-            a for a in automations if a.enabled and a.trigger.type == "schedule"
-        ]
+        scheduled = _dispatch_order(
+            [a for a in automations if a.enabled and a.trigger.type == "schedule"]
+        )
 
         # Set whenever next_due changes for a reason worth persisting
         # (registration or post-run reschedule). Stale-slug cleanup below is

@@ -155,6 +155,7 @@ class AutomationDetail:
     steps: tuple[StepView, ...]
     inject: tuple[InjectView, ...]
     guidance_delivery: str
+    priority: str
     step_count: int
     path: str
     content: str
@@ -170,6 +171,7 @@ class AutomationDetail:
             "steps": [s.to_dict() for s in self.steps],
             "inject": [i.to_dict() for i in self.inject],
             "guidance_delivery": self.guidance_delivery,
+            "priority": self.priority,
             "step_count": self.step_count,
             "path": self.path,
             "content": self.content,
@@ -233,6 +235,7 @@ def _detail(a: Automation) -> AutomationDetail:
         steps=tuple(StepView(id=s.id, prompt=s.prompt, label=s.label) for s in a.steps),
         inject=tuple(InjectView(argv=s.argv, label=s.label) for s in a.inject),
         guidance_delivery=a.guidance_delivery,
+        priority=a.priority,
         step_count=len(a.steps),
         path=str(a.path),
         content=content,

@@ -192,6 +192,36 @@ not catch internally) is a different, unrelated path: it still produces
 other turn failure (§10) — this section covers only the failure mode that
 does *not* raise.
 
+### Dispatch order among due automations
+
+Runs are dispatched sequentially. On a tick where several automations are due,
+something decides who goes first, and for most of this engine's life that
+something was list order — which meant a schedule expression was a **bid in an
+auction nobody clears, and the auction had no priority**. Measured on the
+reference deployment: the fleet demands ~412 runs/day and completes ~127 (31%);
+30-minute automations attain 52–72% of their declared cadence, the 20-minute one
+46%. The single notify-capable path to the owner starved on exactly equal terms
+with bulk background checks.
+
+An automation may now declare `priority: high` (see
+[`AUTOMATIONS.md` §2.3](AUTOMATIONS.md)); absent means `normal`. Due `high`
+automations are dispatched before due `normal` ones. The sort is **stable**, so
+within a tier the prior order survives untouched and a fleet where nothing
+declares the key dispatches in byte-identical order to before it existed.
+
+**State the limit as loudly as the feature:** this changes *who waits*, not how
+much gets done. No concurrency is added, no running turn is preempted, and
+nothing is dropped or deferred beyond what the backlog already imposes. It
+cannot move the 31%. The capacity fix — more concurrency, or fewer automations
+— is a separate architecture decision this key deliberately does not make.
+A knob that reads as a throughput fix while ordering a queue would be exactly
+the reassuring-but-inert surface this project refuses.
+
+**Owner precedence is above all of it.** The owner-priority latch is consulted
+per automation at dispatch: a due automation whose session the owner is
+actively using is deferred to the next tick and left due, regardless of tier.
+`priority:` orders scheduled work strictly *beneath* the owner, never alongside.
+
 ### Sessions are pinned, not per-run
 
 Each automation resumes **one long-lived conversation**, across runs, for weeks.

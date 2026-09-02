@@ -84,6 +84,24 @@ against it · the worked example. Status stays DRAFT and says why until then.
 
 ## Changelog
 
+- **2026-09-02** — Added an optional top-level `priority:` key with the CLOSED
+  value vocabulary `high | normal` (absent = `normal`). Evidence that promoted
+  it out of "backlogged": the consumer team's own 24h measurement plus an 8-day
+  window — the fleet demands ~412 runs/day and completes ~127 (31%);
+  30-minute automations attain 52–72% of declared cadence, the 20-minute one
+  46%. A schedule expression had become a bid in an auction nobody clears, and
+  the auction had no priority, so the single notify-capable path to the owner
+  starved on equal terms with bulk checks. The key orders DUE automations at
+  dispatch and **nothing else**: no preemption of a running turn, no capacity
+  change, no reordering within a tier. It changes WHO WAITS, not how much gets
+  done — the capacity fix (concurrency, or fewer automations) is out of scope
+  and remains an architecture decision. Absent key = byte-identical prior
+  scheduling behavior; unknown values are refused loudly naming the vocabulary,
+  same discipline as `notify:` and `conversation:`. Owner-turn precedence
+  (the owner-priority latch) is unchanged and still absolute — the tier orders
+  scheduled work strictly beneath it. Contract amended in the SAME change as
+  the code and docs, correcting the governance order the `expect_prefix` entry
+  below got wrong. Schema reference: docs/AUTOMATIONS.md §2.
 - **2026-08-25** — Owner review: the contract captures current state (frozen core
   implemented and merged, conformance fixtures green, worked example shipped —
   freeze bar 4/4 in-repo). Held loosely / un-frozen by owner decision while the

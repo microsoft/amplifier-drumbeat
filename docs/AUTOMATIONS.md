@@ -71,6 +71,7 @@ it never takes down the other automations' schedules.
 | `inject` | no | List of `{argv, label, expect_prefix?}`; see §6 |
 | `conversation` | no (default `continuous`) | `continuous` · `fresh` · `daily` — how the conversation persists across runs; see §2.1 |
 | `guidance_delivery` | no (default `reference`) | `reference` · `inline` — how required guidance FILES reach the agent; see §5 |
+| `priority` | no (default `normal`) | `high` · `normal` — dispatch order among automations due at the same tick; see §2.3 |
 | `agent_config` | no | Mapping: a per-automation host-config overlay (provider, model, MCP, skills, debug); see §10 |
 
 This vocabulary is **closed** (contract rule 2): every key above is registered,
@@ -179,6 +180,41 @@ The contract fingerprint that decides session rotation (see §2.1 and
 [`TUNING.md`](TUNING.md)) covers the ordered step **prompts** only — editing a
 step's `id` or `label`, or the frontmatter around the steps, does not abandon
 the conversation.
+
+### 2.3 · Dispatch priority (`priority:`)
+
+```yaml
+priority: high        # high | normal (default: normal)
+```
+
+When several automations come due on the same tick, `high` ones are dispatched
+before `normal` ones. That is the entire behavior.
+
+**Read the next paragraph before you set this key on anything.** It changes
+**who waits**, not how much gets done. It adds no concurrency, preempts no
+running turn, and reorders nothing within a tier. On the reference deployment
+the fleet demands ~412 runs/day and completes ~127 (31%); 30-minute automations
+attain 52–72% of their declared cadence. This key does not move those numbers.
+It exists because a schedule expression had become a bid in an auction nobody
+clears, and the auction had no priority — so the one notify-capable path to the
+owner starved on exactly equal terms with bulk background checks. Fixing the
+throughput is a separate decision (run fewer automations, or change the
+engine's concurrency); this key only decides who goes first with the throughput
+you have.
+
+Consequences worth stating plainly:
+
+- **Marking everything `high` marks nothing high.** The tier is only meaningful
+  while it is scarce.
+- **Absent means `normal`,** and a fleet where nothing declares `priority:`
+  dispatches in byte-identical order to before this key existed.
+- **An unknown value is refused loudly** at parse time, naming the allowed
+  vocabulary — the same closed-vocabulary discipline as `notify:` and
+  `conversation:`.
+- **The owner still outranks every tier.** A due automation whose session the
+  owner is actively using is deferred to the next tick regardless of its
+  priority (the owner-priority latch). `high` orders scheduled work *beneath*
+  the owner, never alongside them.
 
 ---
 
