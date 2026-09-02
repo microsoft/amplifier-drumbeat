@@ -652,12 +652,81 @@ def _transcript_stats(session_id: str, *, cwd: Path) -> dict[str, int | None]:
 
 # ---- automatic session rotation (see drumbeat.session_health) ----
 #
-# A rotation policy nobody evaluates is not a policy. These two call sites
-# are the whole enforcement mechanism: the drift check below runs before
-# the first turn of every resumed run, and the ceiling check at the end of
-# run() fires the moment the provider refuses a prompt. Both go through
-# this one function so a rotation can never happen without landing in
-# runs/session_rotations.jsonl, and never happen silently.
+# A rotation policy nobody evaluates is not a policy. These call sites
+# are the whole enforcement mechanism: the drift, provider, and transcript-size
+# checks below run before the first turn of every resumed run, and the ceiling
+# check at the end of run() fires the moment the provider refuses a prompt.
+# All of them go through this one function so a rotation can never happen
+# without landing in runs/session_rotations.jsonl, and never happen silently.
+
+
+# The transcript size (bytes, at run start) above which a pinned session is
+# rotated BEFORE the turn rather than after the provider refuses the prompt.
+#
+# WHY 5 MB, measured on this deployment's own 8-day window (4,133 runs with a
+# recorded `session_transcript_bytes_at_start`, 157 sessions):
+#
+#   * Every one of the 41 observed ContextLengthError runs started from a
+#     transcript of 5,586,751 bytes or more. The smallest was 5.6 MB; the
+#     10th percentile 7.1 MB; the median 9.8 MB.
+#   * 1,138 runs started at or below 5,000,000 bytes. ZERO of them hit the
+#     ceiling.
+#   * So a 5 MB gate would have pre-empted all 41 observed crashes, and the
+#     runs it would have rotated instead are drawn from a population with no
+#     observed crashes at all -- i.e. it buys the whole observed failure mode.
+#
+# WHY A BYTE COUNT AT ALL, given the relation is indirect: the provider
+# rejects on PROMPT TOKENS, and amplifier-agent compacts in-session, so
+# transcript bytes are a weak, monotone proxy rather than a measurement of the
+# thing that fails. Bytes are, however, the only signal available at run start
+# without replaying the transcript, they are already recorded on every
+# RunResult, and they are monotone within a session -- which is exactly what a
+# pre-emptive gate needs. The gate is deliberately not asked to be a precise
+# predictor; it is asked to keep sessions inside the region where crashes were
+# never observed.
+#
+# WHY NOT LOWER: rotation is not free -- it abandons accumulated conversation
+# memory. Measured per-run transcript growth is 0.29/0.41/0.64 MB at the
+# 25th/50th/75th percentile, so a 5 MB gate gives a session on the order of a
+# dozen runs from a cold start before it rotates. Dropping the gate further
+# buys no additional observed crashes and costs continuity directly.
+#
+# The crash-rotation backstop (Trigger 1, at the end of the run) stays exactly
+# as it was: this gate reduces how often it fires, and never replaces it.
+_DEFAULT_SESSION_ROTATE_BYTES = 5_000_000
+
+
+def _session_rotate_bytes() -> int:
+    """Transcript-size gate (bytes) for pre-emptive rotation of a pinned session.
+
+    Override via ``$DRUMBEAT_SESSION_ROTATE_BYTES`` -- the same engine-level
+    env-var seam ``$DRUMBEAT_SESSION_LOCK_WAIT_SECONDS`` and
+    ``$DRUMBEAT_BACKGROUND_LOCK_WAIT_SECONDS`` already use. There is
+    deliberately NO automation-frontmatter key: the automation file's
+    vocabulary is closed (see contracts/automation-file.v1.md) and this is an
+    engine deployment knob, not per-automation policy. An operator who wants
+    the gate out of the way sets it to a value no transcript will reach.
+
+    FAIL LOUD: an unusable value (unparseable, or not a positive integer) is
+    reported on stderr and the documented default is used, rather than being
+    silently honored as "no gate".
+    """
+    raw = os.environ.get("DRUMBEAT_SESSION_ROTATE_BYTES")
+    if not raw:
+        return _DEFAULT_SESSION_ROTATE_BYTES
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value > 0:
+        return value
+    print(
+        f"[drumbeat] DRUMBEAT_SESSION_ROTATE_BYTES={raw!r} is not a positive "
+        f"integer -- ignoring it and using the default "
+        f"{_DEFAULT_SESSION_ROTATE_BYTES} bytes.",
+        file=sys.stderr,
+    )
+    return _DEFAULT_SESSION_ROTATE_BYTES
 
 
 def _auto_rotate(
@@ -3118,6 +3187,7 @@ def _run_body(
                         )
                     )
 
+                oversize_bytes: int | None = None
                 rotate_reason: str | None = None
                 if drifted:
                     rotate_reason = (
@@ -3138,6 +3208,34 @@ def _run_body(
                         "can reject, so the pin is rotated and the next run starts "
                         "fresh."
                     )
+                else:
+                    # Trigger 3 -- TRANSCRIPT SIZE. Checked only when nothing
+                    # else already decided to rotate (a second stat() would
+                    # change nothing but the log). Measured HERE, before the
+                    # first turn, against the pinned session -- so an
+                    # over-threshold session is rotated ahead of the ceiling
+                    # instead of after it. See _DEFAULT_SESSION_ROTATE_BYTES
+                    # for the measured rationale.
+                    #
+                    # Unreadable (None) is NOT over-threshold: "unknown" must
+                    # not read as "yes" and abandon a live conversation, the
+                    # same posture the drift and lifecycle checks take.
+                    size_threshold = _session_rotate_bytes()
+                    measured_bytes = _transcript_stats(pinned_session_id, cwd=cwd)[
+                        "bytes"
+                    ]
+                    if measured_bytes is not None and measured_bytes > size_threshold:
+                        oversize_bytes = measured_bytes
+                        rotate_reason = (
+                            f"size threshold: this session's transcript is "
+                            f"{measured_bytes} bytes at run start, over the "
+                            f"{size_threshold}-byte gate "
+                            f"($DRUMBEAT_SESSION_ROTATE_BYTES). Every observed "
+                            "context-ceiling crash on this deployment started from a "
+                            "larger transcript than the gate; rotating now costs one "
+                            "conversation's memory instead of a failed run plus a "
+                            "forced rotation afterwards."
+                        )
 
                 if rotate_reason is not None and not dry_run:
                     rotated = _auto_rotate(
@@ -3167,6 +3265,14 @@ def _run_body(
                             f"{pinned_session_id!r} was created under provider "
                             f"{prev_provider!r} but the resolved config selects "
                             f"{effective_provider!r}, so it WOULD be auto-rotated",
+                            file=sys.stderr,
+                        )
+                    if oversize_bytes is not None:
+                        print(
+                            f"[{automation.name}] dry run: pinned session "
+                            f"{pinned_session_id!r} has a {oversize_bytes}-byte "
+                            f"transcript, over the {_session_rotate_bytes()}-byte "
+                            "gate, so it WOULD be auto-rotated",
                             file=sys.stderr,
                         )
                     session_id = pinned_session_id

@@ -6,6 +6,12 @@ Both are mechanically detectable with zero judgment, which is why they live
 in code; everything else about session growth is judgment, which is why it
 lives in ``automations/session-growth-check.md`` instead.
 
+A third, pre-emptive trigger -- the TRANSCRIPT SIZE GATE -- lives in
+``runner`` rather than here, because it needs nothing from this module's
+state stores: it is a ``stat()`` of the pinned session's transcript against
+a byte gate, taken before the first turn. See ``NOT A PREDICTOR, BUT A
+GATE`` below and ``runner._DEFAULT_SESSION_ROTATE_BYTES``.
+
 Trigger 1 -- CEILING HIT (permanent, self-inflicted deadlock)
     The provider rejects the request outright::
 
@@ -32,9 +38,9 @@ Trigger 2 -- CONTRACT DRIFT (the session argues against its own automation)
     longer declared. Fingerprinting the *steps* (the contract) and comparing
     on resume catches exactly that, before the bad run rather than after 15.
 
-NOT a trigger -- TRANSCRIPT SIZE ON DISK
-    It is tempting and it does not work. Measured against the two runs whose
-    true token counts the provider told us:
+TRANSCRIPT SIZE ON DISK -- NOT A PREDICTOR, BUT A GATE
+    Size cannot tell you how close a prompt is to the ceiling. Measured
+    against the two runs whose true token counts the provider told us:
 
         ============================================  =======  ==========  =========
         session                                        on disk  true tokens  bytes/tok
@@ -46,10 +52,19 @@ NOT a trigger -- TRANSCRIPT SIZE ON DISK
     The *smaller* file produced the *larger* prompt, and the implied
     bytes-per-token differs by 3.4x. Compaction has already discarded an
     unknown prefix, and the file carries megabytes of thinking-block
-    signatures that are never sent to the provider. Any MB threshold is
-    therefore either a false alarm or a missed failure, and which one is
-    unknowable from the file. Size is reported as an *aside* by
-    the consumer CLI's ``session-health`` verb and is never grounds for rotation.
+    signatures that are never sent to the provider. No byte count can
+    therefore *predict* a ceiling hit, and the consumer CLI's
+    ``session-health`` verb still reports size as an *aside* for that reason.
+
+    What a byte count CAN do is bound the region a session occupies.
+    Measured over an 8-day production window (4,133 runs carrying a
+    ``session_transcript_bytes_at_start``, 157 sessions): all 41 observed
+    ``ContextLengthError`` runs started from at least 5,586,751 bytes, while
+    1,138 runs started at or below 5,000,000 bytes and none of them hit the
+    ceiling. So the gate is calibrated to keep sessions inside the region
+    where no crash was ever observed -- not to guess where the ceiling is.
+    It is enforced in ``runner``, ahead of the first turn, and rotates
+    through the same single path every trigger here uses.
 
 Rotation is safe here, and that is a measured claim rather than a hope.
 ``runner.run()`` re-injects the durable state into **every** run --

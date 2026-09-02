@@ -295,14 +295,17 @@ Fences, each rejecting a specific temptation:
 Skim these before assuming a simpler design would do:
 
 - **Sessions are pinned, not per-run**, which is what makes "since your last
-  check" mean anything — and it forces a rotation story. There are exactly two
-  rotation triggers, both zero-judgment: the provider refusing the prompt, and
-  the automation's steps having been rewritten under a session still obeying
-  the old ones.
-- **Transcript size on disk is not a risk signal.** Measured: 10.4 MB produced
-  a 219,685-token prompt while 33.0 MB produced 201,361. The *smaller* file
-  made the *larger* prompt. Any megabyte threshold is a false alarm or a missed
-  failure, and which one is unknowable from the file.
+  check" mean anything — and it forces a rotation story. The health triggers
+  are zero-judgment: the provider refusing the prompt, the automation's steps
+  having been rewritten under a session still obeying the old ones, and the
+  transcript crossing a size gate before the turn rather than after the crash.
+- **Transcript size predicts nothing, but it still bounds something.**
+  Measured: 10.4 MB produced a 219,685-token prompt while 33.0 MB produced
+  201,361 — the *smaller* file made the *larger* prompt, so no byte count tells
+  you how close the ceiling is. Over 4,133 production runs, though, every one
+  of the 41 ceiling crashes started above 5.6 MB and none of the 1,138 runs
+  starting under 5 MB crashed. The gate keeps sessions in the region where
+  crashes were never observed; it does not pretend to predict them.
 - **Silence is never a contract value.** A tool with nothing to say prints
   `INJECT_IDLE`; bare-empty stdout aborts the run loudly. A crashed pipe and a
   genuinely idle state must not share an observable.
