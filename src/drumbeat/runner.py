@@ -48,6 +48,7 @@ from drumbeat import (
     ci_upload,
     engine_events,
     error_log,
+    failed_passes,
     packs,
     session_health,
     session_pins,
@@ -809,6 +810,37 @@ def _auto_rotate(
         file=sys.stderr,
     )
     return True
+
+
+# ---- predecessor-crash notice (see drumbeat.failed_passes) ----
+#
+# A notify-capable automation that crashes mid-pass reports notified: false --
+# the identical observable a healthy run produces when it decides nothing needs
+# the owner. The owner could not tell "nothing needs you" from "the thing that
+# decides whether anything needs you crashed." failed_passes.py holds the
+# standing fact; this is how the NEXT run of the same automation gets told.
+
+
+def _predecessor_crash_notice(prior: failed_passes.FailedPass) -> str:
+    """The plain-language block the successor run's first turn carries.
+
+    Deliberately says only what is known: WHEN the previous run failed, WHICH
+    run it was, and the recorded error. It never reconstructs, summarizes, or
+    guesses at what that pass would have reported -- the whole defect being
+    fixed here is a silence that read as a judgment, and a fabricated
+    stand-in would be the same defect with better manners.
+    """
+    when = prior.failed_at or "an unrecorded time"
+    detail = prior.error.strip() or "no error text was recorded"
+    return (
+        "[drumbeat] Notice: the previous run of this automation did not "
+        f"complete. It failed at {when} (run {prior.run_id}) with: {detail}\n\n"
+        "That run produced no report because it crashed, not because it "
+        "judged that nothing needed attention -- its silence was not a "
+        "verdict. Treat the interval it covered as UNCHECKED rather than "
+        "quiet, account for the gap plainly in this run's output, and do not "
+        "attempt to reconstruct or guess at what that run would have said."
+    )
 
 
 def _conversation_rotation_reason(
@@ -3677,6 +3709,50 @@ def _run_body(
         for spec, text in inject_turns
     )
 
+    # PREDECESSOR-CRASH NOTICE. If this automation's most recent run failed and
+    # nothing has succeeded since, the store holds one record (see
+    # failed_passes.py) and this run's FIRST turn carries a plain-language
+    # notice saying so. Without it, the agent resumes a session in which the
+    # previous pass simply said nothing, which is indistinguishable from a pass
+    # that judged there was nothing to say -- so it would account for the gap
+    # as a quiet period.
+    #
+    # Read for notify-capable automations only, matching what _persist_run
+    # records: a notify: never automation has no ambiguity to resolve. The read
+    # never raises (failed_passes never does), so a missing or damaged store
+    # costs at most this one notice and never the run.
+    #
+    # The notice rides as a PREAMBLE on the first turn -- the same mechanism
+    # inject_recap_blocks uses -- rather than as a turn of its own: it is
+    # context for the work, not work, and a turn of its own would burn a turn
+    # (and, on a new session, the single --fresh slot) to say one paragraph.
+    first_turn_notice_blocks: list[str] = []
+    if automation.notify != "never":
+        prior_failure = failed_passes.get(automation.slug, runs_dir=runs_dir)
+        if prior_failure is not None:
+            first_turn_notice_blocks.append(_predecessor_crash_notice(prior_failure))
+            print(
+                f"[{automation.name}] previous run {prior_failure.run_id} FAILED "
+                f"at {prior_failure.failed_at or 'an unrecorded time'} -- this "
+                "run's first turn carries a predecessor-crash notice so the gap "
+                "is not accounted for as a quiet period",
+                file=sys.stderr,
+            )
+
+    def _take_first_turn_blocks() -> tuple[str, ...]:
+        """The notice, exactly once, on whichever turn actually runs first.
+
+        Which turn IS first varies by run (system prompt, requirements,
+        inject, or step 1 -- see the --fresh priority immediately below), so
+        the notice is claimed by the first call site to execute rather than
+        pinned to one of them and silently skipped when that one is absent.
+        """
+        if not first_turn_notice_blocks:
+            return ()
+        blocks = tuple(first_turn_notice_blocks)
+        first_turn_notice_blocks.clear()
+        return blocks
+
     # The very first turn of a brand-new session must use `--fresh`.
     # Priority for claiming that one slot: system prompt (if configured) ->
     # requirements turn (if any file-based `requires:`) -> first inject turn
@@ -3861,6 +3937,7 @@ def _run_body(
             runs_dir=runs_dir,
             wait_seconds=None,
             host_config_path=host_config_path,
+            preamble_blocks=_take_first_turn_blocks(),
         )
         step_results.append(system_result)
         stderr_chunks.append((index, system_stderr))
@@ -3888,6 +3965,7 @@ def _run_body(
             runs_dir=runs_dir,
             wait_seconds=None,
             host_config_path=host_config_path,
+            preamble_blocks=_take_first_turn_blocks(),
         )
         step_results.append(requirements_result)
         stderr_chunks.append((index, requirements_stderr))
@@ -3917,6 +3995,7 @@ def _run_body(
                 runs_dir=runs_dir,
                 wait_seconds=None,
                 host_config_path=host_config_path,
+                preamble_blocks=_take_first_turn_blocks(),
             )
             step_results.append(inject_result)
             stderr_chunks.append((index, inject_stderr))
@@ -3968,8 +4047,10 @@ def _run_body(
                 host_config_path=host_config_path,
                 # Carry every validated inject: turn forward onto every step
                 # (see inject_recap_blocks above) -- a no-op tuple when this
-                # automation declares no inject:.
-                preamble_blocks=inject_recap_blocks,
+                # automation declares no inject:. The predecessor-crash notice
+                # rides in front of it on whichever turn runs FIRST, which is
+                # step 1 for an automation with no system/requires/inject turn.
+                preamble_blocks=_take_first_turn_blocks() + inject_recap_blocks,
             )
             # Identity, not control flow: tie this turn's record back to the
             # declared step by id (contract automation-file.v1, rule 4).
@@ -4012,7 +4093,9 @@ def _run_body(
                 host_config_path=host_config_path,
                 # Same carry-forward as the automation.steps loop above --
                 # the auto-notify judgment reads the same injected state.
-                preamble_blocks=inject_recap_blocks,
+                # _take_first_turn_blocks() is a no-op by here unless this
+                # automation declares no steps at all.
+                preamble_blocks=_take_first_turn_blocks() + inject_recap_blocks,
             )
             step_results.append(check_result)
             stderr_chunks.append((check_index, check_stderr))
@@ -5047,6 +5130,32 @@ def _persist_run(
     if result.failed:
         _log_run_failure(automation, result, runs_dir=runs_dir)
         _notify_run_failure(automation, result, runs_dir=runs_dir)
+
+    # The standing "is this automation's most recent run a crash?" fact, kept
+    # at the same choke point for the same reason: no future call site can
+    # forget it. Scoped to NOTIFY-CAPABLE automations because that is where the
+    # ambiguity lives -- a notify: never run's silence was never going to be
+    # read as "nothing needs you", so it has nothing to disambiguate. (This
+    # also excludes the synthesized bare-session automation, which is
+    # notify: never by construction.) See failed_passes.py.
+    #
+    # Both edges are here, not just the failing one: recording a crash without
+    # clearing it on the next success would leave a permanent crash flag on an
+    # automation that recovered -- a stuck alarm, which is its own version of
+    # an untrustworthy surface.
+    if automation.notify != "never":
+        if result.failed:
+            failed_passes.record(
+                slug=automation.slug,
+                automation=automation.name,
+                run_id=result.run_id,
+                session_id=result.session_id,
+                error=result.error or "",
+                failed_at=result.finished_at,
+                runs_dir=runs_dir,
+            )
+        else:
+            failed_passes.clear(automation.slug, runs_dir=runs_dir)
 
 
 def _synthesize_session_automation(session_id: str) -> Automation:
