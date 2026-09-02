@@ -31,6 +31,26 @@
 
 ### Added
 
+- **`priority:` — a dispatch tier for automations that come due together.**
+  Optional top-level frontmatter key with the closed vocabulary
+  `high | normal` (absent = `normal`). Among DUE automations, `high` is
+  dispatched first; the sort is stable, so within a tier the prior order is
+  untouched and a fleet that never declares the key dispatches in
+  byte-identical order to before. Promoted out of "backlogged" by measurement:
+  the reference fleet demands ~412 runs/day and completes ~127 (31%), with
+  30-minute automations attaining 52–72% of their declared cadence — a schedule
+  expression had become a bid in an auction nobody clears, and the auction had
+  no priority, so the one notify-capable path to the owner starved on equal
+  terms with bulk checks. **Ordering only: it changes who waits, not how much
+  gets done.** No concurrency added, no running turn preempted, nothing
+  dropped; the capacity fix remains a separate architecture decision. Owner
+  precedence is unchanged and still absolute — the owner-priority latch defers
+  a due automation of ANY tier whose session the owner is using. Unknown values
+  are refused loudly naming the vocabulary.
+  `contracts/automation-file.v1.md` amended in the same change (2026-09-02
+  changelog entry), with `docs/AUTOMATIONS.md` §2/§2.3, `docs/ARCHITECTURE.md`
+  §4, and the authoring skill's key registry.
+
 - Required guidance reaches the agent by **reference**.
   `format_requirements_turn` gained a `mode` parameter and a new automation
   field `guidance_delivery` (`reference`, the default, or `inline`). In

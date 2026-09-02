@@ -104,6 +104,35 @@ DEFAULT_GUIDANCE_DELIVERY = "reference"
 VALID_CONVERSATION_LIFECYCLES = {"continuous", "fresh", "daily"}
 DEFAULT_CONVERSATION_LIFECYCLE = "continuous"
 
+# Dispatch priority among DUE automations. Closed vocabulary, refused loudly on
+# anything else -- a priority that reads as meaningful and silently does nothing
+# is the worst defect shape in a fail-loud project.
+#
+# WHAT THIS IS FOR. Measured on the reference deployment: the fleet demands
+# ~412 runs/day and completes ~127 (31%); 30-minute automations attain 52-72%
+# of their declared cadence, the 20-minute one 46%. A schedule expression had
+# become a bid in an auction nobody clears, and the auction had no priority --
+# so the single notify-capable path to the owner starved on exactly equal terms
+# with bulk background checks.
+#
+# WHAT THIS IS NOT. It changes WHO WAITS, not how much gets done. Ordering
+# only: no preemption of a running turn, no capacity change, and within a tier
+# the existing order stands untouched. It cannot manufacture throughput, and
+# saying so plainly is the point -- the capacity fix (concurrency, or simply
+# fewer automations) is a separate architecture decision this key does not
+# make and must not be mistaken for.
+#
+# "normal" (default): an automation that never names this key is a normal
+#   automation, and a fleet where nothing names it dispatches in byte-identical
+#   order to before this key existed.
+# "high": dispatched ahead of normal automations that are due at the same tick.
+VALID_PRIORITY_VALUES = {"high", "normal"}
+DEFAULT_PRIORITY = "normal"
+
+# Dispatch rank, lowest first. Lives here, beside the vocabulary it ranks, so a
+# future value cannot be added to one without the other.
+PRIORITY_RANK: dict[str, int] = {"high": 0, "normal": 1}
+
 # The governing contract every remedy message points back at. One string so a
 # rename is a single edit and every refusal stays consistent.
 CONTRACT_REF = "contracts/automation-file.v1.md"
@@ -123,6 +152,7 @@ KNOWN_AUTOMATION_KEYS = frozenset(
         "requires",
         "inject",
         "conversation",
+        "priority",
         "agent_config",
         "guidance_delivery",
         "steps",
@@ -261,6 +291,10 @@ class Automation:
     # per host-local calendar day. Both non-continuous modes rotate through the
     # same flock-guarded rotation path the health signals use.
     conversation: str = DEFAULT_CONVERSATION_LIFECYCLE
+    # Dispatch priority among DUE automations: "high" or "normal" (default).
+    # See VALID_PRIORITY_VALUES. Ordering ONLY -- it decides who waits when
+    # several automations come due on the same tick, never how many run.
+    priority: str = DEFAULT_PRIORITY
     # Per-automation agent-config overlay (see ``drumbeat.agent_config``). The
     # highest-precedence layer merged into the ONE materialized amplifier-agent
     # host config handed to the engine on every turn of this automation. A
@@ -749,6 +783,14 @@ def load_from_text(path: Path, text: str) -> Automation:
             f"{sorted(VALID_GUIDANCE_DELIVERY)}, got {guidance_delivery!r}",
         )
 
+    priority = section.get("priority", DEFAULT_PRIORITY)
+    if priority not in VALID_PRIORITY_VALUES:
+        raise AutomationError(
+            path,
+            f"automation.priority must be one of "
+            f"{sorted(VALID_PRIORITY_VALUES)}, got {priority!r}",
+        )
+
     # Retired sugar: ``prompt_caching:`` was a deprecated alias that folded into
     # ``agent_config.provider.config.enable_prompt_caching``. The upstream
     # provider defect it routed around is fixed, so the alias is gone -- and it
@@ -858,6 +900,7 @@ def load_from_text(path: Path, text: str) -> Automation:
         slug=slug,
         inject=inject,
         guidance_delivery=guidance_delivery,
+        priority=priority,
         conversation=conversation,
         agent_config=agent_config_value,
     )
