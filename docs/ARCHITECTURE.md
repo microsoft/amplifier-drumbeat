@@ -267,9 +267,12 @@ environment is not a contract.
 
 ## 5. Session lifecycle: when a pinned session must be abandoned
 
-A pinned session accumulates conversation forever. **Only two failure modes
-have ever actually broken a run, both are mechanically detectable with zero
-judgment, and those two are the only rotation triggers in the code.**
+A pinned session accumulates conversation forever. Every rotation trigger in
+the code is **mechanically detectable with zero judgment** — no heuristic, no
+model call, no operator in the loop — and every one of them rotates through a
+single function, so a rotation can never happen without landing in
+`session_rotations.jsonl` and never happens silently. The three below are the
+health triggers: the failure modes that have actually broken runs.
 
 ### Trigger 1 — ceiling hit
 
@@ -300,10 +303,18 @@ for **15 consecutive runs**, reasoning about a schedule its automation no
 longer declared. The engine fingerprints the *steps* (the contract) and
 compares on resume, catching this before the bad run rather than after fifteen.
 
-### NOT a trigger — transcript size on disk
+### Trigger 3 — transcript size gate
 
-It is the obvious metric and it does not work. Measured against the only two
-sessions whose true token counts the provider ever reported:
+Trigger 1 is correct and, by construction, always one failed run late: it can
+only fire *after* the provider has already refused a prompt. Trigger 3 is the
+pre-emptive half. Before the first turn of a resumed run, the engine stats the
+pinned session's `transcript.jsonl`; if it is **over 5,000,000 bytes**, the
+session is rotated first and the run then proceeds on the fresh session.
+
+**Transcript size is a gate, not a predictor, and the distinction is the whole
+design.** It is emphatically not a measurement of the thing that fails.
+Measured against the two sessions whose true token counts the provider ever
+reported:
 
 | session | on disk | true prompt tokens | bytes/token |
 |---|---|---|---|
@@ -312,13 +323,40 @@ sessions whose true token counts the provider ever reported:
 
 **The smaller file produced the larger prompt**, and the implied bytes-per-token
 differs by 3.4×. Compaction has already discarded an unknown prefix, and the
-file carries megabytes of signature data that is never sent to the provider.
-Any megabyte threshold is therefore either a false alarm or a missed failure,
-and which one is unknowable from the file alone.
+file carries megabytes of signature data that is never sent to the provider. So
+"this transcript is N bytes" will never tell you how close the prompt is to the
+ceiling, and a threshold chosen as if it could would be false-alarm-or-missed
+-failure with no way to tell which.
 
-Size is reported as an *aside* and is never grounds for rotation. This is worth
-stating loudly because "the transcript is big, therefore it is at risk" is an
-inference every reader makes, and it is false.
+What size *is* good for is bounding the region a session is allowed to occupy.
+Measured over an 8-day production window — 4,133 runs carrying a
+`session_transcript_bytes_at_start`, across 157 sessions:
+
+- every one of the **41** observed `ContextLengthError` runs started from a
+  transcript of at least **5,586,751 bytes** (10th percentile 7.1 MB, median
+  9.8 MB);
+- **1,138** runs started at or below **5,000,000 bytes**, and **none of them
+  hit the ceiling**;
+- per-run transcript growth is **0.29 / 0.41 / 0.64 MB** at the 25th / 50th /
+  75th percentile.
+
+The 5 MB default is calibrated on exactly that: it sits below the entire
+observed crash distribution, so it would have pre-empted all 41 observed
+crashes, and the runs it rotates instead are drawn from a population in which
+no crash was ever observed. At measured growth rates a session gets on the
+order of a dozen runs from a cold start before the gate fires — the reason the
+gate is not set lower, since rotation costs conversation memory directly and
+buys no additional observed crashes below this point.
+
+The gate is an engine deployment knob, overridable via
+`$DRUMBEAT_SESSION_ROTATE_BYTES` (a positive integer; an unusable value is
+reported on stderr and the default is used, so the mechanism cannot be
+disabled by a typo). There is deliberately **no automation frontmatter key** —
+the automation file's vocabulary is closed, and this is a property of the
+deployment, not per-automation policy.
+
+Trigger 1 stays exactly as it is. This gate reduces how often the ceiling is
+reached; it never replaces the backstop for the sessions that get there anyway.
 
 ### Rotation is safe, and that is measured
 
