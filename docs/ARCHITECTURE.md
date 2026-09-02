@@ -661,9 +661,42 @@ Concretely, and non-negotiably:
 - **Timestamps are explicit-UTC ISO-8601; rendering is the client's job.**
 - **A partial success is a failure.** A step failure aborts the run rather than
   reporting partial success as success.
+- **A record is written atomically or not at all.** `result.json` — the
+  canonical run record every consumer reads — lands via temp file plus
+  `os.replace`, so a writer killed mid-write leaves an orphaned `.tmp`, never
+  a truncated or zero-byte record at the path anyone reads. Measured: two
+  zero-byte `result.json` files on the owner's box. A zero-byte record is not
+  a loud failure; it is an **absence**, and a consumer counting parseable
+  records simply does not see that run.
+- **A log's name is part of its contract.** See below.
 
 Every one of these replaced a real incident where a system did something
 reasonable-looking and nobody could tell it had gone wrong.
+
+### Which log is the failure log
+
+Two files sat side by side and one of them lied by its name.
+
+| File | Carries | Quiet means |
+|---|---|---|
+| `failures.log` | **RUN failures.** One greppable line per failed run | nothing is failing |
+| `automation_lint.jsonl` | **CONFIG LINT.** An automation *file* that would not parse | nobody has broken an automation file |
+| `vocabulary_errors.jsonl` | Config lint for the guidance vocabulary file | same |
+
+The lint log used to be called `automation_errors.jsonl`. Its last write was
+08-27 — correctly, because nobody had broken an automation file since 08-27 —
+and anything watching a file whose name contained "automation" and "errors"
+read a flatline straight through two days that each produced a hundred run
+failures. Nothing malfunctioned. The name invited a reading it could not
+support, which makes it telemetry that lies.
+
+So the lint log is now named for what it is, and `drumbeat doctor` reports
+**which file carries run failures and how fresh it is** — because a monitoring
+pipe that has gone quiet looks exactly like a system that has stopped failing.
+An unreadable or unparseable failure log is reported as `UNKNOWN`, explicitly
+*not* as an absence of failures. A leftover pre-rename `automation_errors.jsonl`
+is named as such, so an operator who finds a stale file learns why it stopped
+growing instead of trusting its age.
 
 ---
 
@@ -692,10 +725,11 @@ destroying server state, not merely unlikely to.**
   engine-events.jsonl      the delivery-intent outbox (engine-written)
   session_pins.json        which conversation each automation resumes
   failed_passes.json       notify-capable automations whose latest run crashed
+  failures.log             RUN failures -- the failure telemetry
   session_rotations.jsonl
   session_contracts.json
-  automation_errors.jsonl
-  vocabulary_errors.jsonl
+  automation_lint.jsonl    automation FILES that would not parse (config lint)
+  vocabulary_errors.jsonl  guidance vocabulary files that would not parse
   api_key
   .scheduler.lock  .scheduler.drain  .session-locks/
 ```

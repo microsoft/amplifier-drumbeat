@@ -1,4 +1,23 @@
-"""Durable logging of every ``AutomationError`` the codebase raises.
+"""Durable CONFIG-LINT logs: malformed automation and guidance files.
+
+NAMING, AND WHY IT MATTERS. These logs record files that failed to PARSE --
+a malformed automation frontmatter, a broken guidance vocabulary block. They
+do NOT record failed runs. That distinction was lost for eight days by a
+filename: the automation lint log was called ``automation_errors.jsonl``, and
+anything watching a file with "automation" and "errors" in its name read a
+flatline straight through two hundred-failure days. The lint log was working
+perfectly; it had simply been mistaken for failure telemetry, because its name
+invited exactly that reading.
+
+The two are now named for what they are:
+
+  * ``automation_lint.jsonl`` (here) -- automation FILES that would not parse.
+  * ``failures.log`` (``runner._log_run_failure``) -- RUNS that failed. This is
+    the failure telemetry. ``drumbeat doctor`` reports its recency.
+
+A quiet lint log is the healthy state: it means nobody has edited an automation
+into an unparseable shape. A quiet ``failures.log`` is the only one that means
+"nothing is failing."
 
 ``automation.py`` already raises a structured ``AutomationError`` on every
 malformed-automation case, but until now nothing recorded those occurrences
@@ -41,7 +60,7 @@ from drumbeat import fsutil
 # directory in every real deployment." True exactly until the workspace and
 # the data dir stopped sharing a root (B5's packet cutover: --workspace
 # points at a policy checkout, --data-dir stays behind) -- at which point a
-# benign lookup-miss wrote ``automation_errors.jsonl`` INSIDE the policy
+# benign lookup-miss wrote the automation lint log INSIDE the policy
 # tree, gitignored and invisible. Gate NEW-2 caught it in live operation.
 #
 # Resolution order, same seam as the ledger tools (fifth wall):
@@ -81,9 +100,27 @@ def resolve_log_data_dir() -> Path:
     return Path.cwd() / "runs"
 
 
-def automation_errors_path() -> Path:
-    """Where ``AutomationError`` occurrences are appended, resolved now."""
-    return resolve_log_data_dir() / "automation_errors.jsonl"
+# The historic name, kept ONLY so operators and doctor can point at a
+# pre-rename file that is no longer written. Nothing appends here.
+LEGACY_AUTOMATION_LINT_FILENAME = "automation_errors.jsonl"
+
+AUTOMATION_LINT_FILENAME = "automation_lint.jsonl"
+
+
+def automation_lint_path() -> Path:
+    """Where unparseable-automation-file records are appended, resolved now.
+
+    This is a LINT log, not failure telemetry -- see the module docstring for
+    the eight-day misreading its former name (``automation_errors.jsonl``)
+    caused. Run failures live in ``failures.log``.
+    """
+    return resolve_log_data_dir() / AUTOMATION_LINT_FILENAME
+
+
+def legacy_automation_lint_path() -> Path:
+    """The pre-rename lint log. Never written; reported by ``drumbeat doctor``
+    so an operator who finds a stale file knows why it stopped growing."""
+    return resolve_log_data_dir() / LEGACY_AUTOMATION_LINT_FILENAME
 
 
 # Same convention, separate file: a malformed guidance vocabulary file (see
@@ -126,6 +163,9 @@ def _append_jsonl(log_path: Path, record: dict) -> None:
 def log_automation_error(path: Path, problem: str) -> None:
     """Append one JSON line recording an ``AutomationError`` occurrence.
 
+    Lands in ``automation_lint.jsonl``: an automation FILE that would not
+    parse, never a run that failed.
+
     Fields are deliberately minimal and match what ``AutomationError``
     itself carries: the file path involved (the closest thing this
     exception has to "which automation") and the problem message (which,
@@ -134,7 +174,7 @@ def log_automation_error(path: Path, problem: str) -> None:
     mapping"``).
     """
     _append_jsonl(
-        automation_errors_path(),
+        automation_lint_path(),
         {
             "time": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "path": str(path),
@@ -163,8 +203,11 @@ def log_vocabulary_error(path: Path, problem: str) -> None:
 
 
 __all__ = [
+    "AUTOMATION_LINT_FILENAME",
     "DATA_DIR_ENV_VAR",
-    "automation_errors_path",
+    "LEGACY_AUTOMATION_LINT_FILENAME",
+    "automation_lint_path",
+    "legacy_automation_lint_path",
     "log_automation_error",
     "log_vocabulary_error",
     "resolve_log_data_dir",

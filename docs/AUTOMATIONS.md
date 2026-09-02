@@ -312,6 +312,21 @@ that is a safety property and bypasses notify policy entirely — but their
 silence was never going to be mistaken for a verdict, so there is nothing to
 disambiguate.
 
+### Which log to watch when something looks wrong
+
+| File (in the data dir) | Carries | A quiet file means |
+|---|---|---|
+| `failures.log` | **Runs that failed.** One line each. This is the failure telemetry | nothing is failing |
+| `failed_passes.json` | Which notify-capable automations are *currently* in a crashed state | every automation's latest run succeeded |
+| `automation_lint.jsonl` | **Automation files that would not parse.** Config lint, not run health | nobody has broken an automation file |
+
+Watch `failures.log`, not the lint log. This distinction cost eight days once:
+the lint log was called `automation_errors.jsonl`, went quiet because nobody
+had broken an automation file, and was read as "nothing is failing" through two
+days of a hundred failures each. `drumbeat doctor` now prints the failure log's
+path and the age of its last entry, so a dead monitoring pipe is visible from
+the health surface instead of looking like calm.
+
 ### Choosing
 
 | Situation | Policy |

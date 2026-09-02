@@ -174,6 +174,48 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             f"`drumbeat drain --workspace {args.workspace} --clear`"
         )
 
+    # Failure telemetry, named explicitly. A monitoring pipe that has gone
+    # quiet looks exactly like a system that has stopped failing, and this
+    # deployment lived that: the config-lint log used to be called
+    # `automation_errors.jsonl`, went quiet on 08-27 because nobody had broken
+    # an automation FILE since then, and was read as a failure flatline through
+    # two hundred-failure days. So doctor states which file carries run
+    # failures, how fresh it is, and -- separately, so the two can never be
+    # conflated again -- which file carries config lint.
+    print()
+    failures = runner.failure_log_status(runs_dir)
+    if failures.problem is not None:
+        print(f"run failures ({failures.path}): UNKNOWN -- {failures.problem}")
+        print(
+            "           an unreadable failure log is a telemetry outage, "
+            "NOT an absence of failures."
+        )
+    elif not failures.exists:
+        print(f"run failures ({failures.path}): none recorded yet (no file)")
+    else:
+        age = failures.last_entry_age_seconds or 0.0
+        print(
+            f"run failures ({failures.path}): last entry {failures.last_entry_at}"
+            f" ({workspace_git.humanize_age(age)} ago)"
+            + (
+                f", automation={failures.last_automation}"
+                if failures.last_automation
+                else ""
+            )
+        )
+    print(
+        f"config lint ({error_log.automation_lint_path().name}): unparseable "
+        "AUTOMATION FILES only -- it says nothing about whether runs are "
+        "failing. Watch the failure log above for that."
+    )
+    legacy_lint = error_log.legacy_automation_lint_path()
+    if legacy_lint.is_file():
+        print(
+            f"           NOTE: {legacy_lint} is the PRE-RENAME lint log. It is "
+            "no longer written by this engine -- its age means nothing. If "
+            "anything still watches it, repoint it."
+        )
+
     # Orphan pins: the named cost of keying the pin store by slug (section
     # 5). A rename is a cold start plus a stranded entry; this is the fence.
     print()
