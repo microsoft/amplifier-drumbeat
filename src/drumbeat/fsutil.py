@@ -62,7 +62,7 @@ def heal_torn_tail(fd: int) -> bool:
     """If the open file's last byte is not ``\\n``, write one and return True.
 
     A durable, append-only JSONL log (``engine-events.jsonl``,
-    ``automation_errors.jsonl``, ``vocabulary_errors.jsonl``,
+    ``automation_lint.jsonl``, ``vocabulary_errors.jsonl``,
     ``session_rotations.jsonl`` -- every JSONL append in this codebase)
     shares one crash-safety hazard: a writer killed mid-append (SIGKILL,
     which cannot be caught) can leave a torn final line -- a valid-JSON

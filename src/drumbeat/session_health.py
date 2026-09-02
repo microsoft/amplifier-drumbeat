@@ -109,7 +109,7 @@ CEILING_RE = re.compile(
 
 # Contract fingerprints live beside every other durable operational record
 # this project keeps (failures.log, session_rotations.jsonl,
-# automation_errors.jsonl) -- one place to look, greppable, gitignored.
+# automation_lint.jsonl) -- one place to look, greppable, gitignored.
 CONTRACT_STORE_NAME = "session_contracts.json"
 
 

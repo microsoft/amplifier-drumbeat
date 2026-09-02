@@ -49,6 +49,7 @@ from drumbeat import (
     engine_events,
     error_log,
     failed_passes,
+    fsutil,
     packs,
     session_health,
     session_pins,
@@ -4894,15 +4895,132 @@ def _record_ci_upload_outcome(
 
     run_dir = runs_dir / automation.slug / result.run_id
     result_path = run_dir / "result.json"
-    with open(result_path, "w", encoding="utf-8") as f:
-        json.dump(asdict(result), f, indent=2)
-        f.write("\n")
+    # Atomic REWRITE. This path overwrites an already-complete run record, so a
+    # process killed mid-write here does not merely lose the upload outcome --
+    # it replaces a good record with a truncated or zero-byte one. See
+    # ``_persist_run``'s note at the original write for the measured evidence.
+    fsutil.atomic_write(result_path, json.dumps(asdict(result), indent=2) + "\n")
+
+
+# ---- failure telemetry: which log is which, and is it alive ----
+#
+# THE MISREADING THIS EXISTS TO PREVENT. Two logs sat side by side in the data
+# dir. ``failures.log`` (below) carries RUN failures and was live and correct.
+# The other was named ``automation_errors.jsonl``, carried CONFIG LINT (an
+# automation file that would not parse), and had not been written since 08-27
+# because nobody had broken an automation file since 08-27. Anything watching
+# the file whose name contained "automation" and "errors" therefore read a
+# flatline straight through two days that each produced a hundred run
+# failures. Nothing malfunctioned. The name lied, and a name that lies is
+# telemetry that lies. The lint log is now ``automation_lint.jsonl`` (see
+# error_log.py), and ``drumbeat doctor`` reports which file is which along
+# with THIS one's recency -- because a monitoring pipe that has gone quiet
+# looks exactly like a system that has stopped failing.
+
+FAILURE_LOG_FILENAME = "failures.log"
+
+# Bounded tail read: failures.log is append-only and unbounded, and the only
+# question asked of it here is "when was the last entry". Reading the whole
+# file to answer that would make a health check cost proportional to the
+# history it is summarizing.
+_FAILURE_LOG_TAIL_BYTES = 64 * 1024
+
+
+def failure_log_path(runs_dir: Path) -> Path:
+    """The RUN-failure log for this data dir (not the config-lint log)."""
+    return Path(runs_dir).expanduser() / FAILURE_LOG_FILENAME
+
+
+@dataclass(frozen=True)
+class FailureLogStatus:
+    """What ``drumbeat doctor`` can say about the run-failure log's liveness.
+
+    ``exists`` False with ``problem`` None is the healthy young-workspace
+    state: nothing has failed yet. ``problem`` is set only when the file is
+    there but could not be read or understood -- an unreadable failure log is
+    itself a failure-telemetry outage and must never render as "no failures".
+    """
+
+    path: Path
+    exists: bool
+    size_bytes: int | None = None
+    last_entry_at: str | None = None
+    last_entry_age_seconds: float | None = None
+    last_automation: str | None = None
+    problem: str | None = None
+
+
+def _tail_text(path: Path, max_bytes: int) -> str:
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(max(0, size - max_bytes))
+        return f.read().decode("utf-8", errors="replace")
+
+
+def failure_log_status(runs_dir: Path) -> FailureLogStatus:
+    """Read the run-failure log's tail and report its recency. Never raises."""
+    path = failure_log_path(runs_dir)
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        return FailureLogStatus(path=path, exists=False)
+    except OSError as exc:
+        return FailureLogStatus(path=path, exists=True, problem=f"cannot stat: {exc}")
+
+    try:
+        tail = _tail_text(path, _FAILURE_LOG_TAIL_BYTES)
+    except OSError as exc:
+        return FailureLogStatus(
+            path=path, exists=True, size_bytes=size, problem=f"cannot read: {exc}"
+        )
+
+    lines = [line for line in tail.splitlines() if line.strip()]
+    if not lines:
+        return FailureLogStatus(
+            path=path,
+            exists=True,
+            size_bytes=size,
+            problem="exists but holds no entries",
+        )
+
+    last = lines[-1]
+    stamp = last.split(" ", 1)[0]
+    try:
+        when = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    except ValueError:
+        # Refuse to invent a time. An unparseable tail is reported as such
+        # rather than silently rendering as "no recent failures".
+        return FailureLogStatus(
+            path=path,
+            exists=True,
+            size_bytes=size,
+            problem=f"last line does not start with a timestamp: {last[:80]!r}",
+        )
+
+    automation = None
+    for field in last.split(" "):
+        if field.startswith("automation="):
+            automation = field.split("=", 1)[1]
+            break
+    return FailureLogStatus(
+        path=path,
+        exists=True,
+        size_bytes=size,
+        last_entry_at=stamp,
+        last_entry_age_seconds=(datetime.now(UTC) - when).total_seconds(),
+        last_automation=automation,
+    )
 
 
 def _log_run_failure(
     automation: Automation, result: RunResult, *, runs_dir: Path
 ) -> None:
     """Append one line to ``runs/failures.log`` for every failed run.
+
+    THIS is the failure telemetry -- the file to watch, and the one
+    ``failure_log_status`` reports on. ``automation_lint.jsonl`` is a config
+    lint log and says nothing about whether runs are failing.
 
     FAIL LOUD: before this, a failed run's only trace was ``result.json``'s
     ``"failed": true`` field, one file among hundreds under
@@ -4916,7 +5034,7 @@ def _log_run_failure(
     it must never mask (or re-raise over) the failure it's trying to record.
     """
     runs_dir = Path(runs_dir).expanduser()
-    log_path = runs_dir / "failures.log"
+    log_path = failure_log_path(runs_dir)
     error_preview = (result.error or "").strip().replace("\n", " ")[:300]
     if not error_preview:
         # A per-step error (main step loop) rather than a top-level abort --
@@ -5104,9 +5222,20 @@ def _persist_run(
     run_dir.mkdir(parents=True, exist_ok=True)
 
     result_path = run_dir / "result.json"
-    with open(result_path, "w", encoding="utf-8") as f:
-        json.dump(asdict(result), f, indent=2)
-        f.write("\n")
+    # ATOMIC, not merely written. result.json is THE canonical run record --
+    # ``last_run``, the runs API, the invalid-run sweep and every consumer that
+    # counts outcomes read it and nothing else. Measured on the owner's box:
+    # two ZERO-BYTE result.json files, left by runs that died mid-write. A
+    # zero-byte record is not a loud failure, it is an ABSENCE: a consumer that
+    # counts parseable records simply does not see that run, which is the
+    # successful-looking-run-that-did-nothing shape wearing a different coat.
+    #
+    # Temp file + os.replace (``fsutil.atomic_write``) makes the partial state
+    # unobservable AT THE FINAL PATH: a killed writer leaves an orphaned .tmp,
+    # never a truncated result.json. This claims atomicity against process
+    # death, which is what was actually measured -- not fsync-level durability
+    # against power loss, which it does not do and does not pretend to.
+    fsutil.atomic_write(result_path, json.dumps(asdict(result), indent=2) + "\n")
 
     for step in result.steps:
         step_path = run_dir / f"step-{step.index:02d}.txt"

@@ -210,7 +210,7 @@ def format_block(report: WorkspaceGit, *, workspace: Path) -> list[str]:
         lines.append("  last commit: none yet (no commit on this branch)")
     else:
         age = report.last_commit_age_seconds
-        age_text = "unknown age" if age is None else _humanize(age)
+        age_text = "unknown age" if age is None else humanize_age(age)
         lines.append(f"  last commit: {age_text} ago ({report.last_commit_at})")
         if report.last_commit_subject:
             lines.append(f"               {report.last_commit_subject}")
@@ -267,7 +267,13 @@ def _containment_lines(report: WorkspaceGit) -> list[str]:
     return [headline, danger, "    Point --data-dir outside the tree."]
 
 
-def _humanize(seconds: float) -> str:
+def humanize_age(seconds: float) -> str:
+    """A short, human-readable age (``42s`` / ``17m`` / ``3.2h`` / ``5.1d``).
+
+    Public because ``cli`` renders the failure log's age with it too, and two
+    independently-written age formatters on one health page is how the same
+    number starts reading two different ways.
+    """
     seconds = max(0.0, seconds)
     if seconds < 90:
         return f"{seconds:.0f}s"
@@ -280,4 +286,4 @@ def _humanize(seconds: float) -> str:
     return f"{hours / 24:.1f}d"
 
 
-__all__ = ["WorkspaceGit", "format_block", "inspect"]
+__all__ = ["WorkspaceGit", "format_block", "humanize_age", "inspect"]
