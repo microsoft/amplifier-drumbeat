@@ -1,0 +1,27 @@
+# behaviors/drumbeat.yaml -- the composable surface for drumbeat's skills.
+#
+# This is the file `amplifier bundle add <repo>#subdirectory=behaviors/drumbeat.yaml --app`
+# composes onto a user's own bundle. It registers the three skills shipped in
+# skills/ so an agent in that session can learn to operate the engine, author
+# automations, and build drumpacks -- and nothing else: drumbeat ships no agents,
+# no context files, and no tools of its own to a consuming session.
+#
+# The skills source is the namespaced reference, not a git pin. "@drumbeat:skills"
+# resolves inside whatever snapshot was installed, so a branch install serves its
+# own skills/ rather than main's. The root bundle.md declares the identical entry;
+# foundation merges tools: by module id and de-duplicates list-valued config, so
+# composing both yields ONE tool-skills registration naming ONE source.
+bundle:
+  name: drumbeat
+  version: 0.1.0
+  description: >-
+    drumbeat's skills as a composable behavior: operate the automation engine,
+    author automation files against the closed-vocabulary contract, and build
+    drumpacks. Skills only -- no agents, context, or tools are added.
+
+tools:
+  - module: tool-skills
+    source: git+https://github.com/microsoft/amplifier-bundle-skills@main#subdirectory=modules/tool-skills
+    config:
+      skills:
+        - "@drumbeat:skills"
