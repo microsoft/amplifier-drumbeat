@@ -256,18 +256,29 @@ layer inline and links the canonical docs above for depth.
 | [`drumbeat-automation-authoring`](skills/drumbeat-automation-authoring) | The automation-file contract as a how-to: closed frontmatter, structured `steps:`, schedules, notify sentinels, `requires:`/`inject:`, `agent_config:`, the guidance loop |
 | [`drumbeat-drumpack-authoring`](skills/drumbeat-drumpack-authoring) | The `drumpack.md` card, `bin/` conventions, `activity:` labels, `inject:` tool rules, and wiring via `drumpacks.txt` |
 
-Add them to your own Amplifier session in one command -- this composes
-[`behaviors/drumbeat.yaml`](behaviors/drumbeat.yaml) onto your bundle and
-registers the three skills, nothing else:
+Consume them in an [Amplifier](https://github.com/microsoft/amplifier) bundle by
+pointing `tool-skills` at this repo's `skills/` subdirectory -- this is the
+path proven in a clean environment to deliver all three skills:
 
-```bash
-amplifier bundle add git+https://github.com/microsoft/amplifier-drumbeat@main#subdirectory=behaviors/drumbeat.yaml --app
+```yaml
+tools:
+  - module: tool-skills
+    source: git+https://github.com/microsoft/amplifier-bundle-skills@main#subdirectory=modules/tool-skills
+    config:
+      skills:
+        - "git+https://github.com/microsoft/amplifier-drumbeat@main#subdirectory=skills"
 ```
 
-The repo also carries a root [`bundle.md`](bundle.md) for running a standalone
-foundation session with the same skills loaded. Either way, consumers get
-**only** `skills/` -- each skill stands alone. Validate any edits with the
-reference linter -- `npx skills-ref validate skills/drumbeat-operations`.
+Bundle-skills consumers pull **only** the `skills/` subdirectory, so each skill
+stands alone. Validate any edits with the reference linter --
+`npx skills-ref validate skills/drumbeat-operations`.
+
+There is deliberately **no** `amplifier bundle add <this repo> --app` surface.
+The bundle loader editable-installs a bundle repository's root Python package
+into the Amplifier tool environment, and this repository's package is the
+engine itself (Python >= 3.13) -- composing it as a bundle installs the engine
+into every session's environment and fails outright on hosts whose Amplifier
+runs on Python 3.12. Tracked upstream; use the snippet above.
 
 ---
 
