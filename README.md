@@ -256,20 +256,18 @@ layer inline and links the canonical docs above for depth.
 | [`drumbeat-automation-authoring`](skills/drumbeat-automation-authoring) | The automation-file contract as a how-to: closed frontmatter, structured `steps:`, schedules, notify sentinels, `requires:`/`inject:`, `agent_config:`, the guidance loop |
 | [`drumbeat-drumpack-authoring`](skills/drumbeat-drumpack-authoring) | The `drumpack.md` card, `bin/` conventions, `activity:` labels, `inject:` tool rules, and wiring via `drumpacks.txt` |
 
-Consume them in an [Amplifier](https://github.com/microsoft/amplifier) bundle by
-pointing `tool-skills` at this repo's `skills/` subdirectory:
+Add them to your own Amplifier session in one command -- this composes
+[`behaviors/drumbeat.yaml`](behaviors/drumbeat.yaml) onto your bundle and
+registers the three skills, nothing else:
 
-```yaml
-tools:
-  - module: tool-skills
-    config:
-      skills:
-        - "git+https://github.com/microsoft/amplifier-drumbeat@main#subdirectory=skills"
+```bash
+amplifier bundle add git+https://github.com/microsoft/amplifier-drumbeat@main#subdirectory=behaviors/drumbeat.yaml --app
 ```
 
-Bundle-skills consumers pull **only** the `skills/` subdirectory, so each skill
-stands alone. Validate any edits with the reference linter —
-`npx skills-ref validate skills/drumbeat-operations`.
+The repo also carries a root [`bundle.md`](bundle.md) for running a standalone
+foundation session with the same skills loaded. Either way, consumers get
+**only** `skills/` -- each skill stands alone. Validate any edits with the
+reference linter -- `npx skills-ref validate skills/drumbeat-operations`.
 
 ---
 
