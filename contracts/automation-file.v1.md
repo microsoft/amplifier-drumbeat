@@ -84,6 +84,47 @@ against it · the worked example. Status stays DRAFT and says why until then.
 
 ## Changelog
 
+- **2026-09-06** — The `agent_config:` block's `provider.config` gained two
+  CLOSED-vocabulary keys, and the resolved model gained a deny-list. The
+  top-level `agent_config:` vocabulary is UNCHANGED (still
+  `provider | providers | mcp | skills | debug`) — this amends what is legal
+  *inside* it, and the same fail-loud discipline applies to each:
+  - **`model_class: fast | standard`** — a provider-independent tier resolved
+    AT MATERIALIZATION into a concrete `default_model` per `provider.module`
+    (engine table: anthropic `fast`=claude-haiku-4-5-20251001,
+    `standard`=claude-sonnet-4-6; openai `fast`=gpt-5.6-luna,
+    `standard`=gpt-5.6-terra). Model ids rotate; tiers do not, so an author
+    should not have to carry the id. The shorthand is drumbeat's, not
+    amplifier-agent's: it is resolved away and **never** appears in the
+    materialized host config. An explicit `default_model` WINS over it, the
+    materialized record names which one won (`"model_class:fast"` vs
+    `"default_model"`), and the shadowed key is named in a WARNING rather than
+    silently dropped. A `model_class` with no `provider.module` to resolve
+    against, an unknown provider module, or an unknown class value is refused
+    loudly naming the vocabulary/known modules.
+  - **`reasoning_effort: minimal | low | medium | high | xhigh`** — amplifier-
+    agent's own field, passed through UNTOUCHED; drumbeat only validates the
+    value at load so a typo fails at authoring time rather than mid-turn.
+  - **a model deny-list** (default `["gpt-5.6-sol"]`) checked at LOAD against
+    the RESOLVED model. A denied automation is rejected through the ordinary
+    automation config-lint path (`load_all_tolerant` → the lint log → `doctor`
+    / every scheduler tick) and therefore **never runs** — it is not a run-time
+    failure, because a model this engine refuses must never reach a turn at
+    all.
+
+  Both tables are overridable per workspace via a NEW registered top-level key
+  in `agent-config.yaml` — `models:` with the closed sub-vocabulary
+  `classes | deny` — joining the existing `default:` / `profiles:`. It is a
+  sibling of `default:`, not a key inside it, because `default:` is a config
+  LAYER (held to the closed layer vocabulary above) and engine policy is not a
+  layer. `classes:` overrides per provider module and per tier (a partial
+  override replaces only the tiers it names); `deny:` replaces the default list
+  wholesale, matching the "a list replaces, never concatenates" merge rule.
+  Evidence that promoted this out of "backlogged": automation authors were
+  pinning literal model ids across a fleet, so every upstream model rotation
+  was a fleet-wide edit, and there was no way for an owner to refuse a model
+  the deployment cannot afford to run. Contract amended in the SAME change as
+  the code, tests, and docs. Schema reference: docs/AUTOMATIONS.md §10.
 - **2026-09-02** — Added an optional top-level `priority:` key with the CLOSED
   value vocabulary `high | normal` (absent = `normal`). Evidence that promoted
   it out of "backlogged": the consumer team's own 24h measurement plus an 8-day

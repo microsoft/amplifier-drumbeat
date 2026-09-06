@@ -24,6 +24,9 @@
 # `provider | providers | mcp | skills | debug`. Any other top-level key, and
 # `approval` / `allowProtocolSkew` by name, are a loud refusal.
 #
+# CLOSED top-level vocabulary for THIS FILE: `default | profiles | models`.
+# `models:` (see the bottom of this file) is engine policy, not a config layer.
+#
 # CREDENTIALS NEVER LIVE HERE. Any credential-bearing key (api_key / apiKey /
 # token / secret / authorization, case-insensitive) at ANY depth is refused —
 # amplifier-agent re-asserts credentials from the ENGINE ENVIRONMENT after this
@@ -52,12 +55,16 @@ profiles:
       config:
         default_model: claude-3-5-haiku-latest
 
-  # A heavier turn: pin an explicit provider + a stronger model.
+  # A heavier turn: pin an explicit provider + a stronger model. `model_class`
+  # is the durable way to say it -- the engine resolves the tier to a concrete
+  # model id (see `models:` below), so an upstream model rotation is one edit
+  # here instead of one per automation.
   deep:
     provider:
       module: anthropic
       config:
-        default_model: claude-sonnet-4-latest
+        model_class: standard
+        reasoning_effort: high   # minimal | low | medium | high | xhigh
 
   # Point a turn at a LOCAL, OpenAI-compatible endpoint. `base_url` is folded
   # into provider.config; the API key still comes from the environment
@@ -70,3 +77,24 @@ profiles:
         base_url: http://192.168.1.7:8081/v1
         use_streaming: false
         max_tokens: 512
+
+# ── models: engine policy — the model_class table and the deny-list ──────────
+# NOT a config layer (it is never merged into a turn's host config): it is how
+# the engine turns `model_class: fast | standard` into a concrete model, and
+# which models this workspace refuses outright. Closed vocabulary:
+# `classes | deny`. Omit the whole block to use the engine defaults:
+#
+#   anthropic: fast=claude-haiku-4-5-20251001  standard=claude-sonnet-4-6
+#   openai:    fast=gpt-5.6-luna               standard=gpt-5.6-terra
+#   deny:      ["gpt-5.6-sol"]
+#
+# models:
+#   classes:
+#     # Per provider module, per tier. PARTIAL: only the tiers you name change.
+#     openai:
+#       fast: gpt-5.6-mercury
+#   deny:
+#     # REPLACES the default list wholesale (same "a list replaces" merge rule).
+#     # An automation resolving to a denied model is a config-lint failure --
+#     # it is named by `drumbeat doctor` and never runs.
+#     - gpt-5.6-sol

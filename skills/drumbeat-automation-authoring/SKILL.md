@@ -193,8 +193,21 @@ agent_config:
   provider:
     module: openai            # provider short-name; omit to keep the bundle default
     config:
-      default_model: gpt-5-mini
+      model_class: fast       # fast | standard -- resolved to a concrete model
+      reasoning_effort: high  # minimal | low | medium | high | xhigh
 ```
+
+**Prefer `model_class:` to a literal `default_model:`.** Model ids rotate, tiers
+don't: `fast`/`standard` resolve at materialization per `provider.module`
+(anthropic → `claude-haiku-4-5-20251001` / `claude-sonnet-4-6`; openai →
+`gpt-5.6-luna` / `gpt-5.6-terra`), overridable per workspace in
+`agent-config.yaml`'s `models.classes:` table. An explicit `default_model` wins
+and drumbeat WARNS naming the shadowed `model_class`; a `model_class` with no
+`provider.module` to resolve against, or an unknown class value, is refused.
+`reasoning_effort` is passed through untouched but validated at load against the
+set above. A model on the deny-list (`models.deny:`, default `["gpt-5.6-sol"]`)
+makes the automation a config-lint failure, so it never runs at all — see
+docs/AUTOMATIONS.md §10.
 
 The engine resolves ONE config per turn by merging up to three layers,
 **lowest precedence first**: (1) `$AMPLIFIER_AGENT_CONFIG` operator file, folded

@@ -626,7 +626,8 @@ agent_config:
   provider:
     module: openai            # provider short-name; omit to keep the bundle default
     config:
-      default_model: gpt-5-mini
+      model_class: fast       # fast | standard -- resolved to a concrete model
+      reasoning_effort: high  # minimal | low | medium | high | xhigh
       base_url: http://192.168.1.7:8081/v1
 ```
 
@@ -665,7 +666,81 @@ default:
 
 An automation's own `agent_config:` overrides it key-by-key. `profiles:` is
 reserved in this file for named profiles used by interactive/API turns; the
-scheduled-automation path reads only `default:`.
+scheduled-automation path reads only `default:`. A third block, `models:`,
+holds engine policy rather than a config layer — see "Model classes" below.
+
+### Model classes: `fast` / `standard` instead of a model id
+
+Model ids rotate; tiers don't. Write the tier and let the engine resolve the id:
+
+```yaml
+agent_config:
+  provider:
+    module: openai
+    config:
+      model_class: fast       # -> default_model: gpt-5.6-luna
+```
+
+| `provider.module` | `fast` | `standard` |
+| --- | --- | --- |
+| `anthropic` | `claude-haiku-4-5-20251001` | `claude-sonnet-4-6` |
+| `openai` | `gpt-5.6-luna` | `gpt-5.6-terra` |
+
+Rules worth knowing, all fail-loud:
+
+- The class is resolved **at materialization**, against the `provider.module`
+  the *merged* config selects. `model_class` is a **drumbeat** key, not an
+  amplifier-agent field: it is resolved away and never reaches the engine.
+- A `model_class` with **no `provider.module`** anywhere in the merge cannot be
+  resolved (a tier is a tier *within* a provider) and is refused, naming the
+  known modules. So is an unknown module, and so is a class outside
+  `fast | standard`.
+- **An explicit `default_model` wins**, and drumbeat **warns** naming the
+  shadowed `model_class` rather than dropping it silently. Precedence here is
+  *key-level, not layer-level*: a `default_model` in the workspace `default:`
+  block shadows a `model_class` in an automation's own (higher-precedence)
+  block. If you set tiers per automation, don't also set a workspace-wide
+  `default_model` — the warning will tell you when you have.
+- The run's resolved model and its **source** (`"model_class:fast"` vs
+  `"default_model"`) are recorded on the resolved config, so you can always
+  tell which knob decided.
+
+### Overriding the tables: `models:` in `agent-config.yaml`
+
+```yaml
+# <workspace>/agent-config.yaml
+models:
+  classes:                    # override the tier table, per provider module
+    openai:
+      fast: gpt-5.6-mercury   # partial: openai.standard is untouched
+  deny:                       # models this workspace refuses to run
+    - gpt-5.6-sol
+```
+
+`models:` is a registered top-level key beside `default:` and `profiles:` (the
+vocabulary is closed to those three; inside `models:` it is closed to
+`classes | deny`). It is a *sibling* of `default:`, not a key inside it, because
+`default:` is a config **layer** and engine policy is not a layer.
+
+`classes:` merges per module and per tier. `deny:` **replaces** the default list
+(`["gpt-5.6-sol"]`) wholesale — the same "a list replaces, never concatenates"
+rule the config merge itself uses.
+
+### The model deny-list rejects the automation at load — it never runs
+
+The deny-list is checked against the **resolved** model (whether it came from
+`default_model` or a `model_class`). A denied automation is refused through the
+ordinary config-lint path — named on every scheduler tick and by
+`drumbeat doctor`, exactly like a malformed block — so it **never runs at all**.
+That is deliberate: a model the deployment refuses must not reach a turn and
+fail there.
+
+### `reasoning_effort`
+
+`provider.config.reasoning_effort` is amplifier-agent's own field, forwarded
+**untouched**. Drumbeat only validates the value at load against
+`minimal | low | medium | high | xhigh`, so a typo is an authoring-time refusal
+naming the set rather than a mid-turn provider error.
 
 ### What's allowed, and what is refused loudly
 
