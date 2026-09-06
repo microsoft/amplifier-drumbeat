@@ -37,6 +37,20 @@ merged:
     ``allowProtocolSkew`` are refused by name (the engine always passes ``-y``,
     so an ``approval`` block is a silent no-op; ``allowProtocolSkew`` is not a
     knob an automation gets to flip).
+  * ``provider.config.model_class`` (``fast|standard``) and
+    ``provider.config.reasoning_effort``
+    (``minimal|low|medium|high|xhigh``) are CLOSED value vocabularies; an
+    unknown value is refused naming the set. ``model_class`` is drumbeat's own
+    shorthand, resolved AT MATERIALIZATION into a concrete ``default_model``
+    per ``provider.module`` (see ``_apply_model_policy``) and removed from the
+    materialized bytes; ``reasoning_effort`` is amplifier-agent's own field and
+    passes through untouched.
+  * the RESOLVED model is checked against a deny-list. Both the tier table and
+    the deny-list come from ``load_model_policy`` -- the engine defaults, with
+    the workspace ``agent-config.yaml`` ``models:`` block folded over them.
+    Because the check runs on every layer at validation time, an automation
+    naming a denied model is rejected at LOAD (config lint -> ``doctor``) and
+    never runs at all, rather than failing when its first turn starts.
   * credential-bearing keys (``api_key`` / ``apiKey`` / ``token`` / ``secret``
     / ``authorization``, case-insensitive) are refused at ANY depth, naming the
     full dotted path. ``provider.config.api_key`` is the canonical attack: a
@@ -56,6 +70,7 @@ import copy
 import hashlib
 import json
 import os
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -72,7 +87,7 @@ ENV_CONFIG_VAR = "AMPLIFIER_AGENT_CONFIG"
 # profiles (layer 3) also live here under ``profiles:`` -- reserved here, owned
 # by a separate lane; this module reads only ``default:``.
 WORKSPACE_CONFIG_FILENAME = "agent-config.yaml"
-_WORKSPACE_ALLOWED_KEYS = frozenset({"default", "profiles"})
+_WORKSPACE_ALLOWED_KEYS = frozenset({"default", "profiles", "models"})
 
 # Where the merged host config is materialized under ``runs_dir``. Same
 # directory (and, for the caching-only case, same bytes) the retired
@@ -108,6 +123,85 @@ _REFUSED_TOP_LEVEL_KEYS: dict[str, str] = {
 # depth. ``provider.config.api_key`` is the canonical attack.
 _CREDENTIAL_KEYS = frozenset({"api_key", "apikey", "token", "secret", "authorization"})
 
+# --------------------------------------------------------------------------- #
+# Model policy: the ``model_class`` shorthand, ``reasoning_effort``, deny-list #
+# --------------------------------------------------------------------------- #
+
+# The CLOSED value vocabulary for ``provider.config.model_class`` -- a
+# provider-independent tier an author picks INSTEAD of naming a model string.
+# Same discipline as ``notify:`` / ``conversation:`` / ``priority:``: an unknown
+# value is refused loudly naming the vocabulary, never coerced or ignored.
+VALID_MODEL_CLASSES = ("fast", "standard")
+
+# The ENGINE table: tier -> concrete model, per ``provider.module``. This is
+# the knowledge an author should not have to carry -- model ids rotate, tiers
+# do not. Overridable per workspace via ``agent-config.yaml``'s ``models:``
+# block (see ``load_model_policy``) so an owner can re-point a tier without an
+# engine release.
+MODEL_CLASS_TABLE: dict[str, dict[str, str]] = {
+    "anthropic": {
+        "fast": "claude-haiku-4-5-20251001",
+        "standard": "claude-sonnet-4-6",
+    },
+    "openai": {
+        "fast": "gpt-5.6-luna",
+        "standard": "gpt-5.6-terra",
+    },
+}
+
+# The CLOSED value vocabulary for ``provider.config.reasoning_effort``. The
+# value itself is amplifier-agent's own field and is passed through UNTOUCHED;
+# drumbeat only refuses a value the provider would not understand, at load,
+# rather than letting it fail mid-turn.
+VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+
+# Models this engine refuses to run, checked against the RESOLVED model.
+# Overridable (wholesale) via ``agent-config.yaml``'s ``models.deny:``.
+DEFAULT_DENIED_MODELS = ("gpt-5.6-sol",)
+
+# The workspace ``agent-config.yaml`` block that overrides both tables above.
+# Added to the CLOSED workspace vocabulary rather than smuggled inside
+# ``default:`` -- ``default:`` is a config LAYER (held to the closed top-level
+# ``provider|providers|mcp|skills|debug`` vocabulary), and engine policy is not
+# a layer. Same allow-list discipline, one more registered name.
+WORKSPACE_MODELS_KEY = "models"
+_MODELS_ALLOWED_KEYS = frozenset({"classes", "deny"})
+
+
+@dataclass(frozen=True)
+class ModelPolicy:
+    """The resolved model tables for one workspace.
+
+    ``classes`` maps ``provider.module`` -> ``model_class`` -> concrete model
+    (the engine table, with any workspace override folded in per module).
+    ``deny`` is the set of models this engine refuses to run.
+    """
+
+    classes: dict[str, dict[str, str]]
+    deny: frozenset[str]
+
+
+DEFAULT_MODEL_POLICY = ModelPolicy(
+    classes=copy.deepcopy(MODEL_CLASS_TABLE),
+    deny=frozenset(DEFAULT_DENIED_MODELS),
+)
+
+
+@dataclass(frozen=True)
+class ModelResolution:
+    """One resolved model and WHERE it came from.
+
+    ``source`` is ``"default_model"`` (an explicit model string) or
+    ``"model_class:<class>"`` (resolved from the tier table). ``shadowed`` names
+    the key that lost when both were set -- so the loss is reported, never
+    silent.
+    """
+
+    model: str
+    source: str
+    shadowed: str | None = None
+
+
 # The recorded "effective provider module" for a turn that names no provider
 # module of its own -- i.e. it runs on whatever provider the bundle mounts.
 # Stored beside the contract fingerprint so a later change to an EXPLICIT
@@ -139,12 +233,23 @@ class ResolvedAgentConfig:
     ``provider_module`` is always populated -- the explicit ``provider.module``
     or ``BUNDLE_DEFAULT_PROVIDER`` -- because provider-change rotation needs it
     whether or not anything was materialized. ``config`` is the merged mapping.
+
+    ``default_model``/``model_source`` name the model this config actually runs
+    on and WHERE it came from -- ``"default_model"`` (an explicit model string)
+    or ``"model_class:<class>"`` (resolved from the tier table). Both ``None``
+    when the config names no model at all. ``warnings`` carries any non-fatal
+    policy note raised while resolving (today: an explicit ``default_model``
+    shadowing a ``model_class``); the resolver also prints each one to stderr,
+    so a shadowed key is never silently dropped.
     """
 
     path: Path | None
     sha: str | None
     provider_module: str
     config: dict[str, Any]
+    default_model: str | None = None
+    model_source: str | None = None
+    warnings: tuple[str, ...] = ()
 
 
 def _scan_forbidden(obj: Any, *, source: str, path: str) -> None:
@@ -177,13 +282,172 @@ def _scan_forbidden(obj: Any, *, source: str, path: str) -> None:
             _scan_forbidden(item, source=source, path=child)
 
 
-def validate_config_layer(data: Any, *, source: str) -> dict[str, Any]:
+def _provider_config(config: Mapping[str, Any]) -> dict[str, Any] | None:
+    """``provider.config`` when it is a mapping, else ``None``."""
+    provider = config.get("provider")
+    if not isinstance(provider, dict):
+        return None
+    provider_config = provider.get("config")
+    if not isinstance(provider_config, dict):
+        return None
+    return provider_config
+
+
+_MODEL_CLASS_PATH = "provider.config.model_class"
+
+
+def _refuse_misplaced_model_class(obj: Any, *, source: str, path: str) -> None:
+    """Refuse a ``model_class`` written anywhere but ``provider.config``.
+
+    ``model_class`` is DRUMBEAT's key, resolved only at ``provider.config``.
+    Written anywhere else -- most plausibly under the ``providers:`` plural
+    catalog -- it would validate, forward verbatim into the host config, and do
+    NOTHING, since amplifier-agent has never heard of it. That is the
+    "enabled, validated, inert" shape this module exists to prevent, so it is a
+    loud refusal naming the path rather than a silent pass-through.
+    """
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            child = f"{path}.{key}" if path else str(key)
+            if key == "model_class" and child != _MODEL_CLASS_PATH:
+                raise AgentConfigError(
+                    f"{source}: {child!r} is not a recognized field -- "
+                    f"'model_class' is drumbeat's own shorthand and is only "
+                    f"resolved at {_MODEL_CLASS_PATH!r}. Anywhere else it would "
+                    "be forwarded to the engine, which does not know it, and "
+                    "silently do nothing."
+                )
+            _refuse_misplaced_model_class(value, source=source, path=child)
+    elif isinstance(obj, (list, tuple)):
+        for i, item in enumerate(obj):
+            _refuse_misplaced_model_class(item, source=source, path=f"{path}[{i}]")
+
+
+def _validate_reasoning_effort(config: Mapping[str, Any], *, source: str) -> None:
+    """Refuse a ``reasoning_effort`` outside the closed set, naming the set.
+
+    The value is otherwise UNTOUCHED -- it is amplifier-agent's own field and is
+    forwarded verbatim. Validating here, at load, is what keeps a typo from
+    surfacing as a provider error mid-turn (or, worse, being silently dropped).
+    """
+    provider_config = _provider_config(config)
+    if provider_config is None or "reasoning_effort" not in provider_config:
+        return
+    value = provider_config["reasoning_effort"]
+    if value not in VALID_REASONING_EFFORTS:
+        raise AgentConfigError(
+            f"{source}: provider.config.reasoning_effort must be one of "
+            f"{list(VALID_REASONING_EFFORTS)}, got {value!r}"
+        )
+
+
+def resolve_model(
+    config: Mapping[str, Any],
+    *,
+    policy: ModelPolicy | None = None,
+    provider_module: str | None = None,
+    source: str,
+    require_module: bool = False,
+) -> ModelResolution | None:
+    """The model a config selects, and where it came from -- or ``None``.
+
+    Reads ``provider.config.default_model`` (an explicit model string) and
+    ``provider.config.model_class`` (a tier resolved through the policy table
+    for ``provider.module``). An explicit ``default_model`` WINS; the shadowed
+    ``model_class`` is reported on the result so the caller can warn rather than
+    drop it silently.
+
+    ``require_module`` distinguishes the two call sites. At MATERIALIZATION the
+    merged config is final, so a ``model_class`` with no ``provider.module`` to
+    resolve it against is unresolvable and fails loud. While validating ONE
+    LAYER it is not: the module legitimately arrives from a different layer, so
+    an unresolvable ``model_class`` is simply left for the merged check.
+    """
+    policy = DEFAULT_MODEL_POLICY if policy is None else policy
+    provider_config = _provider_config(config)
+    if provider_config is None:
+        return None
+
+    explicit = provider_config.get("default_model")
+    if explicit is not None and (not isinstance(explicit, str) or not explicit.strip()):
+        raise AgentConfigError(
+            f"{source}: provider.config.default_model must be a non-empty "
+            f"string, got {explicit!r}"
+        )
+
+    model_class = provider_config.get("model_class")
+    if model_class is not None and model_class not in VALID_MODEL_CLASSES:
+        raise AgentConfigError(
+            f"{source}: provider.config.model_class must be one of "
+            f"{list(VALID_MODEL_CLASSES)}, got {model_class!r}"
+        )
+
+    if explicit is not None:
+        return ModelResolution(
+            model=explicit.strip(),
+            source="default_model",
+            shadowed=("provider.config.model_class" if model_class else None),
+        )
+
+    if model_class is None:
+        return None
+
+    module = provider_module or effective_provider_module(config)
+    if module == BUNDLE_DEFAULT_PROVIDER:
+        if not require_module:
+            return None
+        raise AgentConfigError(
+            f"{source}: provider.config.model_class {model_class!r} cannot be "
+            "resolved without provider.module -- a model class is a tier "
+            "WITHIN a provider, so name the provider module (one of "
+            f"{sorted(policy.classes)}) or set provider.config.default_model "
+            "explicitly"
+        )
+    tiers = policy.classes.get(module)
+    if tiers is None:
+        raise AgentConfigError(
+            f"{source}: provider.config.model_class {model_class!r} has no "
+            f"model table for provider module {module!r} -- known modules: "
+            f"{sorted(policy.classes)}. Add a "
+            f"'{WORKSPACE_MODELS_KEY}.classes.{module}' table to the workspace "
+            f"{WORKSPACE_CONFIG_FILENAME}, or set provider.config.default_model "
+            "explicitly"
+        )
+    model = tiers.get(model_class)
+    if model is None:
+        raise AgentConfigError(
+            f"{source}: provider module {module!r} has no {model_class!r} model "
+            f"-- it defines {sorted(tiers)}"
+        )
+    return ModelResolution(model=model, source=f"model_class:{model_class}")
+
+
+def _refuse_denied_model(
+    resolution: ModelResolution, *, source: str, policy: ModelPolicy
+) -> None:
+    """Refuse a DENIED model, naming it, its source, and where the list lives."""
+    if resolution.model not in policy.deny:
+        return
+    raise AgentConfigError(
+        f"{source}: model {resolution.model!r} (from {resolution.source}) is on "
+        f"this workspace's model deny-list {sorted(policy.deny)} -- pick another "
+        f"model, or edit '{WORKSPACE_MODELS_KEY}.deny' in the workspace "
+        f"{WORKSPACE_CONFIG_FILENAME}"
+    )
+
+
+def validate_config_layer(
+    data: Any, *, source: str, policy: ModelPolicy | None = None
+) -> dict[str, Any]:
     """Fully validate one config layer, or raise ``AgentConfigError``.
 
     Checks: the layer is a mapping; its top-level keys are within the closed
-    vocabulary (with ``approval``/``allowProtocolSkew`` refused by name); and no
-    credential key or null value appears at ANY depth. Returns the same mapping
-    on success so a caller can ``validate_config_layer(...)`` inline.
+    vocabulary (with ``approval``/``allowProtocolSkew`` refused by name); no
+    credential key or null value appears at ANY depth; ``reasoning_effort`` and
+    ``model_class`` are within their closed value vocabularies; and the model
+    this layer resolves to -- when it resolves to one at all -- is not on the
+    deny-list. Returns the same mapping on success so a caller can
+    ``validate_config_layer(...)`` inline.
     """
     if not isinstance(data, dict):
         raise AgentConfigError(
@@ -205,6 +469,12 @@ def validate_config_layer(data: Any, *, source: str) -> dict[str, Any]:
                 f"closed to {sorted(ALLOWED_TOP_LEVEL_KEYS)}"
             )
     _scan_forbidden(data, source=source, path="")
+    policy = DEFAULT_MODEL_POLICY if policy is None else policy
+    _refuse_misplaced_model_class(data, source=source, path="")
+    _validate_reasoning_effort(data, source=source)
+    resolution = resolve_model(data, policy=policy, source=source)
+    if resolution is not None:
+        _refuse_denied_model(resolution, source=source, policy=policy)
     return data
 
 
@@ -274,7 +544,9 @@ def _parse_mapping(text: str, *, source: str) -> dict[str, Any]:
     return data
 
 
-def _load_env_layer(env: Mapping[str, str]) -> dict[str, Any] | None:
+def _load_env_layer(
+    env: Mapping[str, str], *, policy: ModelPolicy | None = None
+) -> dict[str, Any] | None:
     """Layer 1: the ``$AMPLIFIER_AGENT_CONFIG`` file, or ``None`` if unset."""
     raw = env.get(ENV_CONFIG_VAR)
     if not raw or not raw.strip():
@@ -296,33 +568,197 @@ def _load_env_layer(env: Mapping[str, str]) -> dict[str, Any] | None:
     data = _parse_mapping(text, source=source)
     if not data:
         return None
-    return validate_config_layer(data, source=source)
+    return validate_config_layer(data, source=source, policy=policy)
 
 
-def _load_workspace_default(workspace: Path) -> dict[str, Any] | None:
-    """Layer 2: the workspace ``agent-config.yaml`` ``default:`` block, or ``None``."""
+def _read_workspace_config(workspace: Path) -> tuple[Path, dict[str, Any]]:
+    """Read + top-level-validate the workspace ``agent-config.yaml``.
+
+    Returns ``(path, data)``; ``data`` is ``{}`` for a missing or empty file.
+    ONE implementation of the closed workspace vocabulary check, shared by all
+    three readers of this file (``default:``, ``profiles:``, ``models:``) so a
+    newly registered key can never be recognized by one reader and refused by
+    another.
+    """
     path = Path(workspace).expanduser() / WORKSPACE_CONFIG_FILENAME
     if not path.is_file():
-        return None
+        return path, {}
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise AgentConfigError(f"{path}: cannot read: {exc}") from exc
     data = _parse_mapping(text, source=str(path))
     if not data:
-        return None
+        return path, {}
     unknown = set(data) - _WORKSPACE_ALLOWED_KEYS
     if unknown:
         raise AgentConfigError(
             f"{path}: unknown top-level key(s) {sorted(unknown)} -- only "
             f"{sorted(_WORKSPACE_ALLOWED_KEYS)} are recognized ('default:' is "
             "the base layer merged into every automation; 'profiles:' holds "
-            "named profiles for interactive/API turns)"
+            "named profiles for interactive/API turns; 'models:' holds the "
+            "model_class table and the model deny-list)"
         )
+    return path, data
+
+
+def load_model_policy(workspace: Path) -> ModelPolicy:
+    """The workspace's model tables: the ``models:`` block over the engine's own.
+
+    ``models.classes`` overrides the engine ``model_class`` table PER PROVIDER
+    MODULE and per class -- a partial override replaces only the tiers it names,
+    so pointing ``openai.fast`` somewhere new leaves ``openai.standard`` and
+    every other provider alone. ``models.deny`` REPLACES the default deny-list
+    wholesale (the same "a list replaces, never concatenates" rule the config
+    merge itself uses), so an owner can widen OR narrow it deliberately.
+
+    A missing file, or a file with no ``models:`` block, yields
+    ``DEFAULT_MODEL_POLICY``. A malformed block is a loud ``AgentConfigError``
+    naming the file and the offending path -- never a silent fallback to the
+    engine defaults, which would run turns under a policy nobody chose.
+    """
+    path, data = _read_workspace_config(workspace)
+    raw = data.get(WORKSPACE_MODELS_KEY)
+    if raw is None:
+        return DEFAULT_MODEL_POLICY
+    source = f"{path} ({WORKSPACE_MODELS_KEY}:)"
+    if not isinstance(raw, dict):
+        raise AgentConfigError(
+            f"{source}: must be a mapping of "
+            f"{sorted(_MODELS_ALLOWED_KEYS)} -> value, got {type(raw).__name__}"
+        )
+    unknown = sorted(set(raw) - _MODELS_ALLOWED_KEYS)
+    if unknown:
+        raise AgentConfigError(
+            f"{source}: unknown key(s) {unknown} -- the vocabulary is closed to "
+            f"{sorted(_MODELS_ALLOWED_KEYS)} ('classes:' overrides the "
+            "model_class table per provider module; 'deny:' replaces the model "
+            "deny-list)"
+        )
+
+    classes = copy.deepcopy(MODEL_CLASS_TABLE)
+    raw_classes = raw.get("classes")
+    if raw_classes is not None:
+        if not isinstance(raw_classes, dict):
+            raise AgentConfigError(
+                f"{source}: 'classes' must be a mapping of provider module -> "
+                f"{{{' | '.join(VALID_MODEL_CLASSES)}}} -> model, got "
+                f"{type(raw_classes).__name__}"
+            )
+        for module, tiers in raw_classes.items():
+            if not isinstance(module, str) or not module.strip():
+                raise AgentConfigError(
+                    f"{source}: provider module {module!r} must be a non-empty string"
+                )
+            if not isinstance(tiers, dict):
+                raise AgentConfigError(
+                    f"{source}: classes.{module} must be a mapping of "
+                    f"{sorted(VALID_MODEL_CLASSES)} -> model, got "
+                    f"{type(tiers).__name__}"
+                )
+            for tier, model in tiers.items():
+                if tier not in VALID_MODEL_CLASSES:
+                    raise AgentConfigError(
+                        f"{source}: classes.{module}.{tier} is not a model class -- "
+                        f"the vocabulary is closed to {sorted(VALID_MODEL_CLASSES)}"
+                    )
+                if not isinstance(model, str) or not model.strip():
+                    raise AgentConfigError(
+                        f"{source}: classes.{module}.{tier} must be a non-empty "
+                        f"model string, got {model!r}"
+                    )
+            classes.setdefault(module.strip(), {})
+            classes[module.strip()].update(
+                {tier: model.strip() for tier, model in tiers.items()}
+            )
+
+    deny = frozenset(DEFAULT_DENIED_MODELS)
+    raw_deny = raw.get("deny")
+    if raw_deny is not None:
+        if not isinstance(raw_deny, list):
+            raise AgentConfigError(
+                f"{source}: 'deny' must be a list of model strings, got "
+                f"{type(raw_deny).__name__}"
+            )
+        for entry in raw_deny:
+            if not isinstance(entry, str) or not entry.strip():
+                raise AgentConfigError(
+                    f"{source}: deny entry {entry!r} must be a non-empty string"
+                )
+        deny = frozenset(entry.strip() for entry in raw_deny)
+
+    return ModelPolicy(classes=classes, deny=deny)
+
+
+def _load_workspace_default(
+    workspace: Path, *, policy: ModelPolicy | None = None
+) -> dict[str, Any] | None:
+    """Layer 2: the workspace ``agent-config.yaml`` ``default:`` block, or ``None``."""
+    path, data = _read_workspace_config(workspace)
+    if not data:
+        return None
     default = data.get("default")
     if default is None:
         return None
-    return validate_config_layer(default, source=f"{path} (default:)")
+    return validate_config_layer(
+        default, source=f"{path} (default:)", policy=policy
+    )
+
+
+def _emit_warning(message: str) -> None:
+    """Print one non-fatal policy warning to stderr.
+
+    A warning that lives only in a returned dataclass is a warning nobody sees;
+    a warning that only prints is a warning nothing can assert on. Both, so the
+    operator reads it in the service log AND the caller can carry it.
+    """
+    print(f"drumbeat: agent-config warning: {message}", file=sys.stderr)
+
+
+def _apply_model_policy(
+    merged: dict[str, Any],
+    *,
+    provider_module: str,
+    policy: ModelPolicy,
+    source: str,
+) -> tuple[dict[str, Any], ModelResolution | None, tuple[str, ...]]:
+    """Resolve ``model_class`` into a concrete ``default_model``, or refuse.
+
+    Runs at MATERIALIZATION, against the fully merged config, so the tier is
+    resolved against the provider module the turn actually runs on -- wherever
+    in the layer stack that module was declared. The shorthand is then REMOVED
+    from the materialized bytes: ``model_class`` is a drumbeat key, not an
+    amplifier-agent host-config field, and forwarding it would hand the engine
+    a key it does not know. The deny-list is checked against the RESOLVED
+    model, which is the only model that ever reaches a provider.
+    """
+    resolution = resolve_model(
+        merged,
+        policy=policy,
+        provider_module=provider_module,
+        source=source,
+        require_module=True,
+    )
+    if resolution is None:
+        return merged, None, ()
+
+    _refuse_denied_model(resolution, source=source, policy=policy)
+
+    warnings: tuple[str, ...] = ()
+    if resolution.shadowed is not None:
+        message = (
+            f"{source}: provider.config.default_model ({resolution.model!r}) "
+            f"wins over {resolution.shadowed} -- the model class is ignored; "
+            "remove one of the two so the intent is unambiguous"
+        )
+        _emit_warning(message)
+        warnings = (message,)
+
+    out = copy.deepcopy(merged)
+    provider_config = out["provider"]["config"]
+    provider_config.pop("model_class", None)
+    provider_config["default_model"] = resolution.model
+    return out, resolution, warnings
 
 
 def resolve(
@@ -346,21 +782,30 @@ def resolve(
     ``automation_config`` is trusted (already validated at parse time). Every
     other file/profile layer is validated here and a failure raises
     ``AgentConfigError``.
+
+    A ``provider.config.model_class`` surviving the merge is resolved into a
+    concrete ``default_model`` here, at materialization, against the workspace
+    model policy (see ``_apply_model_policy``); the resolved model is checked
+    against the deny-list before anything is written.
     """
     env = os.environ if env is None else env
 
+    policy = load_model_policy(workspace)
+
     layers: list[Mapping[str, Any]] = []
 
-    env_layer = _load_env_layer(env)
+    env_layer = _load_env_layer(env, policy=policy)
     if env_layer:
         layers.append(env_layer)
 
-    workspace_layer = _load_workspace_default(workspace)
+    workspace_layer = _load_workspace_default(workspace, policy=policy)
     if workspace_layer:
         layers.append(workspace_layer)
 
     if profile is not None:
-        layers.append(validate_config_layer(profile, source="named profile"))
+        layers.append(
+            validate_config_layer(profile, source="named profile", policy=policy)
+        )
 
     if automation_config:
         # Already validated at parse time (drumbeat.automation), so it is
@@ -379,9 +824,22 @@ def resolve(
             path=None, sha=None, provider_module=provider_module, config={}
         )
 
+    merged, resolution, warnings = _apply_model_policy(
+        merged,
+        provider_module=provider_module,
+        policy=policy,
+        source=f"agent config for automation {slug!r}",
+    )
+
     path, sha = _materialize(runs_dir, MATERIALIZED_DIRNAME, slug, merged)
     return ResolvedAgentConfig(
-        path=path, sha=sha, provider_module=provider_module, config=merged
+        path=path,
+        sha=sha,
+        provider_module=provider_module,
+        config=merged,
+        default_model=(resolution.model if resolution else None),
+        model_source=(resolution.source if resolution else None),
+        warnings=warnings,
     )
 
 
@@ -397,24 +855,9 @@ def load_profiles(workspace: Path) -> dict[str, dict[str, Any]]:
     A malformed ``profiles:`` block, or a malformed individual profile, is a
     loud ``AgentConfigError`` naming the file and the profile.
     """
-    path = Path(workspace).expanduser() / WORKSPACE_CONFIG_FILENAME
-    if not path.is_file():
-        return {}
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise AgentConfigError(f"{path}: cannot read: {exc}") from exc
-    data = _parse_mapping(text, source=str(path))
+    path, data = _read_workspace_config(workspace)
     if not data:
         return {}
-    unknown = set(data) - _WORKSPACE_ALLOWED_KEYS
-    if unknown:
-        raise AgentConfigError(
-            f"{path}: unknown top-level key(s) {sorted(unknown)} -- only "
-            f"{sorted(_WORKSPACE_ALLOWED_KEYS)} are recognized ('default:' is "
-            "the base layer merged into every automation; 'profiles:' holds "
-            "named profiles for interactive/API turns)"
-        )
     raw = data.get("profiles")
     if raw is None:
         return {}
@@ -423,6 +866,7 @@ def load_profiles(workspace: Path) -> dict[str, dict[str, Any]]:
             f"{path} (profiles:): must be a mapping of profile name -> config "
             f"layer, got {type(raw).__name__}"
         )
+    policy = load_model_policy(workspace)
     profiles: dict[str, dict[str, Any]] = {}
     for name, layer in raw.items():
         if not isinstance(name, str) or not name.strip():
@@ -430,7 +874,7 @@ def load_profiles(workspace: Path) -> dict[str, dict[str, Any]]:
                 f"{path} (profiles:): profile name {name!r} must be a non-empty string"
             )
         profiles[name] = validate_config_layer(
-            layer, source=f"{path} (profiles.{name}:)"
+            layer, source=f"{path} (profiles.{name}:)", policy=policy
         )
     return profiles
 
@@ -495,13 +939,15 @@ def resolve_turn(
     """
     env = os.environ if env is None else env
 
+    policy = load_model_policy(workspace)
+
     layers: list[Mapping[str, Any]] = []
 
-    env_layer = _load_env_layer(env)
+    env_layer = _load_env_layer(env, policy=policy)
     if env_layer:
         layers.append(env_layer)
 
-    workspace_layer = _load_workspace_default(workspace)
+    workspace_layer = _load_workspace_default(workspace, policy=policy)
     if workspace_layer:
         layers.append(workspace_layer)
 
@@ -519,25 +965,48 @@ def resolve_turn(
             path=None, sha=None, provider_module=provider_module, config={}
         )
 
+    merged, resolution, warnings = _apply_model_policy(
+        merged,
+        provider_module=provider_module,
+        policy=policy,
+        source=f"agent config for turn {key!r}",
+    )
+
     path, sha = _materialize(runs_dir, TURN_MATERIALIZED_DIRNAME, key, merged)
     return ResolvedAgentConfig(
-        path=path, sha=sha, provider_module=provider_module, config=merged
+        path=path,
+        sha=sha,
+        provider_module=provider_module,
+        config=merged,
+        default_model=(resolution.model if resolution else None),
+        model_source=(resolution.source if resolution else None),
+        warnings=warnings,
     )
 
 
 __all__ = [
     "ALLOWED_TOP_LEVEL_KEYS",
     "BUNDLE_DEFAULT_PROVIDER",
+    "DEFAULT_DENIED_MODELS",
+    "DEFAULT_MODEL_POLICY",
     "ENV_CONFIG_VAR",
     "MATERIALIZED_DIRNAME",
+    "MODEL_CLASS_TABLE",
     "TURN_MATERIALIZED_DIRNAME",
+    "VALID_MODEL_CLASSES",
+    "VALID_REASONING_EFFORTS",
     "WORKSPACE_CONFIG_FILENAME",
+    "WORKSPACE_MODELS_KEY",
     "AgentConfigError",
+    "ModelPolicy",
+    "ModelResolution",
     "ResolvedAgentConfig",
     "effective_provider_module",
+    "load_model_policy",
     "load_profiles",
     "merge_config",
     "resolve",
+    "resolve_model",
     "resolve_turn",
     "select_profile",
     "validate_config_layer",

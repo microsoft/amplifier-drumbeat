@@ -253,7 +253,7 @@ layer inline and links the canonical docs above for depth.
 | Skill | What it teaches |
 |---|---|
 | [`drumbeat-operations`](skills/drumbeat-operations) | Install, run, supervise (`service`), health-check (`doctor`), rotate pinned sessions, `drain`/`sweep`, and troubleshoot |
-| [`drumbeat-automation-authoring`](skills/drumbeat-automation-authoring) | The automation-file contract as a how-to: closed frontmatter, structured `steps:`, schedules, notify sentinels, `requires:`/`inject:`, `agent_config:`, the guidance loop |
+| [`drumbeat-automation-authoring`](skills/drumbeat-automation-authoring) | The automation-file contract as a how-to: closed frontmatter, structured `steps:`, schedules, notify sentinels, `requires:`/`inject:`, `agent_config:` (incl. `model_class:`/`reasoning_effort:`), the guidance loop |
 | [`drumbeat-drumpack-authoring`](skills/drumbeat-drumpack-authoring) | The `drumpack.md` card, `bin/` conventions, `activity:` labels, `inject:` tool rules, and wiring via `drumpacks.txt` |
 
 Add them to your own Amplifier session in one command -- this composes

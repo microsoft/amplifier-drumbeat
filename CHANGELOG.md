@@ -31,6 +31,29 @@
 
 ### Added
 
+- **`model_class:` / `reasoning_effort:` / a model deny-list — pick a model
+  TIER, not a model id.** `agent_config`'s `provider.config` gained two
+  closed-vocabulary keys. `model_class: fast | standard` is resolved at
+  materialization into a concrete `default_model` per `provider.module`
+  (anthropic: `claude-haiku-4-5-20251001` / `claude-sonnet-4-6`; openai:
+  `gpt-5.6-luna` / `gpt-5.6-terra`) and never reaches the engine as a key —
+  model ids rotate, tiers don't, so a fleet-wide model change stops being a
+  fleet-wide edit. An explicit `default_model` still wins, the resolved config
+  records WHICH decided (`model_source`: `"model_class:fast"` vs
+  `"default_model"`), and a shadowed `model_class` produces a warning rather
+  than a silent drop. `reasoning_effort: minimal | low | medium | high | xhigh`
+  is amplifier-agent's own field, forwarded untouched but validated at load so
+  a typo is an authoring-time refusal instead of a mid-turn provider error.
+  A model deny-list (default `["gpt-5.6-sol"]`) is checked at LOAD against the
+  RESOLVED model: a denied automation is refused through the ordinary
+  config-lint path (named by `drumbeat doctor` and every scheduler tick) and
+  therefore never runs at all. Both tables are overridable per workspace via a
+  new registered top-level key in `agent-config.yaml` — `models:` with the
+  closed sub-vocabulary `classes | deny` (`classes:` merges per provider module
+  and tier; `deny:` replaces wholesale). Contract
+  (`contracts/automation-file.v1.md`), docs, example, and skill amended in the
+  same change; proven by a RED→GREEN suite
+  (`tests/test_model_class_policy.py`, 20 tests).
 - **`priority:` — a dispatch tier for automations that come due together.**
   Optional top-level frontmatter key with the closed vocabulary
   `high | normal` (absent = `normal`). Among DUE automations, `high` is

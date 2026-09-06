@@ -452,12 +452,21 @@ A turn that names **no** profile uses the `default:` layer. An **unknown**
 profile name is refused loud, listing the profiles you defined — never a silent
 fallback to the wrong provider/model.
 
-drumbeat does **not** resolve models itself and keeps no model registry. The
-`default_model` you name is forwarded verbatim into amplifier-agent's own
+The `default_model` you name is forwarded verbatim into amplifier-agent's own
 host-config field `provider.config.default_model`, carried in the host config
 each turn is handed — the same mechanism the engine itself uses to pick a
 per-provider model. drumbeat picks *which* config per turn; amplifier-agent
-still does the model resolution. A malformed `agent-config.yaml`, an unknown top-level key in a
+still does the model resolution.
+
+The one exception is the `model_class: fast | standard` shorthand: drumbeat
+resolves *that* into a concrete `default_model` per `provider.module` from a
+small tier table before materializing the config (overridable in this file's
+`models.classes:` block), and refuses any resolved model on the `models.deny:`
+list. It is a lookup for the id you would otherwise have typed — the resolved
+model still travels in amplifier-agent's own field, and there is still no second
+model-resolution mechanism. See docs/AUTOMATIONS.md §10.
+
+A malformed `agent-config.yaml`, an unknown top-level key in a
 profile, or a credential inside one is a loud refusal that names the file and the
 profile — never a silent wrong-model turn.
 

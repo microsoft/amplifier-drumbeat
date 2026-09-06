@@ -41,7 +41,7 @@ from typing import Any
 
 import yaml
 
-from drumbeat import agent_config
+from drumbeat import agent_config, paths
 from drumbeat.error_log import log_automation_error
 
 # "urgent-only": same auto-notify judgment turn and NOTHING_TO_REPORT
@@ -574,8 +574,15 @@ def _parse_inject(path: Path, raw: object) -> tuple[InjectSpec, ...]:
     return tuple(specs)
 
 
-def load(path: Path) -> Automation:
+def load(path: Path, *, policy: agent_config.ModelPolicy | None = None) -> Automation:
     """Parse and validate a single automation file.
+
+    ``policy`` is the workspace model policy (model_class table + deny-list) the
+    ``agent_config:`` block is validated against; ``None`` uses the engine
+    defaults. The batch loaders below derive it once from the workspace and pass
+    it down, so a per-workspace override is honored at LOAD time -- a denied
+    model must be refused before the automation is ever schedulable, not at the
+    moment its first run tries to start.
 
     Raises:
         AutomationError: if the file is missing, malformed, or fails
@@ -587,10 +594,23 @@ def load(path: Path) -> Automation:
         raise AutomationError(path, "file not found")
 
     text = path.read_text(encoding="utf-8")
-    return load_from_text(path, text)
+    return load_from_text(path, text, policy=policy)
 
 
-def load_all(directory: Path) -> list[Automation]:
+def _workspace_model_policy(directory: Path) -> agent_config.ModelPolicy:
+    """The model policy for the workspace owning an ``automations/`` directory.
+
+    Derived with ``paths.workspace_for_automations_dir`` (never ``resolve()``d --
+    an ``automations/`` symlinked into a policy repo must still resolve its
+    workspace-relative policy file, see that helper's docstring).
+    """
+    workspace = paths.workspace_for_automations_dir(directory)
+    return agent_config.load_model_policy(workspace)
+
+
+def load_all(
+    directory: Path, *, policy: agent_config.ModelPolicy | None = None
+) -> list[Automation]:
     """Parse and validate every ``*.md`` automation file in a directory.
 
     Files are processed in sorted (deterministic) order. A single malformed
@@ -606,9 +626,22 @@ def load_all(directory: Path) -> list[Automation]:
     if not directory.is_dir():
         raise AutomationError(directory, "automations directory not found")
 
+    if policy is None:
+        try:
+            policy = _workspace_model_policy(directory)
+        except agent_config.AgentConfigError as exc:
+            # One-shot, fail-loud caller: a broken model policy means we cannot
+            # say which models are allowed, so refuse the whole load rather than
+            # validate every automation against a policy nobody chose.
+            raise AutomationError(
+                paths.workspace_for_automations_dir(directory)
+                / agent_config.WORKSPACE_CONFIG_FILENAME,
+                str(exc),
+            ) from exc
+
     automations = []
     for md_path in sorted(directory.glob("*.md")):
-        automations.append(load(md_path))
+        automations.append(load(md_path, policy=policy))
     return automations
 
 
@@ -626,7 +659,7 @@ class AutomationLoadFailure:
 
 
 def load_all_tolerant(
-    directory: Path,
+    directory: Path, *, policy: agent_config.ModelPolicy | None = None
 ) -> tuple[list[Automation], list[AutomationLoadFailure]]:
     """Parse every ``*.md`` automation file in a directory, isolating failures.
 
@@ -674,10 +707,32 @@ def load_all_tolerant(
 
     automations: list[Automation] = []
     failures: list[AutomationLoadFailure] = []
+
+    if policy is None:
+        try:
+            policy = _workspace_model_policy(directory)
+        except agent_config.AgentConfigError as exc:
+            # A broken workspace model policy is reported like any other load
+            # failure (named on every scheduler tick and by `doctor`) rather
+            # than raised -- the tolerant loader exists so one broken file
+            # cannot stop the fleet, and the policy file is one more such file.
+            # Per-file validation then falls back to the ENGINE defaults, which
+            # is safe precisely because it is not the last gate: the resolver
+            # re-reads this same file at run time and refuses the run loudly, so
+            # nothing can quietly execute under a policy nobody chose.
+            failures.append(
+                AutomationLoadFailure(
+                    path=paths.workspace_for_automations_dir(directory)
+                    / agent_config.WORKSPACE_CONFIG_FILENAME,
+                    problem=str(exc),
+                )
+            )
+            policy = agent_config.DEFAULT_MODEL_POLICY
+
     by_slug: dict[str, Path] = {}
     for md_path in sorted(directory.glob("*.md")):
         try:
-            parsed = load(md_path)
+            parsed = load(md_path, policy=policy)
         except AutomationError as exc:
             failures.append(AutomationLoadFailure(path=md_path, problem=exc.problem))
             continue
@@ -735,12 +790,15 @@ def load_by_slug(slug: str, directory: Path) -> Automation:
     )
 
 
-def load_from_text(path: Path, text: str) -> Automation:
+def load_from_text(
+    path: Path, text: str, *, policy: agent_config.ModelPolicy | None = None
+) -> Automation:
     """Parse and validate automation content already in memory.
 
     Shares every validation rule with ``load()`` (which just reads the
     file first) -- used by the management API to validate incoming edits
-    before they touch disk.
+    before they touch disk. ``policy`` is the workspace model policy the
+    ``agent_config:`` block is validated against (``None`` = engine defaults).
     """
     data, body = _split_frontmatter(path, text)
 
@@ -833,7 +891,7 @@ def load_from_text(path: Path, text: str) -> Automation:
     else:
         try:
             agent_config_value = agent_config.validate_config_layer(
-                agent_config_raw, source="automation.agent_config"
+                agent_config_raw, source="automation.agent_config", policy=policy
             )
         except agent_config.AgentConfigError as exc:
             raise AutomationError(path, str(exc)) from exc
