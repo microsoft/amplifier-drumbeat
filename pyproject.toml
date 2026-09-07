@@ -2,22 +2,23 @@
 name = "drumbeat"
 version = "0.1.0"
 description = "An automation engine for long-running agent sessions: scheduler, markdown automation format, runner, pinned-session lifecycle, inject: turns, pre-run gate, run artifacts, and the durable delivery-intent outbox."
-# amplifier-agent (an unpinned dependency below) requires >=3.12, and the
-# engine is validated and run on 3.13 -- so the floor is 3.13, matching the
-# README Prerequisites. Was >=3.11, which could not resolve the agent dep.
+# amplifier-agent (the git dependency below) requires >=3.12, and the engine is
+# validated and run on 3.13 -- so the floor is 3.13, matching the README
+# Prerequisites.
 requires-python = ">=3.13"
 dependencies = [
     "pyyaml>=6.0",
-    # amplifier-agent SHIPS THE ENGINE LIBRARY every turn imports (VISION §3):
-    # the isolated per-turn worker (drumbeat.agent_worker) imports
-    # amplifier_agent_lib + amplifier_agent_cli directly -- no CLI subprocess,
-    # no argv contract, no stream parsing. It is NOT on PyPI, so the git URL is
-    # the mechanism; and it is deliberately UNPINNED (floating main) to keep
-    # taking rapid upstream improvements -- the owner accepts the breakage risk
-    # that carries. Declaring it here is what makes a single
+    # amplifier-agent IS the agent library every turn imports (VISION §3,
+    # contracts/agent-binding.v1.md): the isolated per-turn worker
+    # (drumbeat.agent_worker) imports `amplifier_agent` directly -- no CLI, no
+    # argv contract, no stream parsing. It is NOT on PyPI and the distribution
+    # lives in a SUBDIRECTORY of its repository, so the full git URL is the
+    # mechanism and a bare `amplifier-agent` requirement will not resolve.
+    # Pinned to the `v1` line, which is the contracted surface this engine is
+    # built against. Declaring it here is what makes a single
     # `uv tool install git+<drumbeat repo>` install the library into the same
     # environment, where the worker imports it under `sys.executable`.
-    "amplifier-agent @ git+https://github.com/microsoft/amplifier-agent",
+    "amplifier-agent @ git+https://github.com/microsoft/amplifier-agent@v1#subdirectory=packages/python",
 ]
 
 [project.scripts]

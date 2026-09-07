@@ -32,9 +32,10 @@ module — including the long-lived `serve`/scheduler process — stays free of 
 library's process-global state can never outlive a turn.
 
 Conformance: `python -c "import drumbeat.agent_worker"` in an environment with no
-agent CLI on `PATH` succeeds, and
-`grep -rE "amplifier_agent_lib|amplifier_agent_cli|amplifier_agent_home" src tests docs contracts README.md`
-returns zero lines.
+agent CLI on `PATH` succeeds, and a repository-wide grep for any of the retired
+module names (the `_lib`, `_cli` and `_home` namespaces the previous library
+shipped) returns zero lines outside `CHANGELOG.md`, which is the only place the
+move is narrated.
 
 ### 2. One agent, one session, one turn, per OS process
 
