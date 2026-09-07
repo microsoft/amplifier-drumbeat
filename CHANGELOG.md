@@ -2,6 +2,61 @@
 
 ## Unreleased
 
+### Added
+
+- **A tool result is bounded before it enters the conversation, and a provider
+  input-size refusal now rotates the pinned session.** Both halves of the
+  2026-09-07 incident, contract-first in
+  `contracts/agent-binding.v1.md` sections 10 and 11.
+
+  **What happened.** A single 46,464,072-byte tool result entered
+  `teams-check`'s pinned session. A tool result is transcript, not display, so
+  every later turn re-sent it in full and OpenAI refused the request
+  (`invalid_request_error` / `string_above_max_length: input[37].output >
+  10,485,760`). Three things then failed at once: the run reported only the
+  library's lossy `provider_failed` while the real code sat unread in the
+  worker's `stderr.log`; the pin was never rotated, because
+  `detect_ceiling_hit` matched one provider's *prose* form and this arrived as
+  a structured *code*; and the pre-emptive token gate could not help, because a
+  refused turn records no usage for it to measure. The identical run failed
+  again four hours later on the same session. Manual `rotate-session` was the
+  only remedy.
+
+  **The ceiling.** Every tool result drumbeat's own process produces is now
+  truncated at `$DRUMBEAT_TOOL_RESULT_CEILING_BYTES` (default 262144, per
+  automation via the new `agent_config.tool_result_ceiling_bytes` key), with a
+  mandatory note naming what was dropped and the file holding the whole thing
+  (`<run dir>/tool-output/<call-id>.txt`). Under the ceiling nothing changes.
+  An unwritable run directory loses the overflow but still truncates: never
+  fail open.
+
+  **What the ceiling does NOT reach, measured rather than assumed.** The agent
+  library gives a caller no way to bound a *built-in* or *MCP* tool result. A
+  caller tool named `bash` is refused at construction by `1.0.0a1`
+  (`AgentError(code='invalid_input', message='Duplicate tool name: bash.')`),
+  `AgentOptions` is a closed list with no tool-filtering field, and an
+  approvals `deny` is terminal so it cannot steer either. drumbeat therefore
+  registers one caller tool, `run_command` — same arguments as the built-in
+  `bash`, result bounded — and states the preference in
+  `AgentOptions.instructions`. That steering is **advisory and says so**; the
+  gap and its upstream ask are recorded in the contract, and
+  `tests/test_v1_tool_shadowing.py` drives the real library so the claim cannot
+  rot.
+
+  **The backstop.** Because the advisory half can be ignored, a provider
+  input-size refusal is now its own rotation trigger. A failed run whose stderr
+  carries `context_length_exceeded`, `string_above_max_length`,
+  `request_too_large`, or the `prompt is too long: N tokens > M maximum` prose
+  form records `run_completed.error_details` naming the provider code, and
+  rotates the pin through the same single path every other trigger uses — so a
+  poisoned session self-heals on the next run instead of failing forever. The
+  §9 token gate is unchanged; this covers the case the gate structurally cannot
+  see.
+
+  **Also new on the run record:** `error_details` — the machine-readable cause
+  beside `error`'s human sentence. `null`, never `{}`, when nothing was
+  established.
+
 ### Changed
 
 - **The engine runs on `amplifier-agent` `v1` (`amplifier_agent`) — a clean cut,

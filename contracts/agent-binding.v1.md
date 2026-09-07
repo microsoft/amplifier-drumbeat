@@ -58,9 +58,10 @@ Then `create_session(SessionOptions(session_id=…, persistence="durable"))` for
 turn, or `resume_session(session_id)` for a continuing one, and
 `session.start_turn(TurnInput(content=[TextPart(prompt)]))`.
 
-drumbeat registers **no caller tools**. The agent's built-in tool surface plus the
-workspace's pack-augmented `PATH` (`docs/ARCHITECTURE.md` §4) is the whole capability
-surface, so there is no drumbeat-side tool vocabulary to keep in sync.
+drumbeat registers exactly **one caller tool**, `run_command` (§10) — a shell tool whose
+result is bounded before it enters the conversation. Everything else the model can reach
+is the agent's built-in tool surface plus the workspace's pack-augmented `PATH`
+(`docs/ARCHITECTURE.md` §4), so the drumbeat-side tool vocabulary is one name long.
 
 ### 3. `provider.module` is a provider **id**
 
@@ -222,7 +223,131 @@ the measurement changed, and it changed to a **stronger** one: the byte-era prox
 3.4× in bytes-per-token between two measured sessions, while this is the count the
 provider itself returned.
 
+### 10. A tool result is bounded before it enters the conversation
+
+A tool result is not a transient display artifact: it is appended to the session
+transcript and **re-sent, in full, on every subsequent turn**. One oversized result
+therefore poisons the session permanently. Measured on the originating deployment
+(2026-09-07): a single m365 tool result of **46,464,072 bytes** entered `teams-check`'s
+pinned session, after which OpenAI refused every later request
+(`invalid_request_error` / `string_above_max_length: input[37].output > 10,485,760`).
+The identical run failed again 4 hours later on the same pinned session. Manual
+`drumbeat rotate-session` was the only remedy.
+
+The library does not bound this for us. Measured on `amplifier-agent 1.0.0a1`, the
+built-in `bash` tool **deliberately disables truncation** — its `CapturedBash`
+subclass overrides `_truncate_output` to return the output unchanged
+(`packages/engine/src/amplifier_agent_engine/_engine/builtin_tools.py`) — and the
+library never compacts (§9).
+
+So drumbeat bounds every result it owns:
+
+- **Ceiling.** `$DRUMBEAT_TOOL_RESULT_CEILING_BYTES`, default **262144** (256 KiB),
+  overridable per automation by `agent_config.tool_result_ceiling_bytes`
+  (`contracts/automation-file.v1.md`). A non-positive value is refused at load; `0`
+  is not "unlimited" and there is no unlimited.
+- **Truncation is by BYTES, on a UTF-8 character boundary.** The first `N` bytes are
+  kept; a partial multi-byte sequence at the cut is dropped rather than emitted
+  broken.
+- **The note is mandatory and has exactly this shape**, appended after the kept bytes:
+
+  ```
+  \n[drumbeat: output truncated -- kept <kept> of <total> bytes; full output: <path>]
+  ```
+
+  A truncated result that did not say so would be a lie the model then reasons from.
+- **The full output lands in the run directory**, at
+  `<run dir>/tool-output/<call-id>.txt`, written before the truncated result is
+  returned. The `call_id` is the library's own correlation id from `ToolContext`, so
+  the transcript's note and the file on disk name the same call. If the write fails,
+  the note says so (`full output: unavailable -- <reason>`) and the result is still
+  truncated: an unwritable run directory must never be the reason a 46 MB result
+  reaches the provider.
+- **Under the ceiling, nothing changes.** A result at or below the ceiling is returned
+  byte-identical, with no note and no file written.
+
+**Which results this covers, measured — not assumed.** The ceiling reaches exactly the
+tool results drumbeat's own process produces, and `v1` gives it no way to reach the
+others:
+
+| source | executor | bounded by this contract |
+| --- | --- | --- |
+| `caller` (`run_command`) | drumbeat's own handler | **yes** |
+| `built-in` (`bash`, `read_file`, …) | the library, in-process | **no — see below** |
+| `mcp` | a third process the library connects | **no — see below** |
+
+A caller tool named `bash` **cannot** shadow or replace the built-in. Measured
+directly against `1.0.0a1`:
+
+```
+AgentError(code='invalid_input',
+           message='Duplicate tool name: bash.',
+           remedy='Give caller and MCP tools names distinct from the built-in tools.')
+```
+
+`prepare_tools` registers caller tools first and then the built-ins into the same flat
+registry, and `ToolRegistry.add` refuses a duplicate name at construction — so the
+`bash` name is reserved, and the same is true of `read_file`. Nor can the built-in be
+disabled: `AgentOptions` is a closed list (`docs/concepts/agents.md`: "That list is
+closed") with no tool-filtering field, `docs/configuration.md` closes the host-config
+file to five keys, and the engine's `allowed_tools` filter is delegation-internal and
+not caller-settable. An approvals handler cannot stand in for one either — a `deny`
+is **terminal** (`approval_denied`, `docs/concepts/approvals.md`), so denying a
+built-in `bash` call kills the turn rather than steering it.
+
+drumbeat therefore does the two things it actually can, and claims nothing more:
+
+1. registers `run_command` — same contract as the built-in `bash` (one `command`
+   string, optional `timeout` 1–120 s defaulting to 30, run under the turn's own cwd
+   and pack-augmented environment) with the ceiling applied to its result;
+2. states the preference in `AgentOptions.instructions`, verbatim: shell work goes
+   through `run_command`, because `bash` results are unbounded.
+
+(2) is **advisory and known to be advisory**. A model that calls the built-in `bash`
+anyway, or an MCP server that returns 46 MB, is still unbounded — which is precisely
+why §11 exists and is not optional. The upstream ask (a caller-supplied ceiling, or
+replaceable built-ins) is recorded under "Known gap".
+
+### 11. A provider input-size refusal rotates the pinned session
+
+§9's pre-emptive token gate reads `steps[].tokens_in` from the previous run. A run the
+provider **refuses outright records no usage at all**, so the gate never sees the
+growth — measured: `teams-check` failed on the same pinned session twice, four hours
+apart, and the gate did not fire either time. A refusal is therefore its own rotation
+trigger, on the same single path §9 and Trigger 1 use.
+
+A run's captured stderr matches an input-size refusal when it carries any of:
+
+```
+context_length_exceeded          string_above_max_length          request_too_large
+prompt is too long: <N> tokens > <M> maximum
+```
+
+The first three are provider error codes matched on a strict word boundary; the fourth
+is the OpenAI/Anthropic prose form already used by Trigger 1. On a match, and only when
+the run failed:
+
+- `run_completed.error_details` names the real cause —
+  `{"provider_code": "<the matched code>", "source": "stderr"}`, plus
+  `prompt_tokens`/`limit_tokens` when the prose form supplied them. This closes the
+  measured gap where the library surfaced only the lossy `provider_failed` while the
+  structured code sat in the worker's `stderr.log`. `error_details` is `null` on every
+  run that matched nothing — honestly absent, never `{}`.
+- The pinned session is rotated through `_auto_rotate`, so the rotation lands in
+  `runs/session_rotations.jsonl` **and** as a `session_rotated` engine event whose
+  `reason` names the provider code.
+
+The record is written **before** the rotation, so the evidence outlives it.
+
 ## Known gap (recorded, not worked around)
+
+**A built-in or MCP tool result cannot be bounded.** §10 records the measurement: the
+built-in tool names are reserved (a caller `bash` is refused at construction), there is
+no documented way to disable or filter a built-in, and MCP results are read by the
+library from a third process. drumbeat can bound only its own caller tools. The
+upstream ask is a caller-settable per-result ceiling — or replaceable built-ins — and
+until one exists, §11 is the containment: an unbounded result still poisons a session,
+but the session now self-heals on the next run instead of failing forever.
 
 **Raw request/response capture has no v1 equivalent.** The library exposes turn events,
 not wire payloads. There is no drumbeat-side substitute short of monkey-patching a
@@ -240,12 +365,49 @@ provider-level forensic question cannot be answered from a run's artifacts.
 - `tests/test_session_pins.py` — `agent_session_id()` translation, verbatim
   pass-through, collision resistance.
 - `tests/test_preemptive_size_rotation.py` — the token gate.
+- `tests/test_tool_ceiling.py` — §10's mechanism: the ceiling applied, the note's exact
+  shape, the full-output file, byte-boundary safety, an under-ceiling result returned
+  untouched, an unwritable run dir still truncating, and the per-automation override.
+- `tests/test_input_size_refusal.py` — §11: each provider code and the prose form
+  detected, a non-refusal failure left alone, `error_details` on the run record and the
+  `run_completed` event, and the `session_rotated` event naming the code.
+- `tests/test_v1_tool_shadowing.py` — the §10 measurement, kept green rather than
+  remembered: a caller tool named `bash` is refused at construction by the REAL library
+  with `Duplicate tool name`, and a distinctly-named one is accepted.
 - `tests/test_soft_launch_gates.py` — the preflight imports `amplifier_agent` for real.
 - The clean-container proof: a stock container with no Amplifier anywhere installs
   drumbeat, runs one automation end to end on a real provider, and destroys.
 
 ## Changelog
 
+- **2026-09-07** — Sections **10** and **11** added, and §2 amended: drumbeat now
+  registers exactly one caller tool. Evidence that promoted this out of "backlogged":
+  a production incident on the `v1` line. A single 46,464,072-byte m365 tool result
+  entered `teams-check`'s pinned session; every later turn re-sent it, OpenAI refused
+  with `string_above_max_length`, and the identical run failed again on the same pinned
+  session four hours later. Nothing in the engine caught it: the library surfaced only
+  the lossy `provider_failed` (the structured code was in the worker's `stderr.log`),
+  and §9's pre-emptive gate could not fire because a refused turn records no usage to
+  measure. Manual `rotate-session` was the only remedy.
+  Two changes, and one measured refusal recorded rather than worked around:
+  - **§10, the ceiling.** Every tool result drumbeat's own process produces is bounded
+    to `$DRUMBEAT_TOOL_RESULT_CEILING_BYTES` (default 262144, per-automation override
+    `agent_config.tool_result_ceiling_bytes`) before it enters the conversation, with a
+    mandatory truncation note and the full output written to
+    `<run dir>/tool-output/<call-id>.txt`.
+  - **§10's boundary, measured.** A caller tool named `bash` is REFUSED at construction
+    by `1.0.0a1` (`Duplicate tool name: bash.`), there is no documented way to disable
+    a built-in, and an approvals `deny` is terminal — so built-in and MCP results stay
+    unbounded. Recorded under "Known gap" with the upstream ask, and covered by a test
+    against the real library so the claim cannot rot. drumbeat registers `run_command`
+    and states the preference in `AgentOptions.instructions`, which is advisory and
+    says so.
+  - **§11, rotate on refusal.** A provider input-size refusal in a failed run's stderr
+    (`context_length_exceeded`, `string_above_max_length`, `request_too_large`, or the
+    `prompt is too long: N tokens > M maximum` prose form) now names the provider code
+    in `run_completed.error_details` and rotates the pinned session through the same
+    single path every other trigger uses. §9's gate is unchanged; this is the backstop
+    for the case the gate structurally cannot see.
 - **2026-09-06** — v1 drafted. drumbeat adopts `amplifier-agent` `v1`
   (`amplifier_agent`, dist `amplifier-agent 1.0.0a1`) as its only agent library. Clean
   cut, no shim, no dual-read: the previous embedding surface is deleted rather than

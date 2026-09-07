@@ -57,6 +57,8 @@ import sys
 from pathlib import Path
 from typing import Any, TextIO
 
+from drumbeat import tool_ceiling
+
 # The stdout line that carries the ONE terminal result. Distinct top-level key
 # so the parent never confuses it with a display event (which carries "method").
 RESULT_ENVELOPE_KEY = "drumbeat_result"
@@ -269,6 +271,82 @@ async def _preflight() -> int:
     return 0
 
 
+def _caller_tools(spec: dict[str, Any]) -> list[Any]:
+    """drumbeat's own tools, whose results are bounded before they are sent.
+
+    contracts/agent-binding.v1.md section 10. Exactly one tool, ``run_command``
+    -- a shell tool with the built-in ``bash`` tool's arguments and the ceiling
+    applied to its result.
+
+    WHY NOT JUST NAME IT ``bash``: because the library refuses that. Measured
+    against ``amplifier-agent 1.0.0a1``, a caller tool named ``bash`` fails at
+    ``create_agent`` with ``AgentError(code='invalid_input', message='Duplicate
+    tool name: bash.')`` -- caller tools and built-ins share one flat registry
+    and a duplicate is refused at construction. The built-in cannot be disabled
+    either (``AgentOptions`` is a closed list with no tool filter), so this tool
+    ADDS a bounded path rather than replacing an unbounded one, and
+    ``AgentOptions.instructions`` states the preference. That steering is
+    advisory, which is exactly why the rotate-on-refusal backstop (section 11)
+    is not optional.
+    """
+    from amplifier_agent import Tool
+
+    cwd = spec.get("cwd") or os.getcwd()
+    run_dir = spec.get("run_dir")
+    limit = tool_ceiling.ceiling_bytes(spec.get("tool_result_ceiling_bytes"))
+
+    async def run_command_handler(arguments: dict[str, Any], context: Any) -> str:
+        command = arguments.get("command")
+        if not isinstance(command, str) or not command.strip():
+            # ToolFailed, not a crash: a malformed call is the model's mistake
+            # to see and correct within the turn, not the run's to die on.
+            from amplifier_agent import ToolFailed
+
+            raise ToolFailed("`command` must be a non-empty string.")
+        timeout_s = tool_ceiling.coerce_timeout(arguments.get("timeout"))
+        text, _ = await asyncio.to_thread(
+            tool_ceiling.run_command,
+            command,
+            cwd=cwd,
+            env=dict(os.environ),
+            timeout_s=timeout_s,
+        )
+        bounded = tool_ceiling.apply_ceiling(
+            text,
+            limit_bytes=limit,
+            call_id=getattr(context, "call_id", "") or "call",
+            output_dir=run_dir,
+        )
+        return bounded.text
+
+    return [
+        Tool(
+            name=tool_ceiling.TOOL_NAME,
+            description=(
+                "Execute a shell command and wait for its result. Same arguments "
+                "as the built-in `bash` tool, but the result is bounded: output "
+                "over the ceiling is truncated with a note naming the file that "
+                "holds the whole thing. Prefer this over `bash`."
+            ),
+            input_schema={
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "command": {"type": "string", "minLength": 1},
+                    "timeout": {
+                        "type": "integer",
+                        "minimum": tool_ceiling.MIN_TIMEOUT_S,
+                        "maximum": tool_ceiling.MAX_TIMEOUT_S,
+                    },
+                },
+                "required": ["command"],
+            },
+            handler=run_command_handler,
+        )
+    ]
+
+
 async def _run_turn(spec: dict[str, Any], out: TextIO) -> None:
     """Assemble the embedding surface and run exactly one turn."""
     from amplifier_agent import (
@@ -300,6 +378,11 @@ async def _run_turn(spec: dict[str, Any], out: TextIO) -> None:
         skills=skills or None,
         mcp_servers=_mcp_servers(spec),
         storage=str(storage),
+        # The ONE caller tool (section 10) and the advisory preference that
+        # points the model at it. ``instructions`` is appended after the
+        # agent's own, so this steers without displacing anything.
+        tools=_caller_tools(spec),
+        instructions=tool_ceiling.TOOL_PREFERENCE_INSTRUCTIONS,
         # Unattended by construction: there is no human to ask, and the library
         # fails a turn loudly rather than proceeding when no policy is set.
         approvals="allow",
