@@ -2,32 +2,78 @@
 
 ## Unreleased
 
+### Changed
+
+- **The engine runs on `amplifier-agent` `v1` (`amplifier_agent`) — a clean cut,
+  no shim.** This is the migration note; the rest of the repository is written
+  as though it has always been this way, which is why this file is the only
+  place the move appears.
+
+  **What was replaced.** The previous embedding surface — the
+  `amplifier_agent_lib` / `amplifier_agent_cli` / `amplifier_agent_home`
+  namespace, bundle preparation and caching, provider enumeration and
+  injection, the turn-handler/`Engine`/`boot`/`submit_turn` assembly, and the
+  `$AMPLIFIER_AGENT_HOME` session tree with its per-session
+  `transcript.jsonl` — is gone. `v1` ships exactly one public module,
+  `amplifier_agent`, and every one of drumbeat's six previous imports is a
+  `ModuleNotFoundError` against it, so there was no partial move available:
+  either the whole surface moves or nothing runs. The seam is now frozen in
+  `contracts/agent-binding.v1.md`.
+
+  **Evidence that made the call.** A hands-on evaluation of the library on a
+  clean host and in a fresh container (`evidence/aa-v1-eval/` in the consumer
+  workspace): install in 5.9 s, no CLI on `PATH` before or after, no
+  `~/.amplifier`, no bundle cache, no `uv pip install` at run time, real
+  completions with fully populated usage and `Decimal` cost, durable sessions
+  resumed in a different process, and a clean typed error when no credential is
+  configured.
+
+  **What operators need to know.**
+  - The dependency is `amplifier-agent @
+    git+https://github.com/microsoft/amplifier-agent@v1#subdirectory=packages/python`.
+    A bare `amplifier-agent` requirement does not resolve: the distribution
+    lives in a subdirectory, and the repository's default branch builds a
+    structurally different package from the same tree.
+  - `agent_config:` narrows to `provider | mcp | skills`. `debug:` and
+    `providers:` are refused by name, as are unknown keys under `provider` and
+    `provider.config` (closed to `default_model | model_class |
+    reasoning_effort`). A config carrying any of them fails its automation at
+    LOAD, through the ordinary lint path, rather than at run time.
+  - `provider.module` carries a provider **id** (`openai`, `anthropic`, …).
+  - `$DRUMBEAT_SESSION_ROTATE_BYTES` is replaced by
+    `$DRUMBEAT_SESSION_ROTATE_TOKENS` (default 150,000). The pre-emptive
+    rotation gate measures prompt tokens, which is the unit a provider actually
+    refuses on.
+  - Sessions live at `<data-dir>/agent-storage/<session-id>/`, inside the
+    workspace. Nothing is read from `~/.amplifier-agent`. The first run of each
+    pinned session after this change rotates once, because the recorded
+    provider identity changes — which is the correct verdict: the provider
+    stack underneath those conversations changed wholesale.
+
+  **What v1 cannot do yet, recorded rather than worked around.** Raw provider
+  request/response capture (the retired `debug.rawLlmPayloads`) has no
+  equivalent: the library exposes turn events, not wire payloads. There is no
+  host-side substitute short of monkey-patching a provider module, which this
+  engine will not do. The upstream ask is filed with the library's authors
+  (`evidence/aa-v1-eval/REPORT-for-amplifier-agent-devs.md` §2, M5), along with
+  asks for reasoning effort as a first-class option (M1) and a
+  context-pressure signal (M4).
+
 ### Fixed
 
-- **`recency-check` could never run: a new per-automation `prompt_caching`
-  toggle routes around an upstream provider bug.** Since the step-grammar
-  refactor, every `recency-check` run exited 1 with the upstream Anthropic
-  provider rejecting the request —
-  `messages.N.content.0.thinking.cache_control: Extra inputs are not permitted`.
-  Root cause is UPSTREAM in `amplifier-agent` (not this repo): its provider
-  stamps a `cache_control` breakpoint onto a `thinking` content block, which
-  Anthropic forbids. It only bites an automation whose FINAL assistant turn is
-  thinking-only (a thinking block with no sibling text block) —
-  `recency-check` is the only one, because it writes solely to the recency
-  store and emits no final text reply. Every other automation ends with a
-  written summary and never trips it. The `Automation` dataclass gains an
-  optional `prompt_caching: bool` frontmatter field (default `true` — the whole
-  fleet is unchanged); when `false`, `runner.run`/`_run_body` materialize a
-  minimal host config carrying `provider.config.enable_prompt_caching: false`
-  and hand it to every turn as that turn's host config
-  (`_automation_host_config_path`).
-  This makes real `recency-check` runs succeed without changing anything the
-  pass observes or records. The durable fix belongs upstream (guard `thinking`
-  blocks in `amplifier_module_provider_anthropic._stamps_empty_text_block` /
-  `_stamp_last_block`); remove the frontmatter opt-out once it lands. Proven by
-  an offline reproduction against the installed provider (bug present with
-  caching on, gone with `enable_prompt_caching=false`) and a RED→GREEN suite
-  (`tests/test_recency_prompt_caching.py`).
+- **A turn with no working brain was recorded as a success.** Two rules now fail
+  such a run, both of them drumbeat's own:
+  1. a non-empty `module_failures` (session init dropped a provider/tool/hook and
+     the turn ran with a reduced module set) sets `failed: true`, and the error
+     names the modules. Measured: 96 of 96 runs in one morning carried a
+     module-load failure on stderr while every one of them recorded
+     `"failed": false, "error": null`. Visibility that nothing acts on is not
+     visibility;
+  2. a reply that is itself a statement of provider unavailability fails the run.
+     Measured: 34 runs between 20:30Z and 23:44Z recorded `failed: false` while
+     their reply was the engine reporting it had no provider. The match is
+     anchored, never a substring search, so an automation that legitimately
+     quotes the phrase while reporting on its own fleet is not failed.
 
 ### Added
 
@@ -42,8 +88,9 @@
   records WHICH decided (`model_source`: `"model_class:fast"` vs
   `"default_model"`), and a shadowed `model_class` produces a warning rather
   than a silent drop. `reasoning_effort: minimal | low | medium | high | xhigh`
-  is amplifier-agent's own field, forwarded untouched but validated at load so
-  a typo is an authoring-time refusal instead of a mid-turn provider error.
+  is validated at load so a typo is an authoring-time refusal instead of a
+  mid-turn provider error, and is materialized into the host config the turn's
+  worker reads (see the `v1` entry above for the exact shape).
   A model deny-list (default `["gpt-5.6-sol"]`) is checked at LOAD against the
   RESOLVED model: a denied automation is refused through the ordinary
   config-lint path (named by `drumbeat doctor` and every scheduler tick) and

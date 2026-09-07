@@ -1646,11 +1646,12 @@ class _TurnOutcome:
     stderr_text: str = ""
     # Session-init module degradation (see ``_detect_module_load_failures``):
     # ``"<type>:<module_id>"`` entries for every provider/tool/hook this turn's
-    # engine reported (via its own WARNING log line) as failing to load/validate
-    # during boot. NEVER implies the turn itself failed -- amplifier-core keeps
-    # booting with a reduced module set, and the turn can still produce a real
-    # reply. Empty for every turn whose worker stderr carried no such line,
-    # which is every ordinary turn today.
+    # session init reported (via its own WARNING log line) as failing to
+    # load/validate during boot. A non-empty tuple FAILS the turn
+    # (``_dead_brain_error``): the reply, if any, was produced without whatever
+    # those modules provide, so it did not do the job the automation asked for.
+    # Empty for every turn whose worker stderr carried no such line, which is
+    # every ordinary turn.
     module_failures: tuple[str, ...] = ()
 
 

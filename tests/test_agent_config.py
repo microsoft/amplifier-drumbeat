@@ -467,35 +467,50 @@ def test_automation_agent_config_non_mapping_is_a_loud_refusal() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_enable_prompt_caching_via_agent_config_threads_to_materialized_config() -> (
-    None
-):
-    """The direct path that replaces the retired ``prompt_caching`` sugar: an
-    automation setting ``provider.config.enable_prompt_caching: false`` in its
-    OWN ``agent_config:`` block resolves to a materialized host config carrying
-    exactly that -- proving the opt-out still reaches ``--config`` on every turn
-    through the ordinary merge, with no special-case alias in the resolver."""
+def test_provider_config_vocabulary_is_closed_at_authoring_time() -> None:
+    """A provider knob the agent library does not read is refused AT LOAD, by
+    name, with the vocabulary shown.
+
+    Exactly three things reach the library from a config file -- a provider id,
+    a model, and request parameters -- so a fourth key here would validate, land
+    in the materialized bytes, and be read by nothing. That is the "enabled,
+    validated, inert" shape this module exists to prevent, and it is worse than
+    a typo: an author who writes an endpoint here has every reason to believe
+    the turn is pointed somewhere it is not.
+    """
     block = (
         "  agent_config:\n"
         "    provider:\n"
+        "      module: openai\n"
         "      config:\n"
-        "        enable_prompt_caching: false\n"
+        "        base_url: http://192.168.1.7:8081/v1\n"
     )
-    automation = load_from_text(Path("d.md"), _auto(block))
-    assert automation.agent_config == {
-        "provider": {"config": {"enable_prompt_caching": False}}
-    }
-    with tempfile.TemporaryDirectory() as tmp:
-        resolved = agent_config.resolve(
-            runs_dir=Path(tmp),
-            slug=automation.slug,
-            workspace=Path(tmp),
-            automation_config=automation.agent_config,
-            env={},
+    with pytest.raises(AutomationError) as exc:
+        load_from_text(Path("d.md"), _auto(block))
+    problem = exc.value.problem
+    assert "base_url" in problem
+    assert "provider.config" in problem
+    # The remedy names WHERE an endpoint actually belongs.
+    assert "ENVIRONMENT" in problem
+
+
+def test_provider_block_vocabulary_is_closed_too() -> None:
+    with pytest.raises(AgentConfigError) as exc:
+        agent_config.validate_config_layer(
+            {"provider": {"module": "openai", "bundle": "x"}}, source="x"
         )
-        assert resolved.path is not None
-        cfg = json.loads(resolved.path.read_text(encoding="utf-8"))
-        assert cfg["provider"]["config"]["enable_prompt_caching"] is False
+    assert "bundle" in str(exc.value)
+
+
+def test_the_three_provider_config_keys_are_accepted() -> None:
+    """Negative control: closing the vocabulary must not close it too far."""
+    layer = {
+        "provider": {
+            "module": "openai",
+            "config": {"default_model": "gpt-5.6-luna", "reasoning_effort": "low"},
+        }
+    }
+    assert agent_config.validate_config_layer(dict(layer), source="x") == layer
 
 
 def test_retired_prompt_caching_key_is_refused_loudly() -> None:

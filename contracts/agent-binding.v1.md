@@ -70,9 +70,16 @@ is passed as `AgentOptions.provider` unchanged. It is not a dotted module path, 
 filesystem path, and drumbeat never enumerates, injects, or mounts a provider: the
 library ships every provider in-process.
 
-Credentials are **environment-only**, never config. drumbeat refuses a
+`provider` is closed to `module | config`, and `provider.config` to
+`default_model | model_class | reasoning_effort` — exactly what §4 projects onto the
+library. A fourth key there would validate, be materialized, and be read by nothing,
+so it is refused at load naming the vocabulary.
+
+Credentials **and endpoints** are environment-only, never config. drumbeat refuses a
 credential-bearing key at any depth of any config layer
-(`agent_config._CREDENTIAL_KEYS`) and the library has no field to accept one.
+(`agent_config._CREDENTIAL_KEYS`) and the library has no field to accept one; an
+endpoint (`base_url`) is refused by the closed vocabulary above, because an author
+who writes one has every reason to believe the turn is pointed somewhere it is not.
 
 A provider whose credential is absent fails at `create_agent` with the library's own
 `AgentError(code="engine_unavailable")`. That is a **run failure** (§8), reported with

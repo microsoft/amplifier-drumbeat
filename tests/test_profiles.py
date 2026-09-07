@@ -180,14 +180,20 @@ def test_resolve_turn_without_profile_or_default_threads_no_config(
 def test_profile_less_turn_uses_default_layer(tmp_path: Path) -> None:
     _write_agent_config(
         tmp_path,
-        "default:\n  provider:\n    config:\n      enable_prompt_caching: true\n",
+        "default:\n"
+        "  provider:\n"
+        "    module: anthropic\n"
+        "    config:\n"
+        "      model_class: standard\n",
     )
     resolved = agent_config.resolve_turn(
         runs_dir=tmp_path / "runs", workspace=tmp_path, key="t-2", profile=None, env={}
     )
     assert resolved.path is not None
     written = json.loads(resolved.path.read_text(encoding="utf-8"))
-    assert written["provider"]["config"]["enable_prompt_caching"] is True
+    assert written["provider"]["config"]["default_model"] == (
+        agent_config.MODEL_CLASS_TABLE["anthropic"]["standard"]
+    )
 
 
 def test_resolve_turn_materializes_profile_provider_model(tmp_path: Path) -> None:
@@ -237,21 +243,19 @@ def test_profile_overlays_the_default_layer(tmp_path: Path) -> None:
     assert written["provider"]["config"]["default_model"] == QUICK_MODEL
 
 
-def test_local_provider_profile_reaches_a_local_endpoint(tmp_path: Path) -> None:
-    # A profile can point a turn at a LOCAL, OpenAI-compatible box: provider
-    # openai + a base_url folded into provider.config. The API key still comes
-    # from the environment, never the file.
+def test_local_provider_profile_selects_the_local_provider(tmp_path: Path) -> None:
+    # A profile can point a turn at a LOCAL box by naming the provider id and
+    # the model it serves. The ENDPOINT and the credential are both environment
+    # concerns -- an endpoint written here would be validated, materialized, and
+    # read by nothing, which is why the vocabulary refuses it.
     _write_agent_config(
         tmp_path,
         "profiles:\n"
         "  local:\n"
         "    provider:\n"
-        "      module: openai\n"
+        "      module: ollama\n"
         "      config:\n"
-        f"        default_model: {LOCAL_MODEL}\n"
-        f"        base_url: {LOCAL_BASE_URL}\n"
-        "        use_streaming: false\n"
-        "        max_tokens: 512\n",
+        f"        default_model: {LOCAL_MODEL}\n",
     )
     resolved = agent_config.resolve_turn(
         runs_dir=tmp_path / "runs",
@@ -263,17 +267,35 @@ def test_local_provider_profile_reaches_a_local_endpoint(tmp_path: Path) -> None
     assert resolved.path is not None
     written = json.loads(resolved.path.read_text(encoding="utf-8"))
     assert written == {
-        "provider": {
-            "module": "openai",
-            "config": {
-                "default_model": LOCAL_MODEL,
-                "base_url": LOCAL_BASE_URL,
-                "use_streaming": False,
-                "max_tokens": 512,
-            },
-        }
+        "provider": {"module": "ollama", "config": {"default_model": LOCAL_MODEL}}
     }
-    assert resolved.provider_module == "openai"
+    assert resolved.provider_module == "ollama"
+
+    # And it reaches the library as a provider id + a model, nothing else.
+    assert resolved.host_config_path is not None
+    host = json.loads(resolved.host_config_path.read_text(encoding="utf-8"))
+    assert host == {"provider": "ollama", "model": LOCAL_MODEL}
+
+
+def test_an_endpoint_in_a_profile_is_refused_not_shipped_inert(tmp_path: Path) -> None:
+    _write_agent_config(
+        tmp_path,
+        "profiles:\n"
+        "  local:\n"
+        "    provider:\n"
+        "      module: ollama\n"
+        "      config:\n"
+        f"        base_url: {LOCAL_BASE_URL}\n",
+    )
+    with pytest.raises(agent_config.AgentConfigError) as exc:
+        agent_config.resolve_turn(
+            runs_dir=tmp_path / "runs",
+            workspace=tmp_path,
+            key="t-5b",
+            profile="local",
+            env={},
+        )
+    assert "base_url" in str(exc.value)
 
 
 def test_resolve_turn_reraises_for_unknown_profile(tmp_path: Path) -> None:

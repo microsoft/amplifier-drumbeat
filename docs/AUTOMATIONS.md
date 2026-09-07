@@ -72,7 +72,7 @@ it never takes down the other automations' schedules.
 | `conversation` | no (default `continuous`) | `continuous` · `fresh` · `daily` — how the conversation persists across runs; see §2.1 |
 | `guidance_delivery` | no (default `reference`) | `reference` · `inline` — how required guidance FILES reach the agent; see §5 |
 | `priority` | no (default `normal`) | `high` · `normal` — dispatch order among automations due at the same tick; see §2.3 |
-| `agent_config` | no | Mapping: a per-automation host-config overlay (provider, model, MCP, skills, debug); see §10 |
+| `agent_config` | no | Mapping: a per-automation agent-config overlay (provider, model, effort, MCP, skills); see §10 |
 
 This vocabulary is **closed** (contract rule 2): every key above is registered,
 and an unknown or retired top-level key is refused loudly with a remedy at parse
@@ -131,7 +131,7 @@ use: the pin is cleared, one line is written to
 `<data-dir>/session_rotations.jsonl`, and a `session_rotated` event is emitted.
 So `drumbeat sessions` and the rotation log read the same whether a session was
 rotated by a ceiling hit, by a steps rewrite, or by a `fresh`/`daily`
-boundary. Rotation never deletes a transcript — it leaves the old one on disk
+boundary. Rotation never deletes anything — it leaves the old session's storage
 untouched and starts the next run clean.
 
 **Choosing:**
@@ -614,35 +614,48 @@ into guidance and shrink the steps back to concerns.
 
 ---
 
-## 10. `agent_config:` — per-automation host config
+## 10. `agent_config:` — per-automation agent config
 
-Every turn is handed ONE host config — the authoritative source for provider
-selection, model, MCP servers, skills, and debug knobs the engine runs under.
+Every turn runs under ONE resolved agent config — the authoritative source for
+provider selection, model, reasoning effort, MCP servers, and skills.
 `agent_config:` is how an automation shapes that config for its own turns
 without touching any other automation.
 
 ```yaml
 agent_config:
   provider:
-    module: openai            # provider short-name; omit to keep the bundle default
+    module: openai            # provider ID; omit to keep the library's default
     config:
       model_class: fast       # fast | standard -- resolved to a concrete model
       reasoning_effort: high  # minimal | low | medium | high | xhigh
-      base_url: http://192.168.1.7:8081/v1
 ```
 
-You never write the host config by hand. The engine resolves ONE per turn by
+`provider.module` carries a provider **ID** — `openai`, `anthropic`,
+`azure-openai`, `gemini`, `ollama`, `vllm`, `github-copilot` — handed to the
+agent library unchanged. It is not a module path and not a filesystem path: the
+library ships every provider in-process, and drumbeat never enumerates, injects,
+or mounts one.
+
+You never write the resolved config by hand. The engine resolves ONE per turn by
 merging up to three layers, **lowest precedence first**, and materializes the
 result under the data dir:
 
-1. **`$AMPLIFIER_AGENT_CONFIG`** — an operator's own debug/host config file, if
-   that variable is set, folded in as the BASE. (The host config a turn is
-   handed outranks the environment, so folding it in is what keeps that
-   variable from being silently defeated.)
-2. **`agent-config.yaml` `default:`** — the workspace baseline for every
+1. **`agent-config.yaml` `default:`** — the workspace baseline for every
    automation here (see below).
+2. **a named `profile`** — used by interactive/API turns (see the last section
+   of this chapter); a scheduled run passes none.
 3. **this automation's `agent_config:`** — the block above, the highest
    precedence layer.
+
+An operator's own `$AMPLIFIER_AGENT_CONFIG` file is **not** one of those layers.
+It belongs to the agent library and speaks the library's own five-key host-config
+vocabulary (`provider · model · storage · workspace · extra_request_params`),
+not this one. It is folded in as the **base** of the host config drumbeat derives
+and hands the turn, where the two speak the same language: drumbeat's
+per-automation policy wins key by key, and an operator's unrelated
+`extra_request_params` survive untouched. Overriding it wholesale would silently
+defeat an operator who set it, which is exactly the failure this seam is built to
+avoid.
 
 Merge rules are deliberately boring so you can predict the result:
 
@@ -690,7 +703,7 @@ Rules worth knowing, all fail-loud:
 
 - The class is resolved **at materialization**, against the `provider.module`
   the *merged* config selects. `model_class` is a **drumbeat** key, not an
-  amplifier-agent field: it is resolved away and never reaches the engine.
+  agent-library field: it is resolved away and never reaches the library.
 - A `model_class` with **no `provider.module`** anywhere in the merge cannot be
   resolved (a tier is a tier *within* a provider) and is refused, naming the
   known modules. So is an unknown module, and so is a class outside
@@ -737,24 +750,67 @@ fail there.
 
 ### `reasoning_effort`
 
-`provider.config.reasoning_effort` is amplifier-agent's own field, forwarded
-**untouched**. Drumbeat only validates the value at load against
-`minimal | low | medium | high | xhigh`, so a typo is an authoring-time refusal
-naming the set rather than a mid-turn provider error.
+`provider.config.reasoning_effort` takes one of
+`minimal | low | medium | high | xhigh`; a value outside that set is an
+authoring-time refusal naming the set, rather than a mid-turn provider error.
+
+Effort reaches a provider request through exactly one channel: the per-turn
+host-config file the engine materializes and points the turn's worker at with
+`$AMPLIFIER_AGENT_CONFIG`. There, it is written as
+`extra_request_params.<provider-id>.reasoning.effort` — the library keys request
+parameters **by provider**, which is why an effort declared with **no
+`provider.module`** to scope it under is refused at load: written unscoped it
+would validate and then do nothing.
+
+### `skills:` and `mcp:`
+
+Both are top-level blocks beside `provider:`, and both are handed to the library
+**in code** rather than through the host-config file (its vocabulary has no key
+for either):
+
+```yaml
+agent_config:
+  skills:
+    - skills                  # directory of skill subdirectories; relative to the workspace
+  mcp:
+    my-server:                # server name -> settings
+      transport: stdio        # transport | command | args | env | url | headers
+      command: my-mcp-server
+      args: ["--flag"]
+```
+
+`skills:` is a list of directory paths, each holding skill subdirectories;
+relative entries resolve against the workspace. `mcp:` is a mapping of server
+name to `{transport, command?, args?, env?, url?, headers?}` — the inner
+vocabulary is closed, and an unknown key inside a server entry is refused naming
+it.
 
 ### What's allowed, and what is refused loudly
 
-The top-level vocabulary is **closed** to
-`provider · providers · mcp · skills · debug`. Anything else is refused at parse
-time — including `approval` (the engine always runs `-y`, so an approval block
-is a silent no-op) and `allowProtocolSkew`.
+The top-level vocabulary is **closed** to `provider · mcp · skills`. Anything
+else is refused at parse time, and four names are refused *by name*, each with
+its own reason:
+
+- **`debug`** — raw provider request/response capture has no equivalent in the
+  agent library, which exposes turn events rather than wire payloads. There is
+  nothing behind the key, so it is refused rather than accepted and ignored. See
+  the "Known gap" section of
+  [`../contracts/agent-binding.v1.md`](../contracts/agent-binding.v1.md): a
+  provider-level forensic question cannot be answered from a run's artifacts,
+  and the ask is recorded upstream rather than worked around here.
+- **`providers`** — the library ships every provider in-process and selects
+  exactly one by id, so a provider *catalog* selects nothing. Name the one
+  provider under `provider.module`.
+- **`approval`** — the engine runs unattended, so an approval block is a silent
+  no-op.
+- **`allowProtocolSkew`** — not an automation-tunable knob.
 
 **Credentials are refused anywhere in the block** — any `api_key` / `apiKey` /
 `token` / `secret` / `authorization` key, at any depth, fails loud and names the
 full path (e.g. `provider.config.api_key`). Credentials belong in the engine's
-**environment**, never a config file: a committed value would leak, and
-amplifier-agent re-asserts credentials from the environment and ignores the file
-anyway. This is the one rule worth memorizing.
+**environment**, never a config file: a committed value would leak, and the
+agent library takes credentials from the environment only — it has no field a
+config file could set. This is the one rule worth memorizing.
 
 A malformed `agent_config:` block does not take the fleet down: it is reported
 as a load failure (named on every scheduler tick and by `drumbeat doctor`) while
@@ -762,39 +818,22 @@ every other automation keeps running.
 
 ### Provider changes rotate the pinned session automatically
 
-Each automation resumes one conversation across runs (§2). That transcript is
-built under one **provider module**. If your config later selects a *different*
-provider module, the engine **rotates the pin automatically** — abandons the old
-conversation (logged, with a reason) and starts fresh — because a transcript
-carries provider-specific state (thinking-block signatures, cache breakpoints,
-tokenization) the new provider can reject outright. This is built in and not
-configurable; it is the same "leave the sediment, re-seed durable state, start
-fresh" move a contract change or a context-ceiling hit already makes. Changing
-only the *model* (same provider) does **not** rotate.
-
-### Disabling provider prompt caching
-
-To turn provider prompt caching off for an automation's turns, set it directly
-in the `agent_config:` block:
-
-```yaml
-automation:
-  # ...
-  agent_config:
-    provider:
-      config:
-        enable_prompt_caching: false
-```
-
-`provider.config.enable_prompt_caching` is amplifier-agent's own host-config
-field, forwarded verbatim in the host config — drumbeat does not interpret it.
-There is no separate shorthand for it.
+Each automation resumes one conversation across runs (§2). That conversation is
+built under one **provider id**. If your config later selects a *different*
+provider, the engine **rotates the pin automatically** — abandons the old
+conversation (logged, with a reason) and starts fresh — because a resumed
+conversation carries provider-specific state (thinking-block signatures, cache
+breakpoints, tokenization) the new provider can reject outright. This is built in
+and not configurable; it is the same "leave the sediment, re-seed durable state,
+start fresh" move a contract change or a context-ceiling hit already makes.
+Changing only the *model* (same provider) does **not** rotate.
 
 ### Nothing set? Nothing changes
 
-An automation with no `agent_config:`, no workspace `agent-config.yaml`, and no
-`$AMPLIFIER_AGENT_CONFIG` runs with **no host config at all** — every turn runs
-on the engine's own defaults. The materialized config's path
+An automation with no `agent_config:` and no workspace `agent-config.yaml` runs
+with **no drumbeat-side policy at all** — every turn runs on the library's own
+defaults (and on an operator's `$AMPLIFIER_AGENT_CONFIG` file, if one is set,
+unchanged). The materialized config's path
 and sha256 are recorded in each run's
 `result.json` (`effective_config_path` / `effective_config_sha`), so a run can
 always be tied back to the exact policy it executed under; both are `null` when
@@ -808,20 +847,20 @@ no config was handed down.
 naming every module that failed to load or failed its own validation while
 this run's session was booting. Empty for the overwhelming majority of runs.
 
-This is **visibility, not a verdict**: a non-empty `module_failures` does
-**not** mean `failed: true`. Booting the engine tolerates a provider, tool,
-or hook that fails to load — it keeps going with a reduced module set, and
-the run can still produce a real, useful reply (just without whatever that
-module would have provided; a tool that failed to load, for instance, means
-that run had no way to call it). Whether that degradation matters for a
-given automation is a call only the automation's own author or a consuming
-watcher can make — the engine records what happened and lets you decide.
+**A non-empty `module_failures` means `failed: true`**, and the run's `error`
+names the modules that did not load. Booting a session tolerates a provider,
+tool, or hook that fails to load — the library keeps going with a reduced
+module set and the turn can still emit text — but a turn that answered without
+the modules it was configured to have did not run on the engine you asked for,
+and the record says so rather than reporting a success with a footnote.
 Measured on a real deployment, 2026-08-28: 96 of 96 runs in one morning
 carried the same module-load warning on stderr while every run's own record
-read `"failed": false, "error": null`; this field is what makes that
-degradation visible on the record itself, not just recoverable by grepping
-`stderr.log`. See `docs/ARCHITECTURE.md` §4 ("Session-init module failures
-are visible, not fatal") for the mechanism.
+read `"failed": false, "error": null`. This field is what makes that
+degradation visible on the record itself, and the verdict is what makes it
+count. See `docs/ARCHITECTURE.md` §4 ("A turn with no working brain is a
+failure") for the mechanism — including the companion rule, that a reply which
+is *itself* a statement of provider unavailability fails the run (anchored at
+the start of the reply, so an automation quoting the phrase is unaffected).
 
 A run that instead hits a genuinely **unhandled** exception during session
 init is unaffected by any of this — it still records `failed: true` with the
@@ -833,10 +872,10 @@ real exception text in `error`, the same as any other turn failure.
 An interactive turn submitted via `POST /api/turns` — either a fresh turn naming
 `automation_slug` (e.g. a manual-trigger, chat-style automation's first message)
 or a reply that names an existing `session_id` — is resolved by a **separate,
-narrower function** (`agent_config.resolve_turn`) that merges only three layers:
-`$AMPLIFIER_AGENT_CONFIG`, the workspace `agent-config.yaml` `default:` block,
-and the request's own `profile:` (looked up in that same file's `profiles:`
-block). **It has no `automation_config` parameter at all, so an `agent_config:`
+narrower function** (`agent_config.resolve_turn`) that merges only two layers:
+the workspace `agent-config.yaml` `default:` block, and the request's own
+`profile:` (looked up in that same file's `profiles:` block). **It has no
+`automation_config` parameter at all, so an `agent_config:`
 block written into that automation's frontmatter is silently inert for every
 interactive/API turn against it** — including every turn a `trigger: manual`
 automation ever runs, since such an automation is *never* invoked any other way.

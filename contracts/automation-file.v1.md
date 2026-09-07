@@ -116,8 +116,15 @@ against it · the worked example. Status stays DRAFT and says why until then.
   - **`providers:` (the plural catalog) is retired.** It described a set of providers to
     mount; the library ships every provider in-process and selects exactly one by id, so
     a catalog selects nothing. `provider.module` is the single provider knob.
-  - **`skills:` and `mcp:` are unchanged in authoring shape** and are now passed to the
-    library in code rather than through the config file, which has no key for either.
+  - **`skills:` and `mcp:` keep their authoring shape** and are passed to the library
+    in code rather than through the config file, which has no key for either.
+  - **`provider` narrows to `module | config`, and `provider.config` to
+    `default_model | model_class | reasoning_effort`.** Exactly three things reach the
+    library from a config file — a provider id, a model, and request parameters — so a
+    fourth key here would validate, land in the materialized bytes, and be read by
+    nothing. An endpoint (`base_url`) is the worst case: an author who writes one has
+    every reason to believe the turn is pointed somewhere it is not. Endpoints and
+    credentials are ENVIRONMENT concerns, and the refusal says so.
   Contract amended in the SAME change as the code, tests, and docs. Schema reference:
   docs/AUTOMATIONS.md §10; seam reference: contracts/agent-binding.v1.md.
 - **2026-09-06** — The `agent_config:` block's `provider.config` gained two

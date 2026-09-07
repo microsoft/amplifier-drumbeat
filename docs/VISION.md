@@ -77,14 +77,27 @@ judgment — all owner-supplied. Anything consumer-shaped in the engine is a lea
   amended with that evidence.
 - **Compatibility shims.** Format changes are clean cuts with migration notes,
   not dual-reads. Old keys are refused, not quietly honored.
-- **Pinning its agent dependency.** drumbeat tracks amplifier-agent main and
-  accepts the breakage risk deliberately; breakage is worked when it lands, not
-  deferred behind a pin.
+- **Deferring agent-library breakage behind a version pin.** drumbeat names the
+  agent library's contracted LINE, not a commit, and works breakage when it
+  lands rather than freezing on a known-good revision. A pin that names a line
+  is a statement about which contract this engine is built against; a pin that
+  names a commit is a way of not looking.
 - **Status creep in this file.** What shipped lives in the tracker and the
   changelog of releases, never here.
 
 ## Changelog
 
+- **2026-09-06** — §"what this deliberately resists" amended: the agent
+  dependency names the library's contracted LINE rather than tracking a moving
+  default branch. Evidence that forced it, and why it is not the pin this
+  section refuses: the library's `v1` line and its default branch are
+  structurally DIFFERENT distributions built from the same repository — one at
+  the repository root, one under `packages/python` — so an unqualified
+  requirement does not resolve to a newer version of the same thing, it
+  resolves to a different package with a different public module. A requirement
+  that cannot name which of the two it means is not "tracking main", it is
+  unspecified. The posture this section defends is unchanged: the line is
+  tracked, breakage on it is worked when it lands, and no commit is frozen.
 - **2026-08-27** — §3 amended: turn invocation moves from the subprocess SDK to
   the agent's engine library, imported in an isolated per-turn worker process.
   Evidence: amplifier-agent v0.17.0 leads its integration story with the
