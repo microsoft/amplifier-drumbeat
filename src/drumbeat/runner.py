@@ -230,6 +230,14 @@ class StepResult:
     # above. A decimal STRING, not a float, so monetary precision survives being
     # persisted to the run record verbatim (``_persist_run``).
     cost_usd: str | None = None
+    # The provider and model that ACTUALLY served this turn, taken from the
+    # agent library's own usage entries rather than from the config drumbeat
+    # handed it. Recorded because "what was configured" and "what answered" are
+    # different facts, and a run record that only carries the first cannot
+    # answer the question anyone actually asks of it afterwards. ``None`` when
+    # no usage was reported -- honestly absent, same discipline as the counters.
+    provider: str | None = None
+    model: str | None = None
     # ADDITIVE (decomposition step 5; see docs/ARCHITECTURE.md): a machine-readable
     # classification of WHY this turn failed, for the one decision that
     # genuinely depends on it -- "is it safe to resend the user's text
@@ -1642,6 +1650,12 @@ class _TurnOutcome:
     tokens_in: int | None = None
     tokens_out: int | None = None
     cost_usd: str | None = None
+    # WHO served this turn, from the library's own usage entries -- the provider
+    # and model that actually answered, which is not necessarily what was asked
+    # for (a model ceiling can be refined down per turn). ``None`` when the
+    # library reported no usage to read them from.
+    provider: str | None = None
+    model: str | None = None
     duration_ms: int = 0
     stderr_text: str = ""
     # Session-init module degradation (see ``_detect_module_load_failures``):
@@ -2025,6 +2039,10 @@ def _submit_turn(
     tok_in = tok_in if isinstance(tok_in, int) else None
     tok_out = tok_out if isinstance(tok_out, int) else None
     cost = cost if isinstance(cost, str) and cost else None
+    served_provider = terminal.get("provider")
+    served_model = terminal.get("model")
+    served_provider = served_provider if isinstance(served_provider, str) and served_provider else None
+    served_model = served_model if isinstance(served_model, str) and served_model else None
 
     if terminal.get("ok"):
         reply = terminal.get("reply")
@@ -2034,6 +2052,8 @@ def _submit_turn(
             tokens_in=tok_in,
             tokens_out=tok_out,
             cost_usd=cost,
+            provider=served_provider,
+            model=served_model,
             duration_ms=duration_ms,
             stderr_text=stderr_text,
             module_failures=module_failures,
@@ -2052,6 +2072,8 @@ def _submit_turn(
         tokens_in=tok_in,
         tokens_out=tok_out,
         cost_usd=cost,
+        provider=served_provider,
+        model=served_model,
         duration_ms=duration_ms,
         stderr_text=stderr_text,
         module_failures=module_failures,
@@ -2515,6 +2537,8 @@ def _execute_turn(
             tokens_in=outcome.tokens_in,
             tokens_out=outcome.tokens_out,
             cost_usd=outcome.cost_usd,
+            provider=outcome.provider,
+            model=outcome.model,
             module_failures=outcome.module_failures,
         ),
         outcome.stderr_text,
@@ -5253,6 +5277,8 @@ def _persist_run(
                     "tokens_in": step.tokens_in,
                     "tokens_out": step.tokens_out,
                     "cost_usd": step.cost_usd,
+                    "provider": step.provider,
+                    "model": step.model,
                     "module_failures": step.module_failures,
                 }
                 for step in result.steps
