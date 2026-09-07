@@ -308,6 +308,14 @@ anyway, or an MCP server that returns 46 MB, is still unbounded — which is pre
 why §11 exists and is not optional. The upstream ask (a caller-supplied ceiling, or
 replaceable built-ins) is recorded under "Known gap".
 
+Measured once, on a real provider in a clean container, with a prompt naming no tool
+("Run this shell command and tell me how many characters it printed"): the model chose
+`run_command` unprompted, the 20 MB result was bounded, the run succeeded at 5,309
+prompt tokens, and it still answered correctly — reading the count off the truncation
+note's own byte figures, which is why the note carries them. **One observation is not
+a guarantee**, and nothing here is entitled to claim one; it is evidence the steering
+is worth having, not evidence it can be relied on.
+
 ### 11. A provider input-size refusal rotates the pinned session
 
 §9's pre-emptive token gate reads `steps[].tokens_in` from the previous run. A run the
@@ -377,6 +385,16 @@ provider-level forensic question cannot be answered from a run's artifacts.
 - `tests/test_soft_launch_gates.py` — the preflight imports `amplifier_agent` for real.
 - The clean-container proof: a stock container with no Amplifier anywhere installs
   drumbeat, runs one automation end to end on a real provider, and destroys.
+- §10/§11's clean-container proof, on a real provider (evidence:
+  `.amplifier/evaluation/drumbeat-m0j/20260907T155544Z/` in the consumer workspace).
+  **Positive** (ceiling on, a step emitting 20,000,022 bytes): run succeeded, the
+  conversation carried 286,720 bytes of agent storage, the last turn sent
+  **5,359 prompt tokens**, the full output sat at
+  `<run dir>/tool-output/call_….txt`, and the model read the truncation note back
+  verbatim. **Negative** (same automation, ceiling raised above the payload — the
+  pre-change engine): the provider refused with `string_above_max_length`, `error`
+  carried only the library's misleading "check provider credentials" sentence,
+  `error_details` named the real code, and the pin was rotated exactly once.
 
 ## Changelog
 
