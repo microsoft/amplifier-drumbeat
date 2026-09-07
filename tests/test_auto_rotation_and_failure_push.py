@@ -54,7 +54,7 @@ from unittest import mock
 
 from drumbeat import engine_events, runner, session_pins
 from drumbeat.automation import load
-from drumbeat.paths import derive_workspace_slug
+from drumbeat.paths import agent_session_storage, derive_workspace_slug
 
 # The owner's own measured failure string (session_health.CEILING_RE match).
 CEILING_STDERR = "prompt is too long: 210347 tokens > 200000 maximum\n"
@@ -98,7 +98,6 @@ class _RunnerFixture(unittest.TestCase):
         self.runs_dir = self.tmp_path / "runs"
         self.runs_dir.mkdir()
 
-        self.agent_home = self.tmp_path / "agent-home"
 
         # Real inputs, not a mocked mechanism: AMPLIFIER_AGENT_HOME/
         # AMPLIFIER_AGENT_WORKSPACE are the exact two env overrides
@@ -109,7 +108,6 @@ class _RunnerFixture(unittest.TestCase):
         env_patch = mock.patch.dict(
             os.environ,
             {
-                "AMPLIFIER_AGENT_HOME": str(self.agent_home),
                 "AMPLIFIER_AGENT_WORKSPACE": "",
                 "CONTEXT_INTELLIGENCE_PERSONAL": "",
             },
@@ -144,16 +142,10 @@ class _RunnerFixture(unittest.TestCase):
             created_by=session_pins.CREATED_BY_RUN,
             runs_dir=self.runs_dir,
         )
-        session_dir = (
-            self.agent_home
-            / "state"
-            / "workspaces"
-            / self.workspace_slug
-            / "sessions"
-            / session_id
+        session_dir = agent_session_storage(
+            session_id, runs_dir=self.runs_dir
         )
         session_dir.mkdir(parents=True)
-        (session_dir / "transcript.jsonl").write_text("{}\n", encoding="utf-8")
 
     def _rotation_lines(self) -> list[dict]:
         path = self.runs_dir / "session_rotations.jsonl"

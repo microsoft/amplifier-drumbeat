@@ -82,7 +82,7 @@ def test_null_value_is_refused_naming_the_path() -> None:
 
 def test_null_inside_a_list_is_refused() -> None:
     with pytest.raises(AgentConfigError):
-        agent_config.validate_config_layer({"providers": [None]}, source="x")
+        agent_config.validate_config_layer({"skills": [None]}, source="x")
 
 
 # --------------------------------------------------------------------------- #
@@ -111,7 +111,7 @@ def test_credential_key_variants_refused_at_any_depth() -> None:
 def test_credential_inside_a_list_element_refused() -> None:
     with pytest.raises(AgentConfigError) as exc:
         agent_config.validate_config_layer(
-            {"providers": [{"config": {"token": "t"}}]}, source="x"
+            {"mcp": {"s": {"env": [{"token": "t"}]}}}, source="x"
         )
     assert "token" in str(exc.value)
 
@@ -140,8 +140,29 @@ def test_allow_protocol_skew_refused_by_name() -> None:
 
 
 def test_every_allowed_top_level_key_accepted() -> None:
-    data = {"provider": {}, "providers": [], "mcp": {}, "skills": {}, "debug": {}}
+    data = {"provider": {}, "mcp": {}, "skills": []}
     assert agent_config.validate_config_layer(dict(data), source="x") == data
+
+
+def test_debug_refused_by_name_with_the_reason() -> None:
+    """`debug:` had exactly one purpose -- raw provider payload capture -- and
+    the agent library exposes turn events rather than wire payloads. A key with
+    nothing behind it is refused, never accepted and ignored."""
+    with pytest.raises(AgentConfigError) as exc:
+        agent_config.validate_config_layer({"debug": {"verbose": True}}, source="x")
+    msg = str(exc.value)
+    assert "debug" in msg
+    assert "turn events" in msg
+
+
+def test_providers_catalog_refused_by_name_with_the_reason() -> None:
+    """The library ships every provider in-process and selects exactly one by
+    id, so a CATALOG selects nothing."""
+    with pytest.raises(AgentConfigError) as exc:
+        agent_config.validate_config_layer({"providers": []}, source="x")
+    msg = str(exc.value)
+    assert "providers" in msg
+    assert "provider.module" in msg
 
 
 # --------------------------------------------------------------------------- #
@@ -156,16 +177,16 @@ def test_effective_provider_module_reads_provider_module() -> None:
     )
 
 
-def test_effective_provider_module_defaults_to_bundle_sentinel() -> None:
+def test_effective_provider_module_defaults_to_library_sentinel() -> None:
     assert (
         agent_config.effective_provider_module(
             {"provider": {"config": {"default_model": "x"}}}
         )
-        == agent_config.BUNDLE_DEFAULT_PROVIDER
+        == agent_config.LIBRARY_DEFAULT_PROVIDER
     )
     assert (
         agent_config.effective_provider_module({})
-        == agent_config.BUNDLE_DEFAULT_PROVIDER
+        == agent_config.LIBRARY_DEFAULT_PROVIDER
     )
 
 
@@ -187,7 +208,7 @@ def test_resolve_empty_materializes_nothing() -> None:
         assert resolved.path is None
         assert resolved.sha is None
         assert resolved.config == {}
-        assert resolved.provider_module == agent_config.BUNDLE_DEFAULT_PROVIDER
+        assert resolved.provider_module == agent_config.LIBRARY_DEFAULT_PROVIDER
         assert not (root / "runs" / agent_config.MATERIALIZED_DIRNAME).exists()
 
 
@@ -224,27 +245,64 @@ def test_resolve_automation_overrides_workspace_default_and_records_sha() -> Non
 # --------------------------------------------------------------------------- #
 
 
-def test_env_base_layer_folds_in_and_is_overridden() -> None:
+def test_operator_host_config_folds_in_and_is_overridden() -> None:
+    """The operator's own $AMPLIFIER_AGENT_CONFIG is the BASE of the host
+    config, not a drumbeat layer -- it speaks the library's vocabulary. Its own
+    unrelated settings survive; drumbeat's per-automation policy wins."""
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        env_file = root / "operator.yaml"
+        env_file = root / "operator.json"
         env_file.write_text(
-            "debug:\n  verbose: true\n"
-            "provider:\n  config:\n    default_model: base-model\n",
+            json.dumps(
+                {
+                    "model": "base-model",
+                    "extra_request_params": {"openai": {"store": True}},
+                }
+            ),
             encoding="utf-8",
         )
         resolved = agent_config.resolve(
             runs_dir=root / "runs",
             slug="demo",
             workspace=root,
-            automation_config={"provider": {"config": {"default_model": "auto-model"}}},
+            automation_config={
+                "provider": {
+                    "module": "openai",
+                    "config": {
+                        "default_model": "auto-model",
+                        "reasoning_effort": "low",
+                    },
+                }
+            },
             env={agent_config.ENV_CONFIG_VAR: str(env_file)},
         )
-        # The operator's own key survives (this layer exists precisely so
-        # --config does not silently defeat an operator debug config)...
-        assert resolved.config["debug"] == {"verbose": True}
-        # ...but the automation, being higher precedence, wins the model.
-        assert resolved.config["provider"]["config"]["default_model"] == "auto-model"
+        assert resolved.host_config_path is not None
+        host = json.loads(resolved.host_config_path.read_text(encoding="utf-8"))
+        # The automation, being per-automation policy, wins the model...
+        assert host["model"] == "auto-model"
+        assert host["provider"] == "openai"
+        # ...but the operator's unrelated request setting is NOT clobbered, and
+        # the effort is merged in beside it under the same provider.
+        assert host["extra_request_params"]["openai"]["store"] is True
+        assert (
+            host["extra_request_params"]["openai"]["reasoning"]["effort"] == "low"
+        )
+
+
+def test_operator_host_config_key_outside_the_library_vocabulary_is_refused() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        env_file = root / "operator.json"
+        env_file.write_text(json.dumps({"bundle": "x"}), encoding="utf-8")
+        with pytest.raises(AgentConfigError) as exc:
+            agent_config.resolve(
+                runs_dir=root / "runs",
+                slug="demo",
+                workspace=root,
+                automation_config=None,
+                env={agent_config.ENV_CONFIG_VAR: str(env_file)},
+            )
+        assert "bundle" in str(exc.value)
 
 
 def test_env_config_pointing_at_a_missing_file_fails_loud() -> None:

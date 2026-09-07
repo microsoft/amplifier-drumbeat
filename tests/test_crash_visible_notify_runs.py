@@ -36,7 +36,7 @@ from unittest import mock
 
 from drumbeat import failed_passes, runner, session_pins
 from drumbeat.automation import load
-from drumbeat.paths import derive_workspace_slug
+from drumbeat.paths import agent_session_storage, derive_workspace_slug
 
 # The owner's own measured failure shape.
 CRASH_ERROR = "Execution failed: ContextLengthError: prompt is too long"
@@ -71,12 +71,10 @@ class _NotifyRunFixture(unittest.TestCase):
         self.runs_dir = self.tmp_path / "runs"
         self.runs_dir.mkdir()
 
-        self.agent_home = self.tmp_path / "agent-home"
 
         env_patch = mock.patch.dict(
             os.environ,
             {
-                "AMPLIFIER_AGENT_HOME": str(self.agent_home),
                 "AMPLIFIER_AGENT_WORKSPACE": "",
                 "CONTEXT_INTELLIGENCE_PERSONAL": "",
             },
@@ -94,24 +92,17 @@ class _NotifyRunFixture(unittest.TestCase):
 
     # ---- helpers -----------------------------------------------------
 
-    def _sessions_dir(self) -> Path:
-        return (
-            self.agent_home / "state" / "workspaces" / self.workspace_slug / "sessions"
-        )
-
     def _materialize_session(self, session_id: str) -> None:
         """Create the on-disk session a real turn would have left behind.
 
-        ``_submit_turn`` is mocked, so nothing actually writes the session
-        directory. Without this, the SECOND run's pinned-session probe reports
-        a workspace mismatch and aborts -- and every test here depends on a
-        real resumed second run, not an aborted one.
+        ``_submit_turn`` is mocked, so nothing actually writes the session's
+        agent storage. Without this, the SECOND run's pinned-session probe
+        reports MISSING -- and every test here depends on a real resumed second
+        run, not a freshly recreated one.
         """
-        session_dir = self._sessions_dir() / session_id
-        session_dir.mkdir(parents=True, exist_ok=True)
-        transcript = session_dir / "transcript.jsonl"
-        if not transcript.is_file():
-            transcript.write_text("{}\n", encoding="utf-8")
+        agent_session_storage(session_id, runs_dir=self.runs_dir).mkdir(
+            parents=True, exist_ok=True
+        )
 
     def _run(
         self, *, outcome: runner._TurnOutcome
@@ -410,16 +401,7 @@ class TestSurfaceSurvivesAnUnexpectedCrash(_NotifyRunFixture):
             created_by=session_pins.CREATED_BY_RUN,
             runs_dir=self.runs_dir,
         )
-        session_dir = (
-            self.agent_home
-            / "state"
-            / "workspaces"
-            / self.workspace_slug
-            / "sessions"
-            / "daily-rollup-preexisting"
-        )
-        session_dir.mkdir(parents=True)
-        (session_dir / "transcript.jsonl").write_text("{}\n", encoding="utf-8")
+        self._materialize_session("daily-rollup-preexisting")
 
         with (
             mock.patch.object(

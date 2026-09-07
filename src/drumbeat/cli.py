@@ -37,7 +37,6 @@ from drumbeat import (
     error_log,
     invalid_runs,
     packs,
-    paths,
     runner,
     session_health,
     session_pins,

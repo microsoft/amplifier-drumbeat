@@ -126,7 +126,7 @@ def _load_spec(args: argparse.Namespace) -> dict[str, Any]:
         raw = sys.stdin.read()
     spec = json.loads(raw)
     if not isinstance(spec, dict):
-        raise ValueError("task spec must be a JSON object")
+        raise TypeError("task spec must be a JSON object")
     return spec
 
 

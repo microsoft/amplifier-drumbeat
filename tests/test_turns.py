@@ -65,18 +65,11 @@ def ctx(tmp_path: Path) -> EngineContext:
 
 def _make_session(ctx: EngineContext, session_id: str) -> None:
     """Create the on-disk shape ``runner.probe_session`` calls EXISTS."""
-    from drumbeat.paths import amplifier_agent_home, derive_workspace_slug
+    from drumbeat.paths import agent_session_storage
 
-    session_dir = (
-        amplifier_agent_home()
-        / "state"
-        / "workspaces"
-        / derive_workspace_slug(ctx.cwd)
-        / "sessions"
-        / session_id
+    agent_session_storage(session_id, runs_dir=ctx.runs_dir).mkdir(
+        parents=True, exist_ok=True
     )
-    session_dir.mkdir(parents=True, exist_ok=True)
-    (session_dir / "transcript.jsonl").write_text("", encoding="utf-8")
 
 
 # ------------------------------------------------------- request shape ----

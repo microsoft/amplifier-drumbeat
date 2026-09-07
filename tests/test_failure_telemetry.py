@@ -141,12 +141,10 @@ class TestRunRecordsAreAtomic(unittest.TestCase):
         self.prompts_dir = self.workspace / "prompts"
         self.runs_dir = self.tmp_path / "runs"
         self.runs_dir.mkdir()
-        self.agent_home = self.tmp_path / "agent-home"
 
         env_patch = mock.patch.dict(
             os.environ,
             {
-                "AMPLIFIER_AGENT_HOME": str(self.agent_home),
                 "AMPLIFIER_AGENT_WORKSPACE": "",
                 "CONTEXT_INTELLIGENCE_PERSONAL": "",
             },

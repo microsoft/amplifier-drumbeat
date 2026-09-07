@@ -22,8 +22,13 @@ established fake seam every test in this suite uses -- see
 ``_TurnOutcome``'s own docstring), proving:
 
   1. The stderr pattern is parsed into deduped, sorted ``module_failures``.
-  2. A run that degrades but still replies is NOT marked failed -- the
-     honest minimum is visibility, not a manufactured failure.
+  2. A run that degrades IS marked failed, naming the modules that did not
+     load. Visibility alone was the original choice, and the measured
+     outcome of it was 96 of 96 runs carrying a module failure while every
+     one recorded success -- visibility nothing acts on is not visibility.
+     A turn that ran without whatever those modules provide did not do the
+     job the automation asked for, and must not read as one that did
+     (contracts/agent-binding.v1.md section 8).
   3. ``module_failures`` reaches ``StepResult``, ``RunResult``, the
      persisted ``result.json``, and the ``RUN_COMPLETED`` event.
   4. A genuinely failed run (a real error at session init) still gets
@@ -126,12 +131,10 @@ class _RunFixture(unittest.TestCase):
 
         self.runs_dir = self.tmp_path / "runs"
         self.runs_dir.mkdir()
-        self.agent_home = self.tmp_path / "agent-home"
 
         env_patch = mock.patch.dict(
             os.environ,
             {
-                "AMPLIFIER_AGENT_HOME": str(self.agent_home),
                 "AMPLIFIER_AGENT_WORKSPACE": "",
                 "CONTEXT_INTELLIGENCE_PERSONAL": "",
             },
@@ -157,14 +160,14 @@ class _RunFixture(unittest.TestCase):
             )
 
 
-class TestDegradedRunIsVisibleNotFailed(_RunFixture):
+class TestDegradedRunIsFailedAndNamed(_RunFixture):
     """A run whose init degraded (some module failed to load/validate) but
     still produced a real reply must NOT be marked ``failed`` -- the honest
     minimum is a visible ``module_failures`` field (see
     docs/AUTOMATIONS.md, "Session-init module failures").
     """
 
-    def test_module_failures_surfaces_without_flipping_failed(self) -> None:
+    def test_module_failures_fails_the_run_and_names_the_modules(self) -> None:
         self._write_automation(
             _STEP_AUTOMATION.format(name="Ledger Check"), "ledger-check.md"
         )
@@ -185,14 +188,17 @@ class TestDegradedRunIsVisibleNotFailed(_RunFixture):
             )
         )
 
-        self.assertFalse(result.failed)
-        self.assertIsNone(result.error)
+        self.assertTrue(result.failed)
+        # The verdict names the modules, so an operator reads WHAT was missing
+        # rather than a bare "failed".
+        assert result.steps[0].error is not None
+        self.assertIn("tool:tool-ledger-items", result.steps[0].error)
         self.assertEqual(result.module_failures, ("tool:tool-ledger-items",))
         self.assertEqual(result.steps[0].module_failures, ("tool:tool-ledger-items",))
 
         run_dir = self.runs_dir / self.automation.slug / result.run_id
         persisted = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
-        self.assertFalse(persisted["failed"])
+        self.assertTrue(persisted["failed"])
         self.assertEqual(persisted["module_failures"], ["tool:tool-ledger-items"])
 
     def test_clean_run_has_empty_module_failures(self) -> None:

@@ -28,7 +28,7 @@ from unittest import mock
 
 from drumbeat import agent_config, runner, session_health, session_pins
 from drumbeat.automation import load
-from drumbeat.paths import derive_workspace_slug
+from drumbeat.paths import agent_session_storage, derive_workspace_slug
 
 
 class _RunnerFixture(unittest.TestCase):
@@ -51,13 +51,11 @@ class _RunnerFixture(unittest.TestCase):
         self.runs_dir = self.tmp_path / "runs"
         self.runs_dir.mkdir()
 
-        self.agent_home = self.tmp_path / "agent-home"
         self.workspace_slug = derive_workspace_slug(self.workspace)
 
         env_patch = mock.patch.dict(
             os.environ,
             {
-                "AMPLIFIER_AGENT_HOME": str(self.agent_home),
                 "AMPLIFIER_AGENT_WORKSPACE": "",
                 "AMPLIFIER_AGENT_CONFIG": "",
                 "CONTEXT_INTELLIGENCE_PERSONAL": "",
@@ -88,16 +86,10 @@ class _RunnerFixture(unittest.TestCase):
             runs_dir=self.runs_dir,
             provider_module=provider,
         )
-        session_dir = (
-            self.agent_home
-            / "state"
-            / "workspaces"
-            / self.workspace_slug
-            / "sessions"
-            / session_id
+        session_dir = agent_session_storage(
+            session_id, runs_dir=self.runs_dir
         )
         session_dir.mkdir(parents=True)
-        (session_dir / "transcript.jsonl").write_text("{}\n", encoding="utf-8")
 
     def _run(self, *, outcome: runner._TurnOutcome) -> runner.RunResult:
         with (
