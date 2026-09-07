@@ -84,6 +84,42 @@ against it · the worked example. Status stays DRAFT and says why until then.
 
 ## Changelog
 
+- **2026-09-06** — `agent_config:` semantics pinned to the agent-library seam, which
+  now has its own contract: `contracts/agent-binding.v1.md`. The top-level
+  `agent_config:` vocabulary **narrows to `provider | mcp | skills`**; every closed
+  value vocabulary inside it stays closed. Two keys are retired **by name** — not
+  quietly accepted and ignored — because neither has anything behind it any more, and an
+  "enabled, validated, inert" knob is the exact fail-quietly shape this vocabulary
+  exists to prevent. What each surviving key now means on the wire:
+  - **`provider.module` is a provider ID** — `openai`, `anthropic`, `azure-openai`,
+    `gemini`, `ollama`, `vllm`, `github-copilot` — not a dotted module path. The agent
+    library ships every provider in-process, so there is nothing for an automation to
+    point at. An unknown id fails the turn with the library's own typed error and its
+    remedy verbatim, never a silent fallback to some other provider.
+  - **`provider.config.reasoning_effort` is materialized, not forwarded.** The library
+    accepts reasoning effort only through a config file, as
+    `extra_request_params.<provider-id>.reasoning.effort`, so drumbeat writes one file
+    per turn and points the turn's worker at it. The authoring key, its closed value
+    vocabulary (`minimal | low | medium | high | xhigh`), and its per-automation scope
+    are unchanged — a per-automation effort is exactly what a process-global file could
+    not express, which is why the file is per turn. Declaring an effort with no
+    `provider.module` to scope it under is refused at load: the library keys
+    `extra_request_params` by provider, so an unscoped effort would validate and do
+    nothing.
+  - **`provider.config.default_model` and `model_class` are unchanged**, including the
+    tier table, the deny-list, the shadowing warning, and the rule that `model_class` is
+    drumbeat's own shorthand and never reaches the library.
+  - **`debug:` is retired.** Its registered purpose was raw LLM request/response
+    capture, and the library exposes turn events rather than wire payloads — there is no
+    longer anything behind the key. The upstream ask is recorded in
+    `contracts/agent-binding.v1.md` ("Known gap") and `CHANGELOG.md`.
+  - **`providers:` (the plural catalog) is retired.** It described a set of providers to
+    mount; the library ships every provider in-process and selects exactly one by id, so
+    a catalog selects nothing. `provider.module` is the single provider knob.
+  - **`skills:` and `mcp:` are unchanged in authoring shape** and are now passed to the
+    library in code rather than through the config file, which has no key for either.
+  Contract amended in the SAME change as the code, tests, and docs. Schema reference:
+  docs/AUTOMATIONS.md §10; seam reference: contracts/agent-binding.v1.md.
 - **2026-09-06** — The `agent_config:` block's `provider.config` gained two
   CLOSED-vocabulary keys, and the resolved model gained a deny-list. The
   top-level `agent_config:` vocabulary is UNCHANGED (still
