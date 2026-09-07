@@ -136,20 +136,41 @@ Each step becomes one isolated worker process:
 
 ```
 python -m drumbeat.agent_worker      # task spec arrives on stdin as JSON:
-                                     #   {prompt, session_id, cwd, host_config_path, resume}
+                                     #   {prompt, session_id, agent_session_id,
+                                     #    turn_id, cwd, storage, provider, model,
+                                     #    skills, mcp, resume}
 ```
 
-The worker imports the agent's **engine library** and assembles its documented
-embedding surface — prepare the bundle, inject the provider, build the turn
-handler, boot the engine, submit the turn. Results come back over the worker's
-stdout: display events as NDJSON while the turn runs, then one terminal
-envelope carrying the reply and the engine's own token and cost counts.
+The worker imports the agent **library** — `amplifier_agent`, and this worker is
+the only module in the engine that imports it — and drives its entire embedding
+surface, which is four calls:
+
+1. `create_agent(AgentOptions(...))` — one agent;
+2. `agent.create_session(SessionOptions(session_id=…, persistence="durable"))`,
+   or `agent.resume_session(id)` for a continuing session;
+3. `session.start_turn(TurnInput(content=[TextPart(prompt)]))` — one turn;
+4. consume `turn.events()` until the one `terminal` event.
+
+That is the whole surface. The library ships every provider in-process, so there
+is nothing to prepare, cache, mount, enumerate, or install before a turn runs: no
+bundle, no provider injection, no run-time `uv pip install`, no warm-up step.
+Results come back over the worker's stdout: display events as NDJSON while the
+turn runs, then one terminal envelope carrying the reply and the library's own
+token and cost counts.
+
+One thing reaches the turn outside that spec: the **host config**. The runner
+sets `$AMPLIFIER_AGENT_CONFIG` on the worker process **only**, pointing at a
+per-turn file the engine materializes (see
+[`AUTOMATIONS.md` §10](AUTOMATIONS.md)). That file is the single channel through
+which reasoning effort can reach a provider request. Skills and MCP servers
+travel in the task spec instead, because the library takes both in code.
 
 Because the task spec travels on **stdin**, the prompt is never an OS argument,
 so a turn's text can be arbitrarily large.
 
 The first turn of a session's life starts fresh; every turn after it resumes.
-The agent's transcript lives on disk and is replayed between turns. The engine
+The conversation is durable on disk in that session's own storage root (below),
+and the library replays it between turns. The engine
 holds no in-memory conversation state — which is why an engine restart mid-day
 loses nothing but the currently-executing turn.
 
@@ -162,35 +183,40 @@ stock library through its documented embedding surface. Nothing in the engine
 depends on a modified agent underneath, which is the property that keeps it
 portable.
 
-### Session-init module failures are visible, not fatal
+### A turn with no working brain is a failure
 
-Booting the engine mounts every declared provider, tool, and hook. A
-provider/tool/hook that fails to load or fails its own module validation is
-**not fatal to the turn**: the engine library keeps booting with a reduced
-module set, logs the failure once (`Failed to load <type> '<module_id>':
-<reason>`), and the turn can still produce a real reply — just without
-whatever that module would have provided. Measured on a real deployment,
-2026-08-28: 96 of 96 runs in one morning carried exactly this warning on
-their stderr while every run's own record read `"failed": false, "error":
-null` — an independent watcher scanning stderr correctly flagged the
-failures; the engine's own verdict never did.
+Booting a session mounts every provider, tool, and hook the library declares.
+One that fails to load, or fails its own module validation, does not raise:
+the library keeps booting with a reduced module set and logs the failure once
+(`Failed to load <type> '<module_id>': <reason>`). Every turn's stderr is
+scanned for exactly that line, and the matches are recorded — deduped, sorted,
+as `"<type>:<module_id>"` — on the turn's own run-record entry and (aggregated
+across the whole run) at the run's top level, persisted to `result.json` and
+the `RUN_COMPLETED` event as `module_failures`. See `docs/AUTOMATIONS.md` §10
+("Session-init module failures") for the consumer-facing field reference.
 
-Whether a degraded session should count as a run *failure* is a judgment call
-for the automation author or a consuming watcher — the engine does not know
-what a missing tool means to any given automation, and manufacturing a
-`failed: true` for a run that legitimately answered would be its own kind of
-lie. What the engine **does** own is visibility: every turn's stderr is
-scanned for that exact warning line, and any matches are recorded — deduped,
-sorted, as `"<type>:<module_id>"` — on the turn's own run-record entry and
-(aggregated across the whole run) at the run's top level, persisted to
-`result.json` and the `RUN_COMPLETED` event as `module_failures`. See
-`docs/AUTOMATIONS.md` §11 for the consumer-facing field reference.
+**A non-empty `module_failures` fails the run**, and the error names the
+modules that did not load. A turn that answered without the modules it was
+configured to have did not run on the engine anyone asked for, and the record
+has to say so. The measurement that settles it: 96 of 96 runs in one morning
+carried exactly this warning on their stderr while every one of those runs
+recorded `"failed": false, "error": null` — an independent watcher scanning
+stderr correctly flagged the degradation; the engine's own verdict never did.
+Visibility that nothing acts on is not visibility.
 
-An **unhandled** exception during session init (one the engine library does
-not catch internally) is a different, unrelated path: it still produces
-`failed: true` with the real exception text in `error`, exactly like any
-other turn failure (§10) — this section covers only the failure mode that
-does *not* raise.
+The same rule closes the other shape of the same defect: **a reply that is
+itself a statement of provider unavailability fails the run** — the engine
+answering that it has no brain to think with. Measured on the same deployment:
+34 runs between 20:30Z and 23:44Z recorded `"failed": false, "error": null`
+while their reply said the engine had no provider. The match is **anchored** at
+the start of the reply, never a substring search, so an automation that merely
+*quotes* the phrase — one reporting on its own fleet's health does exactly that
+— is never failed for saying it.
+
+An **unhandled** exception during session init (one the library does not catch
+internally) is a different, unrelated path: it still produces `failed: true`
+with the real exception text in `error`, exactly like any other turn failure
+(§10) — this section covers the two failure modes that do *not* raise.
 
 ### Dispatch order among due automations
 
@@ -249,6 +275,32 @@ such an archive somewhere else produced automations pinned to conversations
 that do not exist. Server state belongs in the server's state directory. See
 `docs/AUTOMATIONS.md` for the operator surface (`drumbeat sessions` and
 `drumbeat rotate-session`).
+
+**Where the conversation lives.** Each pinned session gets its **own**
+agent-storage root under the data dir — `<data-dir>/agent-storage/<agent
+session id>/` — handed to the library as the storage location for that session
+and nothing else. The engine owns that path and stats it; it never reads inside
+it, because the library declares its internal layout private. There is no
+shared agent home directory anywhere on the machine, and no per-session file the
+engine parses: everything a session *is* lives under the workspace's own data
+dir, which is why a renamed or moved project carries its sessions with it and
+orphans nothing.
+
+**Session ids are translated at that boundary.** The library accepts ids
+matching `[a-z0-9][a-z0-9-]{7,63}`. An engine session id that already matches is
+used **verbatim** — the id a human reads in the pin file is the id the library
+stores. Any other is lowercased, non-conforming characters become `-`, and a
+`-<sha256[:8] of the original id>` suffix is appended, so two distinct engine
+ids can never collapse onto one conversation. The translation is pure and
+deterministic: the same engine id always yields the same agent id, in any
+process, so a resume in a later process finds the same session.
+
+**Existence is a stat of that root.** Present means resumable; absent means the
+session is gone and safe to recreate; an I/O error is `UNKNOWN`, and the engine
+aborts rather than guessing — silently recreating a session is exactly the
+silent-drop defect the pin mechanism exists to prevent. A **fresh** turn removes
+the session's storage root before running, so a fresh turn can never resume a
+stale conversation.
 
 ### The pre-run gate
 
@@ -312,10 +364,10 @@ The provider rejects the request outright:
 prompt is too long: 219685 tokens > 200000 maximum
 ```
 
-This is not a bad day; it is a permanent deadlock. The agent runtime's context
-policy compacts at a threshold *above* the provider's hard refusal, so a
-session whose prompt lands in that window can never compact its way out —
-compaction never fires.
+This is not a bad day; it is a permanent deadlock. The agent library does not
+compact, so a session whose prompt has crossed the provider's hard limit has no
+mechanism to shrink itself back under it: every subsequent turn sends at least
+as much as the one the provider just refused.
 
 Measured on real run history: one session hit the ceiling and then failed **12
 consecutive times over 27 hours**; another hit it and failed twice before a
@@ -333,112 +385,93 @@ for **15 consecutive runs**, reasoning about a schedule its automation no
 longer declared. The engine fingerprints the *steps* (the contract) and
 compares on resume, catching this before the bad run rather than after fifteen.
 
-### Trigger 3 — transcript size gate
+### Trigger 3 — prompt-token gate
 
 Trigger 1 is correct and, by construction, always one failed run late: it can
 only fire *after* the provider has already refused a prompt. Trigger 3 is the
-pre-emptive half. Before the first turn of a resumed run, the engine stats the
-pinned session's `transcript.jsonl`; if it is **over 5,000,000 bytes**, the
-session is rotated first and the run then proceeds on the fresh session.
+pre-emptive half. Before the first turn of a resumed run, the engine reads the
+largest **prompt-token** count recorded for that session's most recent run — the
+agent library's own reported `tokens_in`, read back off the run record — and if
+it is **over 150,000 tokens**, the session is rotated first and the run then
+proceeds on the fresh session.
 
-**Transcript size is a gate, not a predictor, and the distinction is the whole
-design.** It is emphatically not a measurement of the thing that fails.
-Measured against the two sessions whose true token counts the provider ever
-reported:
+**The gate measures the failing quantity, not a proxy for it.** Prompt tokens
+are the unit the provider refuses on (`prompt is too long: 219685 tokens >
+200000 maximum`), and they are the unit the library itself reports and the
+engine already records on every step. Nothing has to be inferred from a
+session's on-disk representation for the gate to be right — which matters,
+because the engine deliberately never reads inside that storage at all.
 
-| session | on disk | true prompt tokens | bytes/token |
-|---|---|---|---|
-| A | 10.4 MB | 219,685 | ~50 |
-| B | 33.0 MB | 201,361 | ~172 |
+**Where 150,000 comes from, stated honestly: it is calibrated off the ceiling,
+not off a crash distribution.** The two sessions whose true prompt sizes the
+provider ever reported crashed at **219,685** and **201,361** tokens. The
+smallest observed refusal is therefore 201,361, and 150,000 sits about a quarter
+below it — inside a region where no refusal has ever been observed, with room
+for one more turn's growth. The gate is deliberately not asked to *predict* the
+next turn's size; it is asked to keep a session inside that region.
 
-**The smaller file produced the larger prompt**, and the implied bytes-per-token
-differs by 3.4×. Compaction has already discarded an unknown prefix, and the
-file carries megabytes of signature data that is never sent to the provider. So
-"this transcript is N bytes" will never tell you how close the prompt is to the
-ceiling, and a threshold chosen as if it could would be false-alarm-or-missed
--failure with no way to tell which.
+**Why tokens are the unit, and stored size is not.** For those same two
+sessions, the stored bytes behind each prompt token differed by **3.4×** (10.4
+MB of stored conversation → a 219,685-token prompt; 33.0 MB → 201,361 — the
+*smaller* store produced the *larger* prompt). A prompt does not carry
+everything a session stores, and a session stores plenty a prompt never carries,
+so any size-derived threshold is a coin flip between a false alarm and a missed
+failure with no way to tell which one you got. That spread is the reason this
+gate counts what the provider counts.
 
-What size *is* good for is bounding the region a session is allowed to occupy.
-Measured over an 8-day production window — 4,133 runs carrying a
-`session_transcript_bytes_at_start`, across 157 sessions:
+**Why not lower:** rotation is not free — it abandons accumulated conversation
+memory directly. A lower gate rotates healthy sessions and buys no additional
+observed crashes.
 
-- every one of the **41** observed `ContextLengthError` runs started from a
-  transcript of at least **5,586,751 bytes** (10th percentile 7.1 MB, median
-  9.8 MB);
-- **1,138** runs started at or below **5,000,000 bytes**, and **none of them
-  hit the ceiling**;
-- per-run transcript growth is **0.29 / 0.41 / 0.64 MB** at the 25th / 50th /
-  75th percentile.
-
-The 5 MB default is calibrated on exactly that: it sits below the entire
-observed crash distribution, so it would have pre-empted all 41 observed
-crashes, and the runs it rotates instead are drawn from a population in which
-no crash was ever observed. At measured growth rates a session gets on the
-order of a dozen runs from a cold start before the gate fires — the reason the
-gate is not set lower, since rotation costs conversation memory directly and
-buys no additional observed crashes below this point.
+**An unmeasured session is not an over-threshold one.** When no run record for
+that session carries a count, the gate does not fire: "unknown" must never read
+as "yes" and abandon a live conversation, the same posture the drift and
+lifecycle checks take.
 
 The gate is an engine deployment knob, overridable via
-`$DRUMBEAT_SESSION_ROTATE_BYTES` (a positive integer; an unusable value is
+`$DRUMBEAT_SESSION_ROTATE_TOKENS` (a positive integer; an unusable value is
 reported on stderr and the default is used, so the mechanism cannot be
 disabled by a typo). There is deliberately **no automation frontmatter key** —
 the automation file's vocabulary is closed, and this is a property of the
 deployment, not per-automation policy.
+
+The count a run started from is recorded on the run record as
+`session_prompt_tokens_at_start`, and `drumbeat session-health` reports the same
+measurement as `prompt_tokens`.
 
 Trigger 1 stays exactly as it is. This gate reduces how often the ceiling is
 reached; it never replaces the backstop for the sessions that get there anyway.
 
 ### Rotation is safe, and that is measured
 
-Rotation abandons the transcript, not the state. `run()` re-injects the durable
+Rotation abandons the conversation, not the state. `run()` re-injects the durable
 state on **every** run — the `requires:` guidance files verbatim, plus the
 consumer's `inject:` state turn. Checked across every rotation performed in the
 originating deployment: **71/71 tracked ids survived one automation's rotation
 boundary, 27/27 survived another's**, and no post-rotation run contained an "I
 don't have that context" phrase.
 
-The transcript is sediment, not memory. What must survive a rotation is
-re-injected on every run anyway — which is exactly why `inject:` exists.
+An accumulated conversation is sediment, not memory. What must survive a
+rotation is re-injected on every run anyway — which is exactly why `inject:`
+exists.
 
-### A related, unresolved question: chronic compaction overrun
+### There is no compaction to tune, and rotation is why that is survivable
 
-Every `stderr.log` examined across a day of runs for one automation — healthy
-and failing alike — showed the agent runtime's own compaction landing 120–154%
-over its own stated target on effectively every turn, e.g. (paraphrased, the
-runtime's own wording):
+The agent library does not compact and exposes no context-pressure signal
+(measured; see [`../contracts/agent-binding.v1.md`](../contracts/agent-binding.v1.md)
+§9). A pinned session therefore grows monotonically until something abandons it,
+and the only two things that ever do are the triggers above: the pre-emptive
+prompt-token gate, and the provider's own refusal behind it.
 
-```
-Compaction finished OVER BUDGET at level 8: 169,904 tokens against a budget
-of 163,104 (104% of budget, target 81,552) — the un-compactable system floor
-is 511 tokens against a target of 81,552; the rest is protected content
-(last user message, last 5 tool results, tool_use/tool_result pairs) that
-compaction is not permitted to drop.
-```
-
-This engine has no code, and no source, that computes a compaction budget,
-a target size, or a protected-content window — none of that arithmetic
-exists in this repository or in amplifier-agent (the git dependency this
-engine embeds as a library, see the top-level `pyproject.toml`). Both are
-plain-text, fully readable Python. The message above is emitted by
-amplifier-core, a compiled dependency of amplifier-agent (an ABI3 wheel on
-PyPI, no source distribution vendored anywhere this engine can reach) —
-two dependency hops from this repo, and opaque to it. This engine cannot
-inspect, patch, or tune that arithmetic; it can only observe the runtime's
-own stderr after the fact, exactly as the ceiling/ID-survival measurements
-above already do.
-
-**Honest verdict, not a fix:** whether 120–154%-over-target is a real
-miscalibration or deliberate headroom (the runtime may compact in discrete
-"levels" that overshoot a continuous target by construction, similar to how
-a garbage collector's actual pause can overshoot its target heap size) is a
-question for amplifier-core/amplifier-agent, not for this engine. Filed
-upstream rather than guessed at here. What this engine *can* do, and does
-(see `inject_recap_blocks` in `runner._run_body`), is stop depending on any
-single turn surviving compaction at all — an automation's `inject:` state is
-now carried forward on every subsequent turn of the same run, so the exact
-overrun percentage stops being load-bearing for this engine's own
-correctness even though it remains an open question about the runtime it
-embeds.
+That is a design constraint this engine states rather than works around. It has
+no code that computes a context budget, a target size, or a protected-content
+window, and it will not grow one: an engine that second-guessed the library's
+context handling would be a fork of the agent runtime in all but name, which is
+precisely what §4 rules out. What it does instead is stop depending on any
+single turn surviving a long conversation at all — an automation's `inject:`
+state is carried forward on every subsequent turn of the same run (see
+`inject_recap_blocks` in `runner._run_body`), so a run's correctness never rests
+on how much of an earlier turn is still in context.
 
 ---
 
@@ -618,8 +651,9 @@ Each fence rejects a specific temptation this design met and refused.
   beyond its API key, no trigger grammar beyond `schedule | manual`. The order
   is *connect → prove → generalize*, never *generalize → connect → hope*.
 - **Not a fork of the agent runtime.** One OS process per turn, the stock
-  engine library through its documented embedding surface, a fresh session once
-  and resume forever, the compaction gap routed around via rotation.
+  library through its documented four-call embedding surface, a fresh session
+  once and resume forever, and the library's absence of compaction routed
+  around via rotation rather than second-guessed.
 
 ### Where the line actually falls
 
@@ -655,8 +689,9 @@ client → consumer: "reply to <its own notification identifier>: <text>"
   arbitrates replies. One lock namespace, so "two processes resuming one
   session" cannot re-enter through the new door.
 - **A reply targets the session that produced the notification — by explicit
-  `session_id`, even if the automation has since rotated.** Rotation never
-  destroys transcripts; the reply lands in the conversation it answers.
+  `session_id`, even if the automation has since rotated.** Rotation retires a
+  pin; it never destroys the session behind it, so the reply lands in the
+  conversation it answers.
 - **Never a module-level "current session" anywhere in the chain.** That
   variable passes every single-conversation test and cross-contaminates every
   concurrent one. The regression gate is two automations, two sessions, two

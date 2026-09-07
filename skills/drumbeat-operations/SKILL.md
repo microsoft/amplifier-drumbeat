@@ -64,8 +64,14 @@ uv tool install git+https://github.com/microsoft/amplifier-drumbeat
 drumbeat --help
 ```
 
-`uv tool upgrade drumbeat` takes drumbeat *and* the latest agent `main` in one
-step (the agent dependency is deliberately unpinned).
+`uv tool upgrade drumbeat` takes drumbeat and its pinned agent library in one
+step. To install the library on its own (a dev checkout, or a venv whose
+dependencies were never installed), the full git URL is the mechanism — a bare
+`uv tool install amplifier-agent` will not resolve:
+
+```bash
+uv tool install "amplifier-agent @ git+https://github.com/microsoft/amplifier-agent@v1#subdirectory=packages/python"
+```
 
 A running engine keeps executing the code it started from until restarted:
 reinstall or upgrade under a live engine and `drumbeat doctor` reports `STALE`.
@@ -78,19 +84,16 @@ Export the key in the environment the engine starts in:
 export ANTHROPIC_API_KEY=sk-ant-...      # or your provider's equivalent
 ```
 
-**The failure this prevents:** with no key, a turn still **exits 0** and returns
-the reply `Error: No providers available` — a successful-looking run that did
-nothing. Verify once, the same way the engine will:
+**The failure this prevents:** a run that looks successful while the engine had
+no brain. It cannot happen quietly here — a missing credential fails the turn
+with the library's own typed error, reported verbatim with its remedy, and a
+reply that is itself a provider-unavailability statement fails the run too. Both
+land as `failed: true` in `result.json` and one line in `failures.log`.
 
-```bash
-uvx --from git+https://github.com/microsoft/amplifier-agent \
-  amplifier-agent run --fresh --session-id keycheck --output json -y --cwd . "say ok" \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["reply"])'
-```
-
-A real greeting means you are done. `Error: No providers available` means every
-automation will produce that string. **Under a supervisor the key must be in the
-*unit's* environment** (an `EnvironmentFile=`), not just your shell's.
+Prove the key end to end once, the way the engine will: `drumbeat serve`, trigger
+one run (§3), and read that run's `result.json`. **Under a supervisor the key
+must be in the *unit's* environment** (an `EnvironmentFile=`), not just your
+shell's.
 
 ## 3 · Scaffold a workspace and run it
 
@@ -127,8 +130,8 @@ drumbeat doctor --workspace ~/myspace
 ```
 
 What healthy looks like: `status: FRESH` (running process matches disk),
-`agent turns in flight: 0` between runs, `agent command:` naming the engine
-library and the interpreter that imports it, `bundle prewarm: OK`,
+`agent turns in flight: 0` between runs, `agent command:` naming the agent
+library's version and the interpreter that imports it,
 `draining: no`, `orphan pins: 0`. Two notes are expected on a fresh workspace
 and mean nothing is broken: `workspace git: not a git checkout` (your policy has
 no archive yet) and a `CONTAINMENT WARNING` that the data dir sits inside the
@@ -187,7 +190,7 @@ drumbeat rotate-session <slug> --workspace ~/myspace --reason "context bloat"
 
 `rotate-session` takes a **required reason**, clears the pin, writes a durable
 line to `<data-dir>/session_rotations.jsonl`, and the next run starts fresh. It
-never deletes a transcript.
+never deletes the old session's storage.
 
 **Orphan pins** are the named cost of keying the store by slug. Renaming an
 automation (`git mv teams-check.md teams-check-v2.md`) starts the new slug cold
@@ -234,8 +237,8 @@ The payoff line is the first `delivery_intent` whose `verdict` is not
 
 | Symptom | Cause → fix |
 |---|---|
-| Every automation replies `Error: No providers available` | No provider key in the engine's environment. Export it (or set the unit's `EnvironmentFile=`); verify per §2 |
-| `serve` refuses to start naming `amplifier-agent` | The engine library does not import. Reinstall per §1; `doctor` shows `agent command: MISSING` with the install hint |
+| Every run fails naming an unreachable provider | No provider key in the engine's environment. The error carries the library's own remedy verbatim. Export the key (or set the unit's `EnvironmentFile=`); verify per §2 |
+| `serve` refuses to start naming `amplifier-agent` | The agent library does not import in the interpreter turns run under. Reinstall per §1; `doctor` shows `agent command: MISSING` with the install hint |
 | `doctor` says `STALE` | Process on old code. Restart with the drain procedure (§6) — never `pkill -f` |
 | `doctor`/`sessions` show `orphan pins: N` | An automation was renamed. `rotate-session` the old slug to retire it (§7) |
 | A tool the automation `requires:` is "not found" at run time | It is not on the constructed turn PATH. See PATH rules in [DRUMPACKS.md](https://github.com/microsoft/amplifier-drumbeat/blob/main/docs/DRUMPACKS.md); read the live base from `GET /api/capabilities` (`packs.path_base_pinned`) |

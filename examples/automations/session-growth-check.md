@@ -44,15 +44,16 @@ automation:
         instead and say which one you used — but do not assume one exists. Name the
         files you actually read.
 
-        **Transcript size is not a risk
-        signal and must never be reported as one.** This was measured against the
-        only two sessions whose true token counts the provider ever reported: one at
-        10.4 MB on disk produced a 219,685-token prompt, while another at 33.0 MB
-        produced 201,361. The *smaller* file made the *larger* prompt. Compaction has
-        already discarded an unknown prefix, and the file carries megabytes of
-        signature data that is never sent to the provider. "Session X is at 42 MB and
-        at risk" is a false alarm, and past runs of this automation made exactly that
-        mistake. A large transcript is a housekeeping aside at most.
+        **Stored size is not a risk signal and must never be reported as one.**
+        The risk signal is PROMPT TOKENS -- what the provider actually refuses on,
+        recorded per step as `tokens_in` in each run's `result.json`, and the
+        measurement behind the engine's own pre-emptive rotation gate (150,000
+        tokens by default). Measured against the only two sessions whose true
+        token counts the provider ever reported: 10.4 MB of stored conversation
+        produced a 219,685-token prompt, while 33.0 MB produced 201,361 -- the
+        *smaller* store made the *larger* prompt, so "session X is at 42 MB and at
+        risk" is a false alarm, and past runs of this automation made exactly that
+        mistake. Report tokens, or report nothing about size.
     - id: report-needs
       prompt: |-
         Report what actually needs me, in descending order of what matters:
@@ -91,9 +92,10 @@ automation:
         you judge worth saying. A dead automation is worth saying.
     - id: no-act-guard
       prompt: |-
-        Do not rotate anything yourself, and do not delete any transcript. Dead and
-        drifted sessions auto-rotate on their own next run; manual rotation exists
-        for the cases I decide by hand. **This pass reports; it does not act.**
+        Do not rotate anything yourself, and do not delete any session's storage.
+        Dead and drifted sessions auto-rotate on their own next run; manual rotation
+        exists for the cases I decide by hand. **This pass reports; it does not
+        act.**
 ---
 
 Watches the engine's own session fleet by reading the files the engine already writes -- the one example you can run today with no pack installed. The steps live in the frontmatter.

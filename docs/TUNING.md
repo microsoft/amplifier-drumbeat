@@ -378,15 +378,21 @@ policy failure. It is contract drift, and no guidance edit fixes it.
 
 What the tuning practice looks like:
 
-- **Watch tokens, not megabytes.** Measured against the only two prompts
-  whose true token counts the provider ever reported: a 10.4 MB
-  transcript produced a 219,685-token prompt while a 33.0 MB transcript
-  produced 201,361 -- the smaller file made the larger prompt, with
-  bytes-per-token differing 3.4x. Any megabyte threshold is a coin flip.
+- **Watch prompt tokens, not megabytes.** Tokens are what the provider
+  refuses on, and the engine records the library's own `tokens_in` on
+  every step -- so the measurement is the failing quantity itself. Stored
+  size is not a substitute: across the only two prompts whose true token
+  counts the provider ever reported, 10.4 MB of stored conversation
+  produced a 219,685-token prompt while 33.0 MB produced 201,361 -- the
+  smaller store made the larger prompt, a 3.4x spread in bytes per token.
+  Any megabyte threshold is a coin flip. The engine's own pre-emptive
+  gate rotates a pinned session whose most recent run recorded more than
+  **150,000 prompt tokens** (`$DRUMBEAT_SESSION_ROTATE_TOKENS`), and every
+  run record carries `session_prompt_tokens_at_start`.
 - **Rotate on real signals.** Two are worth acting on: a provider ceiling
-  hit (in the measured deployment, prompts landing in the window between
-  the provider's refusal limit and the compaction trigger could never
-  recover -- zero recoveries ever observed, so the first hit is a
+  hit (the library does not compact, so a session whose prompt has
+  crossed the provider's limit has no way to shrink back under it --
+  zero recoveries ever observed, so the first hit is a
   zero-false-positive signal), and contract drift -- the automation's
   steps no longer match what the session was pinned under, detectable by
   fingerprinting the steps and comparing on resume.
@@ -446,24 +452,23 @@ profiles:
 
 A turn selects a profile by naming it on the request
 (`{"profile": "quick", ...}` on `POST /api/turns`). The named profile is folded
-in as **layer 3** of the shared config merge (`$AMPLIFIER_AGENT_CONFIG` base →
-`default:` → **profile** → automation `agent_config:`).
+in as **layer 2** of the shared config merge (`default:` → **profile** →
+automation `agent_config:`).
 A turn that names **no** profile uses the `default:` layer. An **unknown**
 profile name is refused loud, listing the profiles you defined — never a silent
 fallback to the wrong provider/model.
 
-The `default_model` you name is forwarded verbatim into amplifier-agent's own
-host-config field `provider.config.default_model`, carried in the host config
-each turn is handed — the same mechanism the engine itself uses to pick a
-per-provider model. drumbeat picks *which* config per turn; amplifier-agent
-still does the model resolution.
+The `default_model` you name is the model the turn runs on: it is handed to the
+agent library as the agent's model for that turn, and written into the per-turn
+host-config file the worker reads. drumbeat picks *which* policy applies per
+turn; the model string itself is passed through untouched.
 
 The one exception is the `model_class: fast | standard` shorthand: drumbeat
 resolves *that* into a concrete `default_model` per `provider.module` from a
 small tier table before materializing the config (overridable in this file's
 `models.classes:` block), and refuses any resolved model on the `models.deny:`
 list. It is a lookup for the id you would otherwise have typed — the resolved
-model still travels in amplifier-agent's own field, and there is still no second
+model travels exactly where an explicit one would, and there is no second
 model-resolution mechanism. See docs/AUTOMATIONS.md §10.
 
 A malformed `agent-config.yaml`, an unknown top-level key in a
@@ -487,79 +492,68 @@ hardcoded in drumbeat — the id you write in the file is the id that runs.
 
 ### Pointing a profile at a local model
 
-The **same** `provider.config` path reaches a local, OpenAI-compatible server
-(llama.cpp, Ollama, LM Studio, vLLM…) on your LAN — no new mechanism. A profile
-carries a full provider block:
+The **same** profile mechanism reaches a local server (Ollama, vLLM, or any
+box you run yourself) on your LAN — no new mechanism, and only two moving parts:
 
-- `provider.module` — the provider **short-name** amplifier-agent mounts. For an
-  OpenAI-compatible endpoint that is `openai` (catalog names: `anthropic`,
-  `openai`, `azure-openai`, `ollama`).
-- `provider.config` — extra provider knobs folded verbatim into amplifier-agent's
-  `provider.config`. This is where `default_model`, `base_url` (and
-  `use_streaming`, `max_tokens`, `timeout`, …) live.
+- `provider.module` — the provider **ID** the agent library selects. The library
+  ships every provider in-process; the ids are `anthropic`, `openai`,
+  `azure-openai`, `gemini`, `ollama`, `vllm`, `github-copilot`.
+- `provider.config` — the policy drumbeat resolves for that provider:
+  `default_model` (or the `model_class` shorthand) and `reasoning_effort`.
 
 ```yaml
-# agent-config.yaml — a `local` profile pointing at a box at 192.168.1.7:8081
+# agent-config.yaml — a `local` profile on a box you run yourself
 profiles:
   local:
     provider:
-      module: openai
+      module: ollama
       config:
         default_model: qwen3.6-35b-a3b
-        base_url: http://192.168.1.7:8081/v1
-        use_streaming: false        # see "quirks" below — required for this box
-        max_tokens: 1024
 ```
 
 Define as many profiles as you like; each is independent by design, so which
 provider/model a turn runs on stays legible at a glance.
 
-**Credentials are an environment concern, never this file.** amplifier-agent
-re-asserts `api_key` / `host` / `endpoint` from the engine environment *after*
-overlaying `provider.config`, so a credential written here is silently ignored —
-and in a file you might commit, it would leak a secret. drumbeat therefore
-**refuses** those keys inside `config` with a pointer to the env var. For the
-local box, the `openai` provider still requires *some* key to be present even
-though the box ignores it:
+**The endpoint and the credential are both environment concerns, never this
+file.** The library resolves each provider's connection from the engine's
+environment — the API key and the base URL alike (`OLLAMA_HOST` for `ollama`,
+`VLLM_BASE_URL` for `vllm`, `OPENAI_BASE_URL` for `openai`,
+`AZURE_OPENAI_ENDPOINT` for `azure-openai`, each with the provider's own
+default). A credential written into a config file would leak in anything you
+commit, so drumbeat **refuses** those keys at any depth of the block with a
+pointer to the env var:
 
 ```bash
-export OPENAI_API_KEY=local     # any non-empty dummy
+export OLLAMA_HOST=http://192.168.1.7:11434   # point the provider at your box
 ```
 
-#### Why `source:` and `module: provider-chat-completions` do NOT belong here
+#### `provider.module` is an id, not a module reference
 
-A full amplifier provider block (the `- module: provider-chat-completions` /
-`source: git+…` / `config:` shape) is a **bundle** construct. The host config a
-turn is handed is not a bundle: the engine reads only
-`provider.module` (a catalog short-name) and `provider.config`, and it does
-**not** read `provider.source`. So the way to reach an OpenAI-compatible local
-box through this path is `provider: openai` + `config.base_url`, not a
-`provider-chat-completions` module reference. (A genuinely non-catalog provider
-module would have to be declared by the bundle amplifier-agent runs, which is
-outside drumbeat's reach.)
+There is no module path, no `source:`, and no provider catalog anywhere in this
+file. The library selects exactly one provider by id and mounts nothing, so
+`provider.module: ollama` — plus that provider's environment — is the whole
+story for reaching a local box. `providers:` as a plural catalog block is
+refused by name, because a catalog selects nothing.
 
 #### Local-model quirks (measured, not guessed)
 
-Verified against a real llama.cpp box serving `qwen3.6-35b-a3b`
-(`EVIDENCE/local-run/`). Local models fail differently from hosted ones; what we
-observed:
+Local models fail differently from hosted ones. Measured against a real box
+serving `qwen3.6-35b-a3b`:
 
-- **Streaming crashes this server's responses.** With `use_streaming: true` (the
-  default), the openai provider dies with
-  `LLMError: 'NoneType' object has no attribute 'append'` while parsing the
-  stream — reproduced twice (default and explicit `true`). `use_streaming: false`
-  returned a clean `"reply": "PONG"`. **Set `use_streaming: false` for this box.**
 - **It's a reasoning model: budget for the thinking.** The server puts chain-of-
-  thought in `reasoning_content` and leaves `content` empty until it finishes. A
-  low `max_tokens` spends the whole budget thinking and returns an empty reply
-  (`finish_reason: length`). Give generous `max_tokens`, or add Qwen's `/no_think`
-  to the turn to skip reasoning entirely.
-- **First token is slow; cold start slower still.** The first turn also cold-
-  prepares the bundle (fetches the `openai` provider). A warm non-streaming turn
-  answered in ~0.9–2 s; budget more for the first one. The turn ceiling
-  (`ceiling_seconds`, default 20 min) already covers a slow local box, but a
-  latency-sensitive turn on a slow local model is a UX tradeoff to make
-  with eyes open.
+  thought in its own reasoning channel and leaves the visible content empty until
+  it finishes, so a tight output budget can be spent entirely on thinking and
+  return an empty reply. Add Qwen's `/no_think` to the turn to skip reasoning
+  entirely when you want a short answer.
+- **First token is slow.** A warm turn answered in ~0.9–2 s; budget more for the
+  first one after the model loads. The turn ceiling (`ceiling_seconds`, default
+  20 min) already covers a slow local box, but a latency-sensitive turn on a slow
+  local model is a UX tradeoff to make with eyes open.
+- **Server-side knobs stay server-side.** Streaming behavior, token ceilings and
+  timeouts are properties of the box and its provider, not of this file:
+  `provider.config` carries model selection and reasoning effort, and nothing
+  else in it reaches a provider request. If a local server misbehaves under a
+  particular setting, change it where the server is configured.
 
 ### Status: stream the activity, don't show a bare "working"
 

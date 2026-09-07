@@ -177,21 +177,24 @@ run — right for a check that should remember what it saw last time.
 Any other value is refused at parse time. Rotation is identical across triggers:
 the pin is cleared, a line is written to `<data-dir>/session_rotations.jsonl`, and
 a `session_rotated` event is emitted — whether caused by a ceiling hit, a steps
-rewrite, or a `fresh`/`daily` boundary. Rotation never deletes a transcript.
+rewrite, or a `fresh`/`daily` boundary. Rotation never deletes a session.
 Note `conversation:` (does this run reuse the last conversation?) is independent
 of the `daily at HH:MM` *schedule* (when a run fires).
 
 ## 8 · `agent_config:` — per-automation host config
 
-`agent_config:` shapes the single host config a turn is handed, for this
+`agent_config:` shapes the single agent config a turn runs under, for this
 automation's turns only. The top-level vocabulary is **closed to
-`provider · providers · mcp · skills · debug`**; anything else (including
-`approval`) is refused.
+`provider · mcp · skills`**; anything else is refused, and four names are
+refused by name with their own reason: `debug` (the library exposes turn events,
+not wire payloads, so there is nothing behind the key), `providers` (the library
+ships every provider in-process and selects one by id, so a catalog selects
+nothing), `approval`, and `allowProtocolSkew`.
 
 ```yaml
 agent_config:
   provider:
-    module: openai            # provider short-name; omit to keep the bundle default
+    module: openai            # provider ID; omit to keep the library's default
     config:
       model_class: fast       # fast | standard -- resolved to a concrete model
       reasoning_effort: high  # minimal | low | medium | high | xhigh
@@ -204,26 +207,30 @@ don't: `fast`/`standard` resolve at materialization per `provider.module`
 `agent-config.yaml`'s `models.classes:` table. An explicit `default_model` wins
 and drumbeat WARNS naming the shadowed `model_class`; a `model_class` with no
 `provider.module` to resolve against, or an unknown class value, is refused.
-`reasoning_effort` is passed through untouched but validated at load against the
-set above. A model on the deny-list (`models.deny:`, default `["gpt-5.6-sol"]`)
+`reasoning_effort` is validated at load against the set above, and is refused
+outright when no `provider.module` scopes it. A model on the deny-list (`models.deny:`, default `["gpt-5.6-sol"]`)
 makes the automation a config-lint failure, so it never runs at all — see
 docs/AUTOMATIONS.md §10.
 
 The engine resolves ONE config per turn by merging up to three layers,
-**lowest precedence first**: (1) `$AMPLIFIER_AGENT_CONFIG` operator file, folded
-in as the base; (2) the workspace baseline `agent-config.yaml` `default:`; (3)
-this automation's `agent_config:`. Merge rules: two mappings recurse; a scalar or
+**lowest precedence first**: (1) the workspace baseline `agent-config.yaml`
+`default:`; (2) a named `profile` (interactive/API turns only); (3) this
+automation's `agent_config:`. Merge rules: two mappings recurse; a scalar or
 list **replaces** wholesale; a `null` **anywhere is refused loudly** (omit the
-key instead). The workspace baseline sets a `default:` merged into every
-automation, while `profiles:` in that file is reserved for interactive/API turns
-(the scheduled path reads only `default:`).
+key instead). An operator's own `$AMPLIFIER_AGENT_CONFIG` file is not a layer —
+it speaks the agent library's own five-key vocabulary and is folded in as the
+base of the derived host config, where drumbeat's per-automation policy wins key
+by key. `provider.module` carries a provider **ID** (`openai`, `anthropic`,
+`azure-openai`, `gemini`, `ollama`, `vllm`, `github-copilot`), and
+`reasoning_effort` reaches the provider request only through that derived host
+config, scoped under the provider id.
 
 **Credentials are refused anywhere in the block** — any `api_key` / `apiKey` /
 `token` / `secret` / `authorization` at any depth fails loud and names the path.
 Credentials belong in the engine's **environment**, never a config file. This is
-the one rule to memorize. Changing the **provider module** rotates the pinned
-session automatically (provider-specific transcript state); changing only the
-model does not.
+the one rule to memorize. Changing the **provider** rotates the pinned session
+automatically (a resumed conversation carries provider-specific state); changing
+only the model does not.
 
 ## 9 · The guidance-file loop (a convention, not schema)
 

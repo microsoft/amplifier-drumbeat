@@ -75,10 +75,10 @@ a minimal container that ships no `ps`); elsewhere — macOS has no `/proc` at a
 There is a second, worse reason. The runner spawns each turn's worker in its
 **own process group** (so the turn's whole tool tree dies together when its
 watchdog fires) with `close_fds=True`. Kill the scheduler mid-turn and that
-worker **keeps running and keeps writing the session transcript**, while the
+worker **keeps running and keeps writing that session's storage**, while the
 kernel releases the parent's per-session lock the instant the parent dies. The
 next scheduler then resumes that same session underneath the still-writing
-orphan — the exact transcript corruption the locks exist to prevent, performed
+orphan — the exact session corruption the locks exist to prevent, performed
 deliberately.
 
 So the stop procedure is three steps, in order:
@@ -192,11 +192,11 @@ loginctl enable-linger "$USER"
 **Keep the workspace and the data dir on the Linux filesystem (`~/...`), never
 under `/mnt/c`.**
 
-The single-scheduler guarantee and the per-session transcript guard are both
+The single-scheduler guarantee and the per-session write guard are both
 POSIX advisory locks (`flock`). On `drvfs` — the `/mnt/c` mount — advisory
 locking is not reliably enforced, so `flock` can *appear* to succeed for two
 processes at once. Every mechanism in this engine that prevents double-firing
-and transcript corruption is built on that call. A data dir on `/mnt/c` does
+and session corruption is built on that call. A data dir on `/mnt/c` does
 not merely run slower; it removes the guarantee while continuing to print
 `scheduler lock acquired`.
 

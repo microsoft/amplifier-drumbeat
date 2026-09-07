@@ -22,10 +22,10 @@ it runs; you supply the provider key it runs against.
 **1. `uv` and `git`.** drumbeat installs from a git URL with
 [uv](https://docs.astral.sh/uv/), which also provisions the Python it needs
 (3.13). Install `uv` first if you don't have it; `git` must be present because
-the install is a git reference. `amplifier-agent` — which ships the engine
-library every turn imports — is a dependency, so the single install below brings
-it too. It is **not on PyPI**; there is nothing separate to install and nothing
-to put on your PATH.
+the install is a git reference. `amplifier-agent` — the library every turn
+imports — is a declared dependency, so the single install below brings it too.
+It is **not on PyPI**; there is nothing separate to install, no agent CLI, and
+nothing to put on your PATH.
 
 **2. An LLM provider key, exported in the environment the engine starts in.**
 
@@ -33,20 +33,15 @@ to put on your PATH.
 export ANTHROPIC_API_KEY=sk-ant-...      # or your provider's equivalent
 ```
 
-Check it against the same engine your turns run on: if the key is missing, a
-turn still **exits 0** and returns the reply `Error: No providers available`. That is a
-successful-looking run that did nothing, so verify it once by hand rather than
-discovering it in a run artifact at 03:40:
+A provider whose credential is missing is a **loud** failure, not a quiet one:
+the agent library refuses to start the turn with its own typed error, and the
+run is recorded `failed: true` carrying that message and its remedy verbatim.
+A turn that somehow replies with a provider-unavailability statement instead
+fails the run too. Neither ever reads as a successful run that did nothing.
 
-```bash
-uvx --from git+https://github.com/microsoft/amplifier-agent \
-  amplifier-agent run --fresh --session-id keycheck --output json -y --cwd . "say ok" \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["reply"])'
-```
-
-If that prints an actual greeting, you are done. If it prints
-`Error: No providers available`, the engine will start fine and every
-automation will produce that string as its output.
+Prove the key end to end the way the engine will, once, rather than discovering
+it in a run artifact at 03:40: start the engine, trigger one run of a trivial
+automation (Quickstart steps 3–5 below), and read its `result.json`.
 
 Running the engine under systemd? The key must be in the *unit's* environment
 (an `EnvironmentFile=`), not just your shell's.
@@ -63,11 +58,20 @@ uv tool install git+https://github.com/microsoft/amplifier-drumbeat
 drumbeat --help
 ```
 
-That is the whole install. `amplifier-agent` rides along as a dependency, so its
-engine library lands in the same tool venv and every turn imports it there
-automatically — there is no second install and nothing to put on your PATH. The agent dependency
-is unpinned, so `uv tool upgrade drumbeat` takes drumbeat *and* the latest agent
-`main` in one step.
+That is the whole install. `amplifier-agent` rides along as a declared
+dependency, so the library lands in the same tool venv and every turn imports it
+there automatically — there is no second install and nothing to put on your
+PATH. `uv tool upgrade drumbeat` takes drumbeat and its pinned agent library in
+one step.
+
+If you ever need to install the library yourself (a dev checkout, or a venv that
+has not installed its dependencies), the full git URL is the mechanism — it is
+not on PyPI and the distribution lives in a subdirectory, so a bare
+`uv tool install amplifier-agent` will not resolve:
+
+```bash
+uv tool install "amplifier-agent @ git+https://github.com/microsoft/amplifier-agent@v1#subdirectory=packages/python"
+```
 
 A running engine keeps executing the code it was started from until you restart
 it: reinstall or upgrade under a live engine and `drumbeat doctor` reports
@@ -143,7 +147,7 @@ drumbeat doctor --workspace ~/myspace
 
 **What healthy looks like:** `status: FRESH` (the running process matches the
 code on disk), `agent turns in flight: 0` between runs, `agent command:` naming
-the engine library and the interpreter that imports it, `bundle prewarm: OK`,
+the agent library's version and the interpreter that imports it,
 `draining: no`, and `orphan pins: 0`. `FRESH` is the one to learn
 — it goes `STALE` the moment you edit engine code under a running process,
 which is the difference between "I fixed that" and "I fixed that and restarted."
@@ -235,7 +239,7 @@ Read in this order.
 | [`docs/AUTOMATIONS.md`](docs/AUTOMATIONS.md) | The automation format in full: frontmatter, triggers, notify policy, `requires:`, `inject:`, and how to write steps that hold up |
 | [`docs/TUNING.md`](docs/TUNING.md) | The loop for making an automation actually good — instrument silence, review usage not output, derive rules from your own data. **The page that makes people believe this works**; the format is easy and the tuning is the whole job |
 | [`docs/DRUMPACKS.md`](docs/DRUMPACKS.md) | The drumpack contract: load rules, the optional `activity:` narration map, the `INJECT_IDLE` sentinel, PATH guarantees, completeness conventions |
-| [`docs/PLATFORMS.md`](docs/PLATFORMS.md) | Running it for real: WSL, macOS, one-serve-per-workspace, and how to stop it without corrupting a transcript |
+| [`docs/PLATFORMS.md`](docs/PLATFORMS.md) | Running it for real: WSL, macOS, one-serve-per-workspace, and how to stop it without corrupting a session |
 
 Reference, once you want to know why: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 — what the engine is, the turn model, session lifecycle, the delivery seam, and
@@ -318,14 +322,17 @@ Skim these before assuming a simpler design would do:
   check" mean anything — and it forces a rotation story. The health triggers
   are zero-judgment: the provider refusing the prompt, the automation's steps
   having been rewritten under a session still obeying the old ones, and the
-  transcript crossing a size gate before the turn rather than after the crash.
-- **Transcript size predicts nothing, but it still bounds something.**
-  Measured: 10.4 MB produced a 219,685-token prompt while 33.0 MB produced
-  201,361 — the *smaller* file made the *larger* prompt, so no byte count tells
-  you how close the ceiling is. Over 4,133 production runs, though, every one
-  of the 41 ceiling crashes started above 5.6 MB and none of the 1,138 runs
-  starting under 5 MB crashed. The gate keeps sessions in the region where
-  crashes were never observed; it does not pretend to predict them.
+  session's prompt crossing a token gate before the turn rather than after the
+  crash.
+- **The gate counts what the provider counts.** Rotation fires pre-emptively
+  when a session's most recent run recorded more than 150,000 prompt tokens —
+  the agent library's own reported count, in the unit the provider refuses on. Stored
+  size would not do: measured, 10.4 MB of stored conversation produced a
+  219,685-token prompt while 33.0 MB produced 201,361 — the *smaller* store
+  made the *larger* prompt. The two prompts the provider ever reported were
+  refused at 219,685 and 201,361 tokens, so the gate sits about a quarter below
+  the smallest observed refusal: it keeps sessions in a region where no crash
+  was ever observed, and does not pretend to predict one.
 - **Silence is never a contract value.** A tool with nothing to say prints
   `INJECT_IDLE`; bare-empty stdout aborts the run loudly. A crashed pipe and a
   genuinely idle state must not share an observable.

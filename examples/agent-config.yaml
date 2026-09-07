@@ -1,55 +1,66 @@
 # agent-config.yaml — layered agent config for a drumbeat workspace
 #
 # COPY THIS FILE to your workspace root (beside drumpacks.txt) to take effect. It is
-# OPTIONAL: with no file, every automation and every turn runs on the bundle's
-# default provider/model, exactly as before this existed.
+# OPTIONAL: with no file, every automation and every turn runs on the agent
+# library's own default provider/model.
 #
 # WHAT IT DOES. This is the single place an owner shapes which provider, model,
-# MCP servers, skills, and debug knobs a run is handed — in amplifier-agent's
-# OWN host-config vocabulary. drumbeat merges up to five layers into ONE host
-# config it hands the engine for that turn; it never invents a second
+# reasoning effort, MCP servers, and skills a run is handed. drumbeat merges up
+# to three layers into ONE resolved config per turn; it never invents a second
 # model-resolution mechanism. Lowest precedence first:
 #
-#   1. $AMPLIFIER_AGENT_CONFIG — the operator's own debug/host config (env), the base.
-#   2. this file's `default:`  — the baseline merged into EVERY automation and turn.
-#   3. a named `profile`       — chosen per interactive/API turn (see `profiles:` below).
-#   4. an automation's own `agent_config:` frontmatter block.
-#   5. `prompt_caching: false` sugar (deprecated alias).
+#   1. this file's `default:` — the baseline merged into EVERY automation and turn.
+#   2. a named `profile`      — chosen per interactive/API turn (see `profiles:` below).
+#   3. an automation's own `agent_config:` frontmatter block.
+#
+# An operator's own $AMPLIFIER_AGENT_CONFIG file is NOT one of these layers: it
+# belongs to the agent library and speaks the library's own five-key host-config
+# vocabulary (provider | model | storage | workspace | extra_request_params). It
+# is folded in as the BASE of the host config drumbeat derives per turn, where
+# drumbeat's per-automation policy wins key by key and an operator's unrelated
+# extra_request_params survive.
 #
 # MERGE RULES (deliberately boring so you can predict the result): two mappings
 # at the same key recurse; a scalar or a list REPLACES wholesale; a `null`
 # anywhere is REFUSED (v1 has no deletion semantics).
 #
 # CLOSED top-level vocabulary for every layer (default AND each profile):
-# `provider | providers | mcp | skills | debug`. Any other top-level key, and
-# `approval` / `allowProtocolSkew` by name, are a loud refusal.
+# `provider | mcp | skills`. Any other top-level key is a loud refusal, and four
+# are refused BY NAME with their own reason: `debug` (the library exposes turn
+# events, not wire payloads -- there is nothing behind the key; see
+# contracts/agent-binding.v1.md, "Known gap"), `providers` (the library ships
+# every provider in-process and selects ONE by id, so a catalog selects
+# nothing), `approval`, and `allowProtocolSkew`.
 #
 # CLOSED top-level vocabulary for THIS FILE: `default | profiles | models`.
 # `models:` (see the bottom of this file) is engine policy, not a config layer.
 #
 # CREDENTIALS NEVER LIVE HERE. Any credential-bearing key (api_key / apiKey /
-# token / secret / authorization, case-insensitive) at ANY depth is refused —
-# amplifier-agent re-asserts credentials from the ENGINE ENVIRONMENT after this
-# overlay, so a value here is both silently ignored and (in a committed file) a
-# leaked secret. Set OPENAI_API_KEY / ANTHROPIC_API_KEY / OLLAMA_HOST in the
-# engine environment instead.
+# token / secret / authorization, case-insensitive) at ANY depth is refused --
+# the agent library takes credentials from the ENGINE ENVIRONMENT only and has
+# no field a config file could set, so a value here would be both inert and (in
+# a committed file) a leaked secret. Set OPENAI_API_KEY / ANTHROPIC_API_KEY /
+# OLLAMA_API_KEY in the engine environment instead. The provider's ENDPOINT is
+# the same kind of concern: OLLAMA_HOST, VLLM_BASE_URL, OPENAI_BASE_URL,
+# AZURE_OPENAI_ENDPOINT are read from the environment too.
 
 # ── default: the baseline every automation and every turn starts from ──────────
-# Omit this whole block to leave the bundle default untouched as the baseline.
+# Omit this whole block to leave the library's own default untouched.
 default:
   provider:
+    module: anthropic
     config:
-      # Turn on prompt caching for every run by default, for example.
-      enable_prompt_caching: true
+      # Every automation runs on the standard tier unless it says otherwise.
+      model_class: standard
 
 # ── profiles: named overlays a turn selects with `profile: <name>` ─────────────
 # OPEN VOCABULARY — the names are yours. An interactive/API turn carries
 # `{"profile": "quick", ...}` on POST /api/turns; the named profile is folded in
-# as layer 3 of the merge above. A turn that names NO profile just uses `default:`.
+# as layer 2 of the merge above. A turn that names NO profile just uses `default:`.
 # An UNKNOWN profile name is refused loud, listing the profiles you defined here.
 profiles:
   # A cheap, latency-sensitive turn: run it on the provider's fast model,
-  # same provider as the bundle default (omit `module` to keep it).
+  # same provider as the default layer (omit `module` to keep it).
   quick:
     provider:
       config:
@@ -66,17 +77,14 @@ profiles:
         model_class: standard
         reasoning_effort: high   # minimal | low | medium | high | xhigh
 
-  # Point a turn at a LOCAL, OpenAI-compatible endpoint. `base_url` is folded
-  # into provider.config; the API key still comes from the environment
-  # (OPENAI_API_KEY), never this file.
+  # Point a turn at a LOCAL model. The provider ID is the whole selection; the
+  # endpoint and the key both come from the ENGINE ENVIRONMENT (OLLAMA_HOST,
+  # OLLAMA_API_KEY), never this file.
   local:
     provider:
-      module: openai
+      module: ollama
       config:
         default_model: qwen3.6-35b-a3b
-        base_url: http://192.168.1.7:8081/v1
-        use_streaming: false
-        max_tokens: 512
 
 # ── models: engine policy — the model_class table and the deny-list ──────────
 # NOT a config layer (it is never merged into a turn's host config): it is how

@@ -19,7 +19,6 @@ import io
 import json
 import os
 import re
-import tempfile
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
@@ -29,7 +28,6 @@ from unittest import mock
 import pytest
 
 from drumbeat import agent_config, agent_worker, paths, runner
-
 
 # --------------------------------------------------------------------------- #
 # the fake engine (one seam: create_agent)                                     #

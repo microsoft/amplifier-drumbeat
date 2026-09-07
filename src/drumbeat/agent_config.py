@@ -37,6 +37,10 @@ merged:
     ``approval``, ``allowProtocolSkew``, ``debug`` and ``providers`` are refused
     BY NAME, each with its own reason -- a key with nothing behind it is the
     "enabled, validated, inert" shape this module exists to prevent.
+  * ``provider`` is CLOSED to ``module | config``, and ``provider.config`` to
+    ``default_model | model_class | reasoning_effort`` -- those three are
+    exactly what reaches the agent library, so anything else would be
+    validated, written, and never read.
   * ``provider.config.model_class`` (``fast|standard``) and
     ``provider.config.reasoning_effort``
     (``minimal|low|medium|high|xhigh``) are CLOSED value vocabularies; an
@@ -337,6 +341,55 @@ def _provider_config(config: Mapping[str, Any]) -> dict[str, Any] | None:
 
 _MODEL_CLASS_PATH = "provider.config.model_class"
 
+# The CLOSED vocabularies INSIDE ``provider``. Closed for the same reason the
+# top level is: ``build_host_config`` projects exactly three things onto the
+# library's host config (provider id, model, reasoning effort), and the library
+# takes nothing else from a file. A key here that is not one of these validates,
+# lands in the materialized merged config, and reaches nothing -- the "enabled,
+# validated, inert" shape this module exists to prevent. Refused by name, with
+# the vocabulary shown, rather than shipped dead.
+_PROVIDER_ALLOWED_KEYS = frozenset({"module", "config"})
+_PROVIDER_CONFIG_ALLOWED_KEYS = frozenset(
+    {"default_model", "model_class", "reasoning_effort"}
+)
+
+
+def _validate_provider_block(config: Mapping[str, Any], *, source: str) -> None:
+    """Hold ``provider`` and ``provider.config`` to their closed vocabularies."""
+    provider = config.get("provider")
+    if provider is None:
+        return
+    if not isinstance(provider, dict):
+        raise AgentConfigError(
+            f"{source}: `provider` must be a mapping of "
+            f"{sorted(_PROVIDER_ALLOWED_KEYS)} -> value, got "
+            f"{type(provider).__name__}"
+        )
+    unknown = sorted(set(provider) - _PROVIDER_ALLOWED_KEYS)
+    if unknown:
+        raise AgentConfigError(
+            f"{source}: unknown key(s) {unknown} under `provider` -- the "
+            f"vocabulary is closed to {sorted(_PROVIDER_ALLOWED_KEYS)}"
+        )
+    provider_config = provider.get("config")
+    if provider_config is None:
+        return
+    if not isinstance(provider_config, dict):
+        raise AgentConfigError(
+            f"{source}: `provider.config` must be a mapping, got "
+            f"{type(provider_config).__name__}"
+        )
+    unknown = sorted(set(provider_config) - _PROVIDER_CONFIG_ALLOWED_KEYS)
+    if unknown:
+        raise AgentConfigError(
+            f"{source}: unknown key(s) {unknown} under `provider.config` -- the "
+            f"vocabulary is closed to {sorted(_PROVIDER_CONFIG_ALLOWED_KEYS)}. "
+            "Anything else here would be validated, written, and never read: "
+            "the agent library takes a provider id, a model, and request "
+            "parameters from a config file, and nothing else. An endpoint or a "
+            "credential is an ENVIRONMENT concern"
+        )
+
 
 def _refuse_misplaced_model_class(obj: Any, *, source: str, path: str) -> None:
     """Refuse a ``model_class`` written anywhere but ``provider.config``.
@@ -512,6 +565,7 @@ def validate_config_layer(
             )
     _scan_forbidden(data, source=source, path="")
     policy = DEFAULT_MODEL_POLICY if policy is None else policy
+    _validate_provider_block(data, source=source)
     _refuse_misplaced_model_class(data, source=source, path="")
     _validate_reasoning_effort(data, source=source)
     resolution = resolve_model(data, policy=policy, source=source)
