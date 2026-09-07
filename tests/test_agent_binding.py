@@ -335,6 +335,33 @@ class TestTurnOutcome(unittest.TestCase):
         self.assertEqual(terminal["tokens_in"], 15)
         self.assertEqual(terminal["tokens_out"], 3)
 
+    def test_the_run_record_names_who_actually_served_the_turn(self) -> None:
+        """Not what was CONFIGURED -- what answered.
+
+        A model ceiling can be refined down per turn, so a record carrying only
+        the requested model cannot answer the question anyone actually asks of
+        it afterwards ("which model produced this?").
+        """
+        from amplifier_agent import Usage, UsageEntry
+
+        recorder: dict = {}
+        usage = Usage(
+            entries=[
+                UsageEntry(
+                    provider="openai",
+                    model="gpt-5.6-luna",
+                    tokens_in=1,
+                    tokens_out=1,
+                )
+            ]
+        )
+        _, terminal = _run_worker(
+            _spec(self.tmp), agent=_FakeAgent(recorder, _events(usage=usage))
+        )
+        assert terminal is not None
+        self.assertEqual(terminal["provider"], "openai")
+        self.assertEqual(terminal["model"], "gpt-5.6-luna")
+
     def test_a_counter_the_library_did_not_report_stays_none(self) -> None:
         """VISION section 4: honestly absent, never a fabricated 0."""
         from amplifier_agent import Usage, UsageEntry
@@ -347,6 +374,9 @@ class TestTurnOutcome(unittest.TestCase):
         assert terminal is not None
         self.assertIsNone(terminal["tokens_in"])
         self.assertIsNone(terminal["cost_usd"])
+        # ...but WHO served it is still known, because the library names the
+        # provider and model on every entry regardless of the counters.
+        self.assertEqual(terminal["provider"], "openai")
 
     def test_cost_is_an_exact_decimal_string_not_a_float(self) -> None:
         from decimal import Decimal

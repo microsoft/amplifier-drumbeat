@@ -180,7 +180,11 @@ the library: `tokens_in`, `tokens_out`, `cache_read_tokens`, `cache_write_tokens
 
 Usage is read from the terminal event's `usage` snapshot, summed across
 `Usage.entries`. A counter the library did not report stays `None` — honestly absent,
-never a fabricated `0`.
+never a fabricated `0`. Each entry also names the provider and model that ACTUALLY
+served the turn, and the run record carries both per step (`provider`, `model`) —
+not the ones drumbeat asked for. A model ceiling can be refined down per turn, so
+"what was configured" and "what answered" are different facts and the record owes
+the second one.
 
 A turn is a **failure** when any of these hold:
 

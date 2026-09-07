@@ -184,10 +184,26 @@ def _usage_totals(usage: Any) -> dict[str, Any]:
         "cache_read_tokens": None,
         "cache_write_tokens": None,
         "cost_usd": None,
+        # WHO actually served the turn, read from the library's own usage
+        # entries -- not from what drumbeat asked for. A model ceiling can be
+        # refined down per turn, so "what was configured" and "what answered"
+        # are different facts, and the run record owes the second one. ``None``
+        # when the library reported no entry to read it from; comma-joined on
+        # the (rare) turn whose work spanned more than one.
+        "provider": None,
+        "model": None,
     }
     entries = getattr(usage, "entries", None) or []
     cost_total: Decimal | None = None
+    providers: list[str] = []
+    models: list[str] = []
     for entry in entries:
+        provider = getattr(entry, "provider", None)
+        if isinstance(provider, str) and provider and provider not in providers:
+            providers.append(provider)
+        model = getattr(entry, "model", None)
+        if isinstance(model, str) and model and model not in models:
+            models.append(model)
         for field in ("tokens_in", "tokens_out", "cache_read_tokens", "cache_write_tokens"):
             value = getattr(entry, field, None)
             if isinstance(value, int):
@@ -199,6 +215,10 @@ def _usage_totals(usage: Any) -> dict[str, Any]:
                 cost_total = usd if cost_total is None else cost_total + usd
     if cost_total is not None:
         totals["cost_usd"] = str(cost_total)
+    if providers:
+        totals["provider"] = ",".join(providers)
+    if models:
+        totals["model"] = ",".join(models)
     return totals
 
 
@@ -388,6 +408,8 @@ def _error_payload(exc: Any, *, totals: dict[str, Any] | None = None) -> dict[st
         "cache_read_tokens": None,
         "cache_write_tokens": None,
         "cost_usd": None,
+        "provider": None,
+        "model": None,
     }
     if totals:
         payload.update(totals)
