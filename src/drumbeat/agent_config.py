@@ -3,22 +3,23 @@
 Every turn runs under a single resolved agent config -- the authoritative source
 for provider selection, model, reasoning effort, MCP servers, and skills. This
 module resolves the ONE config each automation turn is handed, by merging up to
-four layers, lowest precedence first:
+three layers, lowest precedence first:
 
-  1. ``$AMPLIFIER_AGENT_CONFIG`` -- the operator's own config file, folded in as
-     the BASE. This layer is load-bearing: drumbeat sets that same variable on
-     every turn's worker (pointing at the file it materializes below), so
-     without folding the operator's file in, setting it would be SILENTLY
-     defeated. Absent/empty variable contributes nothing.
-  2. the workspace ``agent-config.yaml`` ``default:`` block -- the owner's
+  1. the workspace ``agent-config.yaml`` ``default:`` block -- the owner's
      baseline for every automation in this workspace.
-  3. a named ``profile`` (interactive/API turns) -- supplied by the caller;
+  2. a named ``profile`` (interactive/API turns) -- supplied by the caller;
      automation runs pass ``None``. The profile SOURCE (named profiles in
      ``agent-config.yaml``) is a separate lane; this module only provides the
      merge slot so that lane can drop a resolved profile in without touching
      the merge engine.
-  4. the automation's own ``agent_config:`` frontmatter block -- the most
+  3. the automation's own ``agent_config:`` frontmatter block -- the most
      specific policy an author can express, and the HIGHEST precedence layer.
+
+The operator's own ``$AMPLIFIER_AGENT_CONFIG`` file is deliberately NOT one of
+these layers. It belongs to the agent library and speaks the library's five-key
+host-config vocabulary, not this one; it is folded in as the BASE of the HOST
+config below (``operator_host_config`` -> ``build_host_config``), where the two
+speak the same language. drumbeat's own per-automation policy still wins.
 
 Merge rules, deliberately boring so an author can predict the result:
 
@@ -65,9 +66,10 @@ TWO artifacts come out of one resolution, and the split is deliberate
     drives provider-change rotation.
   * the HOST config -- the agent library's own five-key vocabulary, written to
     ``<runs_dir>/agent_host_configs/<slug>.json`` and handed to the turn's
-    worker as ``$AMPLIFIER_AGENT_CONFIG``. This is the ONLY channel through
-    which reasoning effort can reach a provider request: the library accepts
-    ``extra_request_params`` from a file and from nowhere else.
+    worker as ``$AMPLIFIER_AGENT_CONFIG``, with the operator's own file as its
+    base. This is the ONLY channel through which reasoning effort can reach a
+    provider request: the library accepts ``extra_request_params`` from a file
+    and from nowhere else.
 
 ``skills`` and ``mcp`` appear in NEITHER file: the library takes both in code
 (``AgentOptions.skills`` / ``.mcp_servers``) and its host-config vocabulary has
@@ -565,11 +567,16 @@ def build_host_config(
     provider_module: str,
     model: str | None,
     source: str,
+    base: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Project a merged config onto the agent library's host-config vocabulary.
 
     Three keys, at most: ``provider``, ``model``, and -- only when the config
-    declares a ``reasoning_effort`` -- ``extra_request_params``.
+    declares a ``reasoning_effort`` -- ``extra_request_params``. ``base`` is the
+    operator's own file (``operator_host_config``); drumbeat's per-automation
+    policy overrides it key by key, and ``extra_request_params`` MERGES per
+    provider rather than replacing, so an operator's unrelated request setting
+    survives an automation setting an effort.
 
     Reasoning effort is the whole reason this file exists. The library has no
     ``AgentOptions`` field for it and no environment form; a config FILE is the
@@ -579,7 +586,7 @@ def build_host_config(
     scope it under would validate, be written, and do nothing -- refused loudly
     here rather than shipped inert.
     """
-    out: dict[str, Any] = {}
+    out: dict[str, Any] = copy.deepcopy(dict(base or {}))
     if provider_module != LIBRARY_DEFAULT_PROVIDER:
         out["provider"] = provider_module
     if model:
@@ -596,9 +603,10 @@ def build_host_config(
             "parameters BY PROVIDER, so an unscoped effort would be written and "
             "silently ignored; name the provider (e.g. provider.module: openai)"
         )
-    out["extra_request_params"] = {
-        provider_module: {"reasoning": {"effort": effort}}
-    }
+    out["extra_request_params"] = merge_config(
+        out.get("extra_request_params") or {},
+        {provider_module: {"reasoning": {"effort": effort}}},
+    )
     return out
 
 
@@ -707,19 +715,35 @@ def _parse_mapping(text: str, *, source: str) -> dict[str, Any]:
     return data
 
 
-def _load_env_layer(
-    env: Mapping[str, str], *, policy: ModelPolicy | None = None
-) -> dict[str, Any] | None:
-    """Layer 1: the ``$AMPLIFIER_AGENT_CONFIG`` file, or ``None`` if unset."""
+def operator_host_config(env: Mapping[str, str]) -> dict[str, Any]:
+    """The operator's own ``$AMPLIFIER_AGENT_CONFIG`` file, or ``{}`` if unset.
+
+    This file belongs to the AGENT LIBRARY, not to drumbeat: it speaks the
+    library's five-key host-config vocabulary, not the ``agent_config:``
+    authoring vocabulary, so it is NOT one of the merge layers. It is folded in
+    as the BASE of the host config drumbeat materializes
+    (``build_host_config``), where the two speak the same language.
+
+    Folding it in at all is load-bearing. drumbeat sets that same variable on
+    every turn's worker, pointing at the file it wrote; without this, an
+    operator who set it to change a provider request would be SILENTLY
+    overridden -- the exact fail-quietly shape this module exists to prevent.
+    drumbeat's own resolved provider/model/effort still WIN, because they are
+    per-automation policy and this is a process-wide default.
+
+    Fail-loud on a variable pointing at nothing, an unreadable or non-object
+    file, a key outside the library's closed vocabulary, a credential-bearing
+    key at any depth, or a null.
+    """
     raw = env.get(ENV_CONFIG_VAR)
     if not raw or not raw.strip():
-        return None
+        return {}
     path = Path(raw).expanduser()
     if not path.is_file():
         raise AgentConfigError(
             f"{ENV_CONFIG_VAR}={raw!r}: file not found -- unset the variable or "
-            "point it at a real amplifier-agent config file (it is folded in as "
-            "the base layer of every automation's agent config)"
+            "point it at a real agent host-config file (it is folded in as the "
+            "base of the host config every turn is handed)"
         )
     try:
         text = path.read_text(encoding="utf-8")
@@ -730,8 +754,18 @@ def _load_env_layer(
     source = f"{ENV_CONFIG_VAR} ({path})"
     data = _parse_mapping(text, source=source)
     if not data:
-        return None
-    return validate_config_layer(data, source=source, policy=policy)
+        return {}
+    unknown = sorted(set(data) - set(HOST_CONFIG_KEYS))
+    if unknown:
+        raise AgentConfigError(
+            f"{source}: unknown host-config key(s) {unknown} -- the agent "
+            f"library's vocabulary is closed to {list(HOST_CONFIG_KEYS)}. This "
+            "file is the LIBRARY's config, not drumbeat's `agent_config:` block; "
+            "per-automation policy belongs in the automation file or the "
+            f"workspace {WORKSPACE_CONFIG_FILENAME}"
+        )
+    _scan_forbidden(data, source=source, path="")
+    return data
 
 
 def _read_workspace_config(workspace: Path) -> tuple[Path, dict[str, Any]]:
@@ -935,7 +969,7 @@ def resolve(
 ) -> ResolvedAgentConfig:
     """Resolve and materialize one automation's per-turn host config.
 
-    Merges the four layers (see the module docstring) and, when the result is
+    Merges the three layers (see the module docstring) and, when the result is
     non-empty, writes it atomically to
     ``<runs_dir>/automation_host_configs/<slug>.json`` (rewritten each run, so
     it can never drift from the sources on disk) and returns its path + sha.
@@ -955,11 +989,9 @@ def resolve(
 
     policy = load_model_policy(workspace)
 
-    layers: list[Mapping[str, Any]] = []
+    operator_base = operator_host_config(env)
 
-    env_layer = _load_env_layer(env, policy=policy)
-    if env_layer:
-        layers.append(env_layer)
+    layers: list[Mapping[str, Any]] = []
 
     workspace_layer = _load_workspace_default(workspace, policy=policy)
     if workspace_layer:
@@ -982,25 +1014,39 @@ def resolve(
 
     provider_module = effective_provider_module(merged)
 
+    source = f"agent config for automation {slug!r}"
+
     if not merged:
+        # No drumbeat-side policy at all: nothing to materialize as a MERGED
+        # config, and nothing recorded on the run record. The operator's own
+        # host config still reaches the turn, unchanged -- overriding it here
+        # would be the silent defeat this seam exists to prevent.
         return ResolvedAgentConfig(
-            path=None, sha=None, provider_module=provider_module, config={}
+            path=None,
+            sha=None,
+            provider_module=provider_module,
+            config={},
+            host_config_path=(
+                _materialize(runs_dir, HOST_CONFIG_DIRNAME, slug, operator_base)[0]
+                if operator_base
+                else None
+            ),
         )
 
     merged, resolution, warnings = _apply_model_policy(
         merged,
         provider_module=provider_module,
         policy=policy,
-        source=f"agent config for automation {slug!r}",
+        source=source,
     )
 
-    source = f"agent config for automation {slug!r}"
     path, sha = _materialize(runs_dir, MATERIALIZED_DIRNAME, slug, merged)
     host_config = build_host_config(
         merged,
         provider_module=provider_module,
         model=(resolution.model if resolution else None),
         source=source,
+        base=operator_base,
     )
     host_config_path = (
         _materialize(runs_dir, HOST_CONFIG_DIRNAME, slug, host_config)[0]
@@ -1088,12 +1134,11 @@ def resolve_turn(
 ) -> ResolvedAgentConfig:
     """Resolve one interactive/API turn's host config from the layered merge.
 
-    The layers, lowest precedence first: the ``$AMPLIFIER_AGENT_CONFIG`` base,
-    the workspace ``agent-config.yaml`` ``default:`` block, and -- when the turn
-    names one -- a ``profile`` looked up in that same file's ``profiles:`` block
-    (layer 3 of the shared merge). ``profile=None`` merges only the base and
-    ``default:`` layers: a profile-less turn uses the default, exactly as the
-    spec requires. An unknown profile name fails loud (``select_profile``),
+    The layers, lowest precedence first: the workspace ``agent-config.yaml``
+    ``default:`` block, and -- when the turn names one -- a ``profile`` looked
+    up in that same file's ``profiles:`` block. ``profile=None`` merges only
+    ``default:``: a profile-less turn uses the default, exactly as the spec
+    requires. An unknown profile name fails loud (``select_profile``),
     listing the available profiles.
 
     **Deliberately no ``automation_config`` parameter, unlike ``resolve()``.**
@@ -1117,11 +1162,9 @@ def resolve_turn(
 
     policy = load_model_policy(workspace)
 
-    layers: list[Mapping[str, Any]] = []
+    operator_base = operator_host_config(env)
 
-    env_layer = _load_env_layer(env, policy=policy)
-    if env_layer:
-        layers.append(env_layer)
+    layers: list[Mapping[str, Any]] = []
 
     workspace_layer = _load_workspace_default(workspace, policy=policy)
     if workspace_layer:
@@ -1136,25 +1179,35 @@ def resolve_turn(
 
     provider_module = effective_provider_module(merged)
 
+    source = f"agent config for turn {key!r}"
+
     if not merged:
         return ResolvedAgentConfig(
-            path=None, sha=None, provider_module=provider_module, config={}
+            path=None,
+            sha=None,
+            provider_module=provider_module,
+            config={},
+            host_config_path=(
+                _materialize(runs_dir, HOST_CONFIG_DIRNAME, key, operator_base)[0]
+                if operator_base
+                else None
+            ),
         )
 
     merged, resolution, warnings = _apply_model_policy(
         merged,
         provider_module=provider_module,
         policy=policy,
-        source=f"agent config for turn {key!r}",
+        source=source,
     )
 
-    source = f"agent config for turn {key!r}"
     path, sha = _materialize(runs_dir, TURN_MATERIALIZED_DIRNAME, key, merged)
     host_config = build_host_config(
         merged,
         provider_module=provider_module,
         model=(resolution.model if resolution else None),
         source=source,
+        base=operator_base,
     )
     host_config_path = (
         _materialize(runs_dir, HOST_CONFIG_DIRNAME, key, host_config)[0]
@@ -1175,12 +1228,12 @@ def resolve_turn(
 
 __all__ = [
     "ALLOWED_TOP_LEVEL_KEYS",
-    "LIBRARY_DEFAULT_PROVIDER",
     "DEFAULT_DENIED_MODELS",
     "DEFAULT_MODEL_POLICY",
     "ENV_CONFIG_VAR",
     "HOST_CONFIG_DIRNAME",
     "HOST_CONFIG_KEYS",
+    "LIBRARY_DEFAULT_PROVIDER",
     "MATERIALIZED_DIRNAME",
     "MODEL_CLASS_TABLE",
     "TURN_MATERIALIZED_DIRNAME",
@@ -1198,6 +1251,7 @@ __all__ = [
     "load_profiles",
     "mcp_servers",
     "merge_config",
+    "operator_host_config",
     "resolve",
     "resolve_model",
     "resolve_turn",

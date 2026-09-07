@@ -203,11 +203,11 @@ def test_model_class_outside_provider_config_is_refused_not_forwarded() -> None:
     this module has -- `model_class` only resolves at provider.config."""
     with pytest.raises(AgentConfigError) as exc:
         agent_config.validate_config_layer(
-            {"providers": {"openai": {"config": {"model_class": "fast"}}}},
+            {"mcp": {"openai": {"env": {"model_class": "fast"}}}},
             source="x",
         )
     msg = str(exc.value)
-    assert "providers.openai.config.model_class" in msg
+    assert "mcp.openai.env.model_class" in msg
     assert "provider.config.model_class" in msg
 
 

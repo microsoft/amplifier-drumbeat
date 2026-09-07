@@ -249,7 +249,7 @@ class TestHealthReport(unittest.TestCase):
         if failed:
             (run_dir / "stderr.log").write_text(REAL_CEILING_STDERR, encoding="utf-8")
 
-    def test_flags_dead_and_leaves_size_as_an_aside(self) -> None:
+    def test_flags_dead_and_leaves_prompt_tokens_as_an_aside(self) -> None:
         runs_dir = self.tmp_path / "runs"
         self._write_run(runs_dir, "20260807T000000Z", session_id="demo-1", failed=True)
 
@@ -258,16 +258,15 @@ class TestHealthReport(unittest.TestCase):
         (report,) = session_health.health_for(
             [automation],
             runs_dir=runs_dir,
-            agent_home=self.tmp_path / "agent-home",
-            workspace="-ws",
         )
         assert report.ceiling_hit is not None
         self.assertEqual(report.ceiling_hit.prompt_tokens, 219685)
         self.assertEqual(report.consecutive_failures, 1)
         self.assertIn("DEAD", report.detail)
-        # No transcript on disk in this fixture: size is unknown, and that
-        # is explicitly not an error, because size is never a trigger.
-        self.assertIsNone(report.transcript_bytes)
+        # The failed run in this fixture carries no token counts, so the
+        # prompt-token aside is honestly absent -- explicitly not an error,
+        # because it is never a trigger here (the runner enforces the gate).
+        self.assertIsNone(report.prompt_tokens)
 
     def test_a_predecessors_ceiling_hit_is_not_charged_to_the_fresh_session(
         self,
@@ -288,8 +287,6 @@ class TestHealthReport(unittest.TestCase):
         (report,) = session_health.health_for(
             [automation],
             runs_dir=runs_dir,
-            agent_home=self.tmp_path / "agent-home",
-            workspace="-ws",
         )
         self.assertIsNone(report.ceiling_hit)
         self.assertEqual(report.consecutive_failures, 0)
@@ -300,8 +297,6 @@ class TestHealthReport(unittest.TestCase):
         (report,) = session_health.health_for(
             [automation],
             runs_dir=self.tmp_path / "runs",
-            agent_home=self.tmp_path / "agent-home",
-            workspace="-ws",
         )
         self.assertIsNone(report.session_id)
         self.assertIsNone(report.ceiling_hit)

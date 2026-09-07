@@ -34,7 +34,7 @@ from unittest import mock
 
 from drumbeat import runner, session_pins
 from drumbeat.automation import load_from_text
-from drumbeat.paths import derive_workspace_slug
+from drumbeat.paths import agent_session_storage, derive_workspace_slug
 
 _CHAT_AUTOMATION_WITH_INJECT = """---
 automation:
@@ -79,12 +79,10 @@ class _RunnerFixture(unittest.TestCase):
         self.runs_dir = self.tmp_path / "runs"
         self.runs_dir.mkdir()
 
-        self.agent_home = self.tmp_path / "agent-home"
 
         env_patch = mock.patch.dict(
             os.environ,
             {
-                "AMPLIFIER_AGENT_HOME": str(self.agent_home),
                 "AMPLIFIER_AGENT_WORKSPACE": "",
                 "CONTEXT_INTELLIGENCE_PERSONAL": "",
             },
@@ -108,16 +106,10 @@ class _RunnerFixture(unittest.TestCase):
             created_by=session_pins.CREATED_BY_RUN,
             runs_dir=self.runs_dir,
         )
-        session_dir = (
-            self.agent_home
-            / "state"
-            / "workspaces"
-            / self.workspace_slug
-            / "sessions"
-            / session_id
+        session_dir = agent_session_storage(
+            session_id, runs_dir=self.runs_dir
         )
         session_dir.mkdir(parents=True)
-        (session_dir / "transcript.jsonl").write_text("{}\n", encoding="utf-8")
 
     def _state_tool(self, stdout: str = "STATE: 42 open items\n") -> Path:
         return _write_tool(self.workspace, f"printf %s '{stdout}'")

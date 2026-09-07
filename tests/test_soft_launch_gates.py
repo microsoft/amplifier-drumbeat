@@ -63,16 +63,17 @@ class TestAgentCommandPreflight(unittest.TestCase):
 
     def test_present_engine_library_resolves_to_a_descriptor(self) -> None:
         # Every turn runs `python -m drumbeat.agent_worker` under sys.executable
-        # and imports the engine library there; the preflight imports it in a
-        # fresh subprocess of that same interpreter. In this test venv the
-        # library IS installed (a declared dependency), so the preflight returns
-        # a non-None descriptor naming it.
+        # and imports the agent library there; the preflight runs that same
+        # module's --preflight mode in a fresh subprocess of that same
+        # interpreter. In this test venv the library IS installed (a declared
+        # dependency), so the preflight returns a non-None descriptor naming it
+        # -- and it is a REAL `import amplifier_agent`, not a stub.
         with tempfile.TemporaryDirectory() as tmp:
             root = _workspace(tmp)
             descriptor = runner.check_agent_command(root)
             self.assertIsNotNone(descriptor)
             assert descriptor is not None
-            self.assertIn("amplifier-agent engine library", descriptor)
+            self.assertIn("amplifier-agent library", descriptor)
 
     def test_missing_engine_library_is_detected(self) -> None:
         # Simulate the library being unimportable: the import subprocess exits

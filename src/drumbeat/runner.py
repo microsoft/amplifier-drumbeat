@@ -1702,7 +1702,7 @@ _PROVIDER_UNAVAILABLE_REPLY_RE = re.compile(
 )
 
 
-def _dead_brain_error(outcome: "_TurnOutcome") -> str | None:
+def _dead_brain_error(outcome: _TurnOutcome) -> str | None:
     """Why this apparently-successful turn must be recorded as a FAILURE.
 
     Two rules, both drumbeat's own, both closing the same defect class: a turn

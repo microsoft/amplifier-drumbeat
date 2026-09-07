@@ -2,8 +2,8 @@
 
 An interactive/API turn may carry ``profile: <name>``; the named profile is
 looked up in the workspace ``agent-config.yaml`` ``profiles:`` block and folded
-in as layer 3 of the shared agent-config merge (base env -> ``default:`` ->
-profile -> automation ``agent_config:``). The
+in as a layer of the shared agent-config merge (``default:`` -> profile ->
+automation ``agent_config:``). The
 vocabulary of NAMES is OPEN -- the owner picks them -- but each profile's config
 is held to the SAME closed top-level vocabulary and recursive credential/null
 refusal as every other layer.
@@ -13,8 +13,9 @@ Every test here is red-provable: delete the mechanism and the test fails.
 The load-bearing end-to-end pin is
 ``test_quick_profile_runs_the_worker_with_that_provider_model``: a real
 ``resume_turn`` over a real ``agent-config.yaml`` profile, asserting the turn
-hands the worker a ``host_config_path`` pointing at a host config whose
-``default_model`` is the profile's model. Its companions prove a profile-less
+hands the worker the profile's model BOTH ways it can reach the agent library:
+in the task spec (which becomes ``AgentOptions.model``) and in the host config
+the worker is pointed at via ``$AMPLIFIER_AGENT_CONFIG``. Its companions prove a profile-less
 turn uses the ``default:`` layer, an unknown profile fails loud LISTING the
 available profiles, and credentials in a profile are refused.
 """
@@ -328,9 +329,8 @@ def test_submit_turn_refuses_unknown_profile_400_listing_available(
 
 class _FakeWorkerProc:
     """Stand-in for the worker ``subprocess.Popen`` handle. Captures the
-    task-spec JSON written to stdin (which carries ``host_config_path`` -- the
-    materialized ``--config`` a profiled turn threads to the worker) and replays
-    one successful terminal envelope."""
+    task-spec JSON written to stdin (which carries the resolved provider/model)
+    and replays one successful terminal envelope."""
 
     def __init__(self, captured: dict) -> None:
         self.pid = 424243
@@ -359,22 +359,27 @@ class _Sink:
 
 
 def _capture_spawn(monkeypatch: pytest.MonkeyPatch) -> dict:
-    """Patch the worker spawn seam (``runner.subprocess.Popen``); capture the
-    task spec written to the worker's stdin -- notably ``host_config_path``, the
-    materialized config a profiled turn threads to the worker -- and succeed with
-    a fixed reply.
+    """Patch the worker spawn seam (``runner.subprocess.Popen``); capture both
+    the task spec written to the worker's stdin AND the environment the worker
+    is spawned with -- the two channels a resolved config reaches the agent
+    library through -- and succeed with a fixed reply.
     """
     captured: dict = {}
 
     def fake_popen(args, **kwargs):  # noqa: ANN001, ANN002
+        captured["env"] = dict(kwargs.get("env") or {})
         return _FakeWorkerProc(captured)
 
     monkeypatch.setattr(runner.subprocess, "Popen", fake_popen)
     return captured
 
 
-def _spec_host_config_path(captured: dict) -> str | None:
-    return json.loads("".join(captured["stdin_sink"]))["host_config_path"]
+def _spec(captured: dict) -> dict:
+    return json.loads("".join(captured["stdin_sink"]))
+
+
+def _spec_agent_config_path(captured: dict) -> str | None:
+    return captured["env"].get(agent_config.ENV_CONFIG_VAR)
 
 
 def test_quick_profile_runs_the_worker_with_that_provider_model(
@@ -393,10 +398,10 @@ def test_quick_profile_runs_the_worker_with_that_provider_model(
         f"        default_model: {QUICK_MODEL}\n",
     )
 
-    host_config_path = agent_config.resolve_turn(
+    resolved = agent_config.resolve_turn(
         runs_dir=runs, workspace=workspace, key="t-e2e", profile="quick", env={}
-    ).path
-    assert host_config_path is not None
+    )
+    assert resolved.path is not None
 
     captured = _capture_spawn(monkeypatch)
     runner.resume_turn(
@@ -404,15 +409,21 @@ def test_quick_profile_runs_the_worker_with_that_provider_model(
         "what's on my calendar?",
         cwd=workspace,
         runs_dir=runs,
-        host_config_path=host_config_path,
+        resolved_config=resolved,
     )
 
-    config_path = _spec_host_config_path(captured)
+    # Channel 1: the task spec, which becomes AgentOptions.model.
+    assert _spec(captured)["model"] == QUICK_MODEL
+
+    # Channel 2: the host config file the worker is pointed at. Both must
+    # agree -- they come from the one ResolvedAgentConfig, so they cannot
+    # disagree about which policy the turn ran on.
+    config_path = _spec_agent_config_path(captured)
     assert config_path is not None, (
-        "a profiled turn must hand the worker a host config (host_config_path)"
+        "a profiled turn must point the worker at a host config"
     )
     written = json.loads(Path(config_path).read_text(encoding="utf-8"))
-    assert written["provider"]["config"]["default_model"] == QUICK_MODEL
+    assert written["model"] == QUICK_MODEL
 
 
 def test_turn_without_profile_or_config_uses_no_config(
@@ -423,11 +434,12 @@ def test_turn_without_profile_or_config_uses_no_config(
     runs = tmp_path / "runs"
     runs.mkdir()
     # No agent-config.yaml at all: a profile-less turn resolves to nothing and
-    # runs unchanged, on the bundle default model.
-    host_config_path = agent_config.resolve_turn(
+    # runs unchanged, on the agent library's own default model.
+    resolved = agent_config.resolve_turn(
         runs_dir=runs, workspace=workspace, key="t-none", profile=None, env={}
-    ).path
-    assert host_config_path is None
+    )
+    assert resolved.path is None
+    assert resolved.host_config_path is None
 
     captured = _capture_spawn(monkeypatch)
     runner.resume_turn(
@@ -435,9 +447,12 @@ def test_turn_without_profile_or_config_uses_no_config(
         "hello",
         cwd=workspace,
         runs_dir=runs,
-        host_config_path=host_config_path,
+        resolved_config=resolved,
     )
 
-    assert _spec_host_config_path(captured) is None, (
-        "a turn with no profile and no config must run unchanged, on the default model"
+    assert _spec(captured)["model"] is None
+    assert _spec(captured)["provider"] is None
+    assert _spec_agent_config_path(captured) is None, (
+        "a turn with no profile and no config must run unchanged, on the "
+        "library's own default -- and must not inherit a stale config file"
     )

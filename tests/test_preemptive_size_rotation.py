@@ -5,19 +5,12 @@ prompt (``runner``'s Trigger 1, ceiling hit -- see
 ``test_auto_rotation_and_failure_push.py``). That backstop is correct and
 stays; it is also, by construction, always one failed run late.
 
-Measured on this deployment's own 8-day window (4,133 runs carrying a
-``session_transcript_bytes_at_start``, 157 sessions):
-
-- every one of the 41 observed ``ContextLengthError`` runs started from a
-  transcript of at least 5,586,751 bytes;
-- 1,138 runs started at or below 5,000,000 bytes and NOT ONE of them hit
-  the ceiling;
-- measured per-run transcript growth is 0.29 / 0.41 / 0.64 MB at the
-  25th / 50th / 75th percentile.
-
-Hence ``runner._DEFAULT_SESSION_ROTATE_BYTES == 5_000_000``: a gate that
-would have pre-empted every observed crash while still giving a session on
-the order of a dozen runs from a cold start.
+The gate measures PROMPT TOKENS -- the unit the provider actually refuses on
+(``prompt is too long: 219685 tokens > 200000 maximum``) and the count the
+agent library itself reports on every turn. The two sessions whose true prompt
+sizes the provider ever reported crashed at 219,685 and 201,361 tokens, so
+``runner._DEFAULT_SESSION_ROTATE_TOKENS == 150_000`` sits a quarter below the
+smallest observed refusal, with room for one more turn's growth.
 
 House style (see ``test_auto_rotation_and_failure_push.py``): drive the REAL
 production functions and check their real on-disk side effects. The only
@@ -40,7 +33,7 @@ from unittest import mock
 
 from drumbeat import engine_events, runner, session_pins
 from drumbeat.automation import load
-from drumbeat.paths import derive_workspace_slug
+from drumbeat.paths import agent_session_storage, derive_workspace_slug
 
 _AUTOMATION = """---
 automation:
@@ -55,11 +48,11 @@ automation:
 ---
 """
 
-# Small enough to keep the fixture's fake transcripts tiny, exercised through
-# the SAME env-var seam an operator uses. The default itself is asserted
-# separately (TestDefaultThresholdIsTheMeasuredOne) so shrinking it here can
-# never quietly become "the default is whatever the test says".
-_TEST_GATE_BYTES = 1_000
+# Small enough to keep the fixture's recorded token counts tiny, exercised
+# through the SAME env-var seam an operator uses. The default itself is
+# asserted separately (TestDefaultThresholdIsTheMeasuredOne) so shrinking it
+# here can never quietly become "the default is whatever the test says".
+_TEST_GATE_TOKENS = 1_000
 
 
 class _SizeRotationFixture(unittest.TestCase):
@@ -76,15 +69,13 @@ class _SizeRotationFixture(unittest.TestCase):
         self.runs_dir = self.tmp_path / "runs"
         self.runs_dir.mkdir()
 
-        self.agent_home = self.tmp_path / "agent-home"
 
         env_patch = mock.patch.dict(
             os.environ,
             {
-                "AMPLIFIER_AGENT_HOME": str(self.agent_home),
                 "AMPLIFIER_AGENT_WORKSPACE": "",
                 "CONTEXT_INTELLIGENCE_PERSONAL": "",
-                "DRUMBEAT_SESSION_ROTATE_BYTES": str(_TEST_GATE_BYTES),
+                "DRUMBEAT_SESSION_ROTATE_TOKENS": str(_TEST_GATE_TOKENS),
             },
         )
         env_patch.start()
@@ -97,13 +88,16 @@ class _SizeRotationFixture(unittest.TestCase):
 
     # ---- helpers -----------------------------------------------------
 
-    def _pin_session_with_transcript(self, session_id: str, *, size_bytes: int) -> Path:
-        """Pin ``session_id`` and give it a real transcript of exactly ``size_bytes``.
+    def _pin_session_with_prompt_tokens(
+        self, session_id: str, *, tokens_in: int
+    ) -> Path:
+        """Pin ``session_id``, give it real agent storage, and leave a real run
+        record behind carrying ``tokens_in``.
 
-        Mirrors amplifier-agent's on-disk session layout (see
-        ``runner._session_dir``) so the pinned-session probe resolves EXISTS
-        and ``runner._transcript_stats`` reads a genuine ``st_size`` -- the
-        gate must be proven against a real file, never a stubbed number.
+        Both halves matter and neither is stubbed: the storage directory is what
+        the pinned-session probe stats to resolve EXISTS, and the run record is
+        where ``runner._session_prompt_tokens`` reads the measurement -- the
+        same file ``_persist_run`` writes on every real run.
         """
         session_pins.upsert(
             self.automation.slug,
@@ -112,23 +106,25 @@ class _SizeRotationFixture(unittest.TestCase):
             created_by=session_pins.CREATED_BY_RUN,
             runs_dir=self.runs_dir,
         )
-        session_dir = (
-            self.agent_home
-            / "state"
-            / "workspaces"
-            / self.workspace_slug
-            / "sessions"
-            / session_id
+        storage = agent_session_storage(session_id, runs_dir=self.runs_dir)
+        storage.mkdir(parents=True)
+
+        run_dir = self.runs_dir / self.automation.slug / "20260801T000000Z-prior"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "result.json").write_text(
+            json.dumps(
+                {
+                    "run_id": "20260801T000000Z-prior",
+                    "session_id": session_id,
+                    "failed": False,
+                    "steps": [
+                        {"index": 0, "tokens_in": tokens_in, "tokens_out": 7}
+                    ],
+                }
+            ),
+            encoding="utf-8",
         )
-        session_dir.mkdir(parents=True)
-        transcript = session_dir / "transcript.jsonl"
-        # One well-formed JSONL line padded to the requested size, so the file
-        # is both the right size AND readable as a transcript.
-        filler = "x" * max(0, size_bytes - len('{"pad": ""}\n'))
-        transcript.write_text(json.dumps({"pad": filler}) + "\n", encoding="utf-8")
-        actual = transcript.stat().st_size
-        self.assertEqual(actual, size_bytes, "fixture transcript is the wrong size")
-        return transcript
+        return storage
 
     def _rotation_lines(self) -> list[dict]:
         path = self.runs_dir / "session_rotations.jsonl"
@@ -174,8 +170,8 @@ class TestOverThresholdRotatesBeforeTheTurn(_SizeRotationFixture):
 
     def test_oversized_session_rotates_first_then_the_run_proceeds(self) -> None:
         old_session_id = f"{self.automation.slug}-20260801T000000Z-aaaaaa"
-        transcript = self._pin_session_with_transcript(
-            old_session_id, size_bytes=_TEST_GATE_BYTES + 1
+        storage = self._pin_session_with_prompt_tokens(
+            old_session_id, tokens_in=_TEST_GATE_TOKENS + 1
         )
 
         result, submit_turn, stderr = self._run()
@@ -204,8 +200,8 @@ class TestOverThresholdRotatesBeforeTheTurn(_SizeRotationFixture):
         self.assertEqual(entry["old_session_id"], old_session_id)
         self.assertTrue(entry["reason"].startswith("auto:"))
         self.assertIn("size threshold", entry["reason"])
-        self.assertIn(str(_TEST_GATE_BYTES + 1), entry["reason"])
-        self.assertIn(str(_TEST_GATE_BYTES), entry["reason"])
+        self.assertIn(str(_TEST_GATE_TOKENS + 1), entry["reason"])
+        self.assertIn(str(_TEST_GATE_TOKENS), entry["reason"])
 
         # 5. Never silent: the operator sees it on stderr too.
         self.assertIn("AUTO-ROTATING", stderr)
@@ -213,7 +209,8 @@ class TestOverThresholdRotatesBeforeTheTurn(_SizeRotationFixture):
 
         # 6. Same continuity contract the crash path already honours: the pin
         #    is re-written to the fresh session, a session_rotated event is
-        #    emitted, and the old transcript is left on disk untouched.
+        #    emitted, and the abandoned session's storage is left on disk
+        #    untouched.
         pin = session_pins.get(self.automation.slug, runs_dir=self.runs_dir)
         self.assertIsNotNone(pin)
         assert pin is not None
@@ -221,13 +218,12 @@ class TestOverThresholdRotatesBeforeTheTurn(_SizeRotationFixture):
         rotated_events = self._outbox_events(engine_events.EventType.SESSION_ROTATED)
         self.assertEqual(len(rotated_events), 1)
         self.assertEqual(rotated_events[0]["old_session_id"], old_session_id)
-        self.assertTrue(transcript.is_file())
-        self.assertEqual(transcript.stat().st_size, _TEST_GATE_BYTES + 1)
+        self.assertTrue(storage.is_dir())
 
     def test_rotation_log_entry_has_the_full_recorded_shape(self) -> None:
         old_session_id = f"{self.automation.slug}-20260801T000000Z-cccccc"
-        self._pin_session_with_transcript(
-            old_session_id, size_bytes=_TEST_GATE_BYTES * 3
+        self._pin_session_with_prompt_tokens(
+            old_session_id, tokens_in=_TEST_GATE_TOKENS * 3
         )
 
         self._run()
@@ -240,7 +236,7 @@ class TestOverThresholdRotatesBeforeTheTurn(_SizeRotationFixture):
         self.assertEqual(entry["automation"], self.automation.name)
         self.assertEqual(entry["slug"], self.automation.slug)
         self.assertEqual(entry["path"], str(self.automation.path))
-        self.assertIn(str(_TEST_GATE_BYTES * 3), entry["reason"])
+        self.assertIn(str(_TEST_GATE_TOKENS * 3), entry["reason"])
 
 
 class TestUnderThresholdNeverRotates(_SizeRotationFixture):
@@ -250,7 +246,7 @@ class TestUnderThresholdNeverRotates(_SizeRotationFixture):
 
     def test_under_threshold_session_is_resumed_untouched(self) -> None:
         session_id = f"{self.automation.slug}-20260802T000000Z-bbbbbb"
-        self._pin_session_with_transcript(session_id, size_bytes=_TEST_GATE_BYTES - 1)
+        self._pin_session_with_prompt_tokens(session_id, tokens_in=_TEST_GATE_TOKENS - 1)
 
         result, submit_turn, _ = self._run()
 
@@ -271,7 +267,7 @@ class TestUnderThresholdNeverRotates(_SizeRotationFixture):
         """The gate is strictly ``>``. A boundary that rotates AT the value
         would make the documented number mean something other than it says."""
         session_id = f"{self.automation.slug}-20260802T000000Z-dddddd"
-        self._pin_session_with_transcript(session_id, size_bytes=_TEST_GATE_BYTES)
+        self._pin_session_with_prompt_tokens(session_id, tokens_in=_TEST_GATE_TOKENS)
 
         result, _, _ = self._run()
 
@@ -284,20 +280,20 @@ class TestDefaultThresholdIsTheMeasuredOne(unittest.TestCase):
     """The default is a measured claim (see this module's docstring), so it is
     pinned here rather than left to drift silently."""
 
-    def test_default_is_five_million_bytes(self) -> None:
-        self.assertEqual(runner._DEFAULT_SESSION_ROTATE_BYTES, 5_000_000)
+    def test_default_is_the_calibrated_token_gate(self) -> None:
+        self.assertEqual(runner._DEFAULT_SESSION_ROTATE_TOKENS, 150_000)
 
     def test_unset_env_yields_the_default(self) -> None:
-        with mock.patch.dict(os.environ, {"DRUMBEAT_SESSION_ROTATE_BYTES": ""}):
+        with mock.patch.dict(os.environ, {"DRUMBEAT_SESSION_ROTATE_TOKENS": ""}):
             self.assertEqual(
-                runner._session_rotate_bytes(), runner._DEFAULT_SESSION_ROTATE_BYTES
+                runner._session_rotate_tokens(), runner._DEFAULT_SESSION_ROTATE_TOKENS
             )
 
     def test_positive_override_is_honoured(self) -> None:
         with mock.patch.dict(
-            os.environ, {"DRUMBEAT_SESSION_ROTATE_BYTES": "123456789"}
+            os.environ, {"DRUMBEAT_SESSION_ROTATE_TOKENS": "123456789"}
         ):
-            self.assertEqual(runner._session_rotate_bytes(), 123456789)
+            self.assertEqual(runner._session_rotate_tokens(), 123456789)
 
     def test_unusable_override_falls_back_loudly(self) -> None:
         """FAIL LOUD: an unusable value must not be silently honoured as
@@ -306,12 +302,12 @@ class TestDefaultThresholdIsTheMeasuredOne(unittest.TestCase):
             with self.subTest(raw=raw):
                 buf = io.StringIO()
                 with (
-                    mock.patch.dict(os.environ, {"DRUMBEAT_SESSION_ROTATE_BYTES": raw}),
+                    mock.patch.dict(os.environ, {"DRUMBEAT_SESSION_ROTATE_TOKENS": raw}),
                     redirect_stderr(buf),
                 ):
-                    value = runner._session_rotate_bytes()
-                self.assertEqual(value, runner._DEFAULT_SESSION_ROTATE_BYTES)
-                self.assertIn("DRUMBEAT_SESSION_ROTATE_BYTES", buf.getvalue())
+                    value = runner._session_rotate_tokens()
+                self.assertEqual(value, runner._DEFAULT_SESSION_ROTATE_TOKENS)
+                self.assertIn("DRUMBEAT_SESSION_ROTATE_TOKENS", buf.getvalue())
 
 
 if __name__ == "__main__":
