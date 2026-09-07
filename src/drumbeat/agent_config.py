@@ -1,15 +1,15 @@
-"""Layered per-automation agent config -> ONE materialized host config per turn.
+"""Layered per-automation agent config -> ONE materialized policy per turn.
 
-Every turn runs under a single host config -- the authoritative source for
-provider selection, model, MCP servers, skills, and debug knobs. This module
-resolves the ONE host config each automation turn is handed, by merging up to
+Every turn runs under a single resolved agent config -- the authoritative source
+for provider selection, model, reasoning effort, MCP servers, and skills. This
+module resolves the ONE config each automation turn is handed, by merging up to
 four layers, lowest precedence first:
 
-  1. ``$AMPLIFIER_AGENT_CONFIG`` -- the operator's own debug/host config file,
-     folded in as the BASE. This layer is load-bearing: the host config a turn
-     is handed outranks the environment inside amplifier-agent, so without
-     folding this file in the feature would SILENTLY defeat an operator who set
-     that variable to debug a run. Absent/empty variable contributes nothing.
+  1. ``$AMPLIFIER_AGENT_CONFIG`` -- the operator's own config file, folded in as
+     the BASE. This layer is load-bearing: drumbeat sets that same variable on
+     every turn's worker (pointing at the file it materializes below), so
+     without folding the operator's file in, setting it would be SILENTLY
+     defeated. Absent/empty variable contributes nothing.
   2. the workspace ``agent-config.yaml`` ``default:`` block -- the owner's
      baseline for every automation in this workspace.
   3. a named ``profile`` (interactive/API turns) -- supplied by the caller;
@@ -32,19 +32,16 @@ Merge rules, deliberately boring so an author can predict the result:
 Validation is fail-loud and applies to every file/profile layer BEFORE it is
 merged:
 
-  * the top-level vocabulary is CLOSED to
-    ``provider | providers | mcp | skills | debug``. ``approval`` and
-    ``allowProtocolSkew`` are refused by name (the engine always passes ``-y``,
-    so an ``approval`` block is a silent no-op; ``allowProtocolSkew`` is not a
-    knob an automation gets to flip).
+  * the top-level vocabulary is CLOSED to ``provider | mcp | skills``.
+    ``approval``, ``allowProtocolSkew``, ``debug`` and ``providers`` are refused
+    BY NAME, each with its own reason -- a key with nothing behind it is the
+    "enabled, validated, inert" shape this module exists to prevent.
   * ``provider.config.model_class`` (``fast|standard``) and
     ``provider.config.reasoning_effort``
     (``minimal|low|medium|high|xhigh``) are CLOSED value vocabularies; an
     unknown value is refused naming the set. ``model_class`` is drumbeat's own
     shorthand, resolved AT MATERIALIZATION into a concrete ``default_model``
-    per ``provider.module`` (see ``_apply_model_policy``) and removed from the
-    materialized bytes; ``reasoning_effort`` is amplifier-agent's own field and
-    passes through untouched.
+    per ``provider.module`` (see ``_apply_model_policy``).
   * the RESOLVED model is checked against a deny-list. Both the tier table and
     the deny-list come from ``load_model_policy`` -- the engine defaults, with
     the workspace ``agent-config.yaml`` ``models:`` block folded over them.
@@ -54,14 +51,31 @@ merged:
   * credential-bearing keys (``api_key`` / ``apiKey`` / ``token`` / ``secret``
     / ``authorization``, case-insensitive) are refused at ANY depth, naming the
     full dotted path. ``provider.config.api_key`` is the canonical attack: a
-    committed config that leaks a secret AND is silently ignored by
-    amplifier-agent (which re-asserts credentials from the environment). The
-    refusal is RECURSIVE, not top-level, precisely because the dangerous
-    placement is nested.
+    committed config that leaks a secret AND is silently ignored by the agent
+    library, which takes credentials from the environment only. The refusal is
+    RECURSIVE, not top-level, precisely because the dangerous placement is
+    nested.
+
+TWO artifacts come out of one resolution, and the split is deliberate
+(contracts/agent-binding.v1.md section 4):
+
+  * the MERGED config -- drumbeat's own vocabulary, written to
+    ``<runs_dir>/automation_agent_configs/<slug>.json``. Its sha is the run
+    record's fingerprint of the policy a run used, and its ``provider.module``
+    drives provider-change rotation.
+  * the HOST config -- the agent library's own five-key vocabulary, written to
+    ``<runs_dir>/agent_host_configs/<slug>.json`` and handed to the turn's
+    worker as ``$AMPLIFIER_AGENT_CONFIG``. This is the ONLY channel through
+    which reasoning effort can reach a provider request: the library accepts
+    ``extra_request_params`` from a file and from nowhere else.
+
+``skills`` and ``mcp`` appear in NEITHER file: the library takes both in code
+(``AgentOptions.skills`` / ``.mcp_servers``) and its host-config vocabulary has
+no key for either, so a file entry would be refused by name.
 
 The empty case is by construction: when every layer is empty, the merged config
 is ``{}``, ``resolve()`` materializes NOTHING and returns a ``path`` of ``None``
--- so the turn is handed no host config and runs on the engine's own defaults.
+-- so the turn is handed no config and runs on the library's own defaults.
 """
 
 from __future__ import annotations
@@ -89,10 +103,10 @@ ENV_CONFIG_VAR = "AMPLIFIER_AGENT_CONFIG"
 WORKSPACE_CONFIG_FILENAME = "agent-config.yaml"
 _WORKSPACE_ALLOWED_KEYS = frozenset({"default", "profiles", "models"})
 
-# Where the merged host config is materialized under ``runs_dir``. Same
-# directory (and, for the caching-only case, same bytes) the retired
-# ``runner._automation_host_config_path`` used, so nothing downstream moves.
-MATERIALIZED_DIRNAME = "automation_host_configs"
+# Where a scheduled automation's MERGED config (drumbeat's own vocabulary) is
+# materialized under ``runs_dir``, keyed by slug. Its sha is the run record's
+# fingerprint of the policy that run used.
+MATERIALIZED_DIRNAME = "automation_agent_configs"
 
 # Where an interactive/API turn's merged host config is materialized under
 # ``runs_dir``, keyed by turn id. DELIBERATELY distinct from
@@ -100,10 +114,17 @@ MATERIALIZED_DIRNAME = "automation_host_configs"
 # interactive turn's config must never overwrite -- or be overwritten by -- a
 # scheduled run's materialized file mid-flight, and turn ids are unique so two
 # concurrent turns can never collide either.
-TURN_MATERIALIZED_DIRNAME = "turn_host_configs"
+TURN_MATERIALIZED_DIRNAME = "turn_agent_configs"
+
+# Where the derived HOST config -- the agent library's own five-key vocabulary
+# -- is materialized, for both scheduled and interactive turns. Separate from
+# the two directories above because it is a different vocabulary for a
+# different reader: drumbeat reads the merged config, the library reads this
+# one (via ``$AMPLIFIER_AGENT_CONFIG`` on the turn's worker).
+HOST_CONFIG_DIRNAME = "agent_host_configs"
 
 # The CLOSED top-level vocabulary a config layer may declare.
-ALLOWED_TOP_LEVEL_KEYS = frozenset({"provider", "providers", "mcp", "skills", "debug"})
+ALLOWED_TOP_LEVEL_KEYS = frozenset({"provider", "mcp", "skills"})
 
 # Top-level keys refused BY NAME, with the reason shown in the refusal. Both
 # would otherwise be caught by the closed-vocab check, but a named refusal
@@ -116,6 +137,17 @@ _REFUSED_TOP_LEVEL_KEYS: dict[str, str] = {
     "allowProtocolSkew": (
         "`allowProtocolSkew` is not an automation-tunable knob; it must not be "
         "flipped from a per-automation config -- remove it"
+    ),
+    "debug": (
+        "raw provider request/response capture has no equivalent in the agent "
+        "library, which exposes turn events rather than wire payloads -- there "
+        "is nothing behind this key, so it is refused rather than accepted and "
+        "ignored (see contracts/agent-binding.v1.md, \"Known gap\"); remove it"
+    ),
+    "providers": (
+        "the agent library ships every provider in-process and selects exactly "
+        "one by id, so a provider CATALOG selects nothing -- name the one "
+        "provider under `provider.module` instead; remove it"
     ),
 }
 
@@ -202,12 +234,12 @@ class ModelResolution:
     shadowed: str | None = None
 
 
-# The recorded "effective provider module" for a turn that names no provider
-# module of its own -- i.e. it runs on whatever provider the bundle mounts.
-# Stored beside the contract fingerprint so a later change to an EXPLICIT
-# provider module is detectable; a run that stays on the bundle default never
-# rotates against this sentinel.
-BUNDLE_DEFAULT_PROVIDER = "<bundle-default>"
+# The recorded "effective provider" for a turn that names no provider of its
+# own -- i.e. it runs on whatever the agent library defaults to. Stored beside
+# the contract fingerprint so a later change to an EXPLICIT provider is
+# detectable; a run that stays on the library default never rotates against
+# this sentinel.
+LIBRARY_DEFAULT_PROVIDER = "<library-default>"
 
 
 class AgentConfigError(Exception):
@@ -231,7 +263,7 @@ class ResolvedAgentConfig:
     points at the materialized file and
     ``sha`` is the sha256 of its exact bytes (recorded in the run record).
     ``provider_module`` is always populated -- the explicit ``provider.module``
-    or ``BUNDLE_DEFAULT_PROVIDER`` -- because provider-change rotation needs it
+    or ``LIBRARY_DEFAULT_PROVIDER`` -- because provider-change rotation needs it
     whether or not anything was materialized. ``config`` is the merged mapping.
 
     ``default_model``/``model_source`` name the model this config actually runs
@@ -250,6 +282,14 @@ class ResolvedAgentConfig:
     default_model: str | None = None
     model_source: str | None = None
     warnings: tuple[str, ...] = ()
+    # The DERIVED agent-library host config (``build_host_config``), written
+    # beside the merged one and handed to the turn's worker as
+    # ``$AMPLIFIER_AGENT_CONFIG``. ``None`` when the projection is empty --
+    # i.e. this config names no provider, no model and no reasoning effort, so
+    # there is nothing for the library to read and the turn runs on its
+    # defaults. Separate from ``path`` because the two files speak different
+    # vocabularies to different readers (see the module docstring).
+    host_config_path: Path | None = None
 
 
 def _scan_forbidden(obj: Any, *, source: str, path: str) -> None:
@@ -393,7 +433,7 @@ def resolve_model(
         return None
 
     module = provider_module or effective_provider_module(config)
-    if module == BUNDLE_DEFAULT_PROVIDER:
+    if module == LIBRARY_DEFAULT_PROVIDER:
         if not require_module:
             return None
         raise AgentConfigError(
@@ -496,18 +536,141 @@ def merge_config(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[st
 
 
 def effective_provider_module(config: Mapping[str, Any]) -> str:
-    """The provider module a merged config selects, or ``BUNDLE_DEFAULT_PROVIDER``.
+    """The provider module a merged config selects, or ``LIBRARY_DEFAULT_PROVIDER``.
 
-    Reads ``provider.module`` (amplifier-agent's own field). ``providers``
-    (plural catalog) does not set the pin's provider identity in v1; a turn that
-    names no explicit ``provider.module`` records the bundle-default sentinel.
+    Reads ``provider.module``, which carries a provider ID (``openai``,
+    ``anthropic``, ``azure-openai``, ...) and is handed to the library as
+    ``AgentOptions.provider`` unchanged. A turn that names no provider records
+    the library-default sentinel.
     """
     provider = config.get("provider")
     if isinstance(provider, dict):
         module = provider.get("module")
         if isinstance(module, str) and module.strip():
             return module.strip()
-    return BUNDLE_DEFAULT_PROVIDER
+    return LIBRARY_DEFAULT_PROVIDER
+
+
+# The library's CLOSED host-config vocabulary (docs/configuration.md: "Five,
+# and no more"). drumbeat writes at most three of them: ``storage`` is passed in
+# code so a relative path can never be re-anchored by the child's working
+# directory, and ``workspace`` is never written at all (each pinned session gets
+# its own storage root instead -- contracts/agent-binding.v1.md section 6).
+HOST_CONFIG_KEYS = ("provider", "model", "storage", "workspace", "extra_request_params")
+
+
+def build_host_config(
+    merged: Mapping[str, Any],
+    *,
+    provider_module: str,
+    model: str | None,
+    source: str,
+) -> dict[str, Any]:
+    """Project a merged config onto the agent library's host-config vocabulary.
+
+    Three keys, at most: ``provider``, ``model``, and -- only when the config
+    declares a ``reasoning_effort`` -- ``extra_request_params``.
+
+    Reasoning effort is the whole reason this file exists. The library has no
+    ``AgentOptions`` field for it and no environment form; a config FILE is the
+    only channel that reaches the provider request (measured on the wire:
+    evidence/aa-v1-eval/FINDINGS-raw.md T1b). And ``extra_request_params`` is
+    keyed BY PROVIDER, so an effort declared with no ``provider.module`` to
+    scope it under would validate, be written, and do nothing -- refused loudly
+    here rather than shipped inert.
+    """
+    out: dict[str, Any] = {}
+    if provider_module != LIBRARY_DEFAULT_PROVIDER:
+        out["provider"] = provider_module
+    if model:
+        out["model"] = model
+
+    provider_config = _provider_config(merged) or {}
+    effort = provider_config.get("reasoning_effort")
+    if effort is None:
+        return out
+    if provider_module == LIBRARY_DEFAULT_PROVIDER:
+        raise AgentConfigError(
+            f"{source}: provider.config.reasoning_effort {effort!r} cannot be "
+            "applied without provider.module -- the agent library keys request "
+            "parameters BY PROVIDER, so an unscoped effort would be written and "
+            "silently ignored; name the provider (e.g. provider.module: openai)"
+        )
+    out["extra_request_params"] = {
+        provider_module: {"reasoning": {"effort": effort}}
+    }
+    return out
+
+
+def skills_dirs(merged: Mapping[str, Any], *, workspace: Path) -> tuple[str, ...]:
+    """The ``skills:`` block projected onto ``AgentOptions.skills``.
+
+    A list of directories, each holding skill subdirectories. Relative entries
+    resolve against the workspace, so an automation can name ``skills`` and mean
+    the one beside its own automations. Passed in CODE, never through the host
+    config file -- the library's file vocabulary has no key for skills.
+    """
+    raw = merged.get("skills")
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raise AgentConfigError(
+            "agent config: `skills` must be a list of directory paths, got "
+            f"{type(raw).__name__}"
+        )
+    out: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, str) or not entry.strip():
+            raise AgentConfigError(
+                f"agent config: skills entry {entry!r} must be a non-empty "
+                "directory path"
+            )
+        path = Path(entry).expanduser()
+        out.append(str(path if path.is_absolute() else (workspace / path)))
+    return tuple(out)
+
+
+_MCP_ALLOWED_KEYS = frozenset(
+    {"transport", "command", "args", "env", "url", "headers"}
+)
+
+
+def mcp_servers(merged: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+    """The ``mcp:`` block projected onto ``AgentOptions.mcp_servers`` entries.
+
+    A mapping of server name -> ``{transport, command?, args?, env?, url?,
+    headers?}``. The inner vocabulary is CLOSED, same discipline as every other
+    block here: an unknown key is refused naming it, because the library's
+    ``McpServer`` would simply not carry it.
+    """
+    raw = merged.get("mcp")
+    if raw is None:
+        return ()
+    if not isinstance(raw, dict):
+        raise AgentConfigError(
+            f"agent config: `mcp` must be a mapping of server name -> settings, "
+            f"got {type(raw).__name__}"
+        )
+    out: list[dict[str, Any]] = []
+    for name, entry in raw.items():
+        if not isinstance(entry, dict):
+            raise AgentConfigError(
+                f"agent config: mcp.{name} must be a mapping, got "
+                f"{type(entry).__name__}"
+            )
+        unknown = sorted(set(entry) - _MCP_ALLOWED_KEYS)
+        if unknown:
+            raise AgentConfigError(
+                f"agent config: mcp.{name} has unknown key(s) {unknown} -- the "
+                f"vocabulary is closed to {sorted(_MCP_ALLOWED_KEYS)}"
+            )
+        server: dict[str, Any] = {"name": str(name)}
+        server.update(entry)
+        server.setdefault("transport", "stdio")
+        out.append(server)
+    return tuple(out)
 
 
 def _materialize(
@@ -831,7 +994,19 @@ def resolve(
         source=f"agent config for automation {slug!r}",
     )
 
+    source = f"agent config for automation {slug!r}"
     path, sha = _materialize(runs_dir, MATERIALIZED_DIRNAME, slug, merged)
+    host_config = build_host_config(
+        merged,
+        provider_module=provider_module,
+        model=(resolution.model if resolution else None),
+        source=source,
+    )
+    host_config_path = (
+        _materialize(runs_dir, HOST_CONFIG_DIRNAME, slug, host_config)[0]
+        if host_config
+        else None
+    )
     return ResolvedAgentConfig(
         path=path,
         sha=sha,
@@ -840,6 +1015,7 @@ def resolve(
         default_model=(resolution.model if resolution else None),
         model_source=(resolution.source if resolution else None),
         warnings=warnings,
+        host_config_path=host_config_path,
     )
 
 
@@ -972,7 +1148,19 @@ def resolve_turn(
         source=f"agent config for turn {key!r}",
     )
 
+    source = f"agent config for turn {key!r}"
     path, sha = _materialize(runs_dir, TURN_MATERIALIZED_DIRNAME, key, merged)
+    host_config = build_host_config(
+        merged,
+        provider_module=provider_module,
+        model=(resolution.model if resolution else None),
+        source=source,
+    )
+    host_config_path = (
+        _materialize(runs_dir, HOST_CONFIG_DIRNAME, key, host_config)[0]
+        if host_config
+        else None
+    )
     return ResolvedAgentConfig(
         path=path,
         sha=sha,
@@ -981,15 +1169,18 @@ def resolve_turn(
         default_model=(resolution.model if resolution else None),
         model_source=(resolution.source if resolution else None),
         warnings=warnings,
+        host_config_path=host_config_path,
     )
 
 
 __all__ = [
     "ALLOWED_TOP_LEVEL_KEYS",
-    "BUNDLE_DEFAULT_PROVIDER",
+    "LIBRARY_DEFAULT_PROVIDER",
     "DEFAULT_DENIED_MODELS",
     "DEFAULT_MODEL_POLICY",
     "ENV_CONFIG_VAR",
+    "HOST_CONFIG_DIRNAME",
+    "HOST_CONFIG_KEYS",
     "MATERIALIZED_DIRNAME",
     "MODEL_CLASS_TABLE",
     "TURN_MATERIALIZED_DIRNAME",
@@ -1001,13 +1192,16 @@ __all__ = [
     "ModelPolicy",
     "ModelResolution",
     "ResolvedAgentConfig",
+    "build_host_config",
     "effective_provider_module",
     "load_model_policy",
     "load_profiles",
+    "mcp_servers",
     "merge_config",
     "resolve",
     "resolve_model",
     "resolve_turn",
     "select_profile",
+    "skills_dirs",
     "validate_config_layer",
 ]

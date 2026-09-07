@@ -517,13 +517,15 @@ def _execute(ctx: EngineContext, record: dict[str, Any], request: TurnRequest) -
             # profile, raises loudly so the turn is recorded failed. Keyed by
             # turn id so an interactive config can never collide with a scheduled
             # run's materialized file. The path (when any) is handed to the
-            # runner, which threads it to the turn's worker as its host config.
-            host_config_path = agent_config.resolve_turn(
+            # runner, which threads it to the turn's worker: the merged config
+            # supplies provider/model/skills/mcp, and its derived host-config
+            # file becomes the worker's ``$AMPLIFIER_AGENT_CONFIG``.
+            resolved_config = agent_config.resolve_turn(
                 runs_dir=runs_dir,
                 workspace=ctx.cwd,
                 key=turn_id,
                 profile=request.profile,
-            ).path
+            )
             # Turn-context injectors: run every owner-declared injector (in the
             # workspace's ``injectors.yaml``) whose ``apply_to`` includes this
             # turn's profile, and collect their labeled preamble blocks -- in
@@ -541,11 +543,11 @@ def _execute(ctx: EngineContext, record: dict[str, Any], request: TurnRequest) -
             )
             if request.automation_slug is not None:
                 _execute_automation_turn(
-                    ctx, turn_id, request, progress, host_config_path, preamble_blocks
+                    ctx, turn_id, request, progress, resolved_config, preamble_blocks
                 )
             else:
                 _execute_session_turn(
-                    ctx, turn_id, request, progress, host_config_path, preamble_blocks
+                    ctx, turn_id, request, progress, resolved_config, preamble_blocks
                 )
     except Exception as exc:  # noqa: BLE001 - executor thread must never crash the engine
         sys.stderr.write(
@@ -566,7 +568,7 @@ def _execute_session_turn(
     turn_id: str,
     request: TurnRequest,
     progress,
-    host_config_path: Path | None = None,
+    resolved_config: agent_config.ResolvedAgentConfig | None = None,
     preamble_blocks: tuple[str, ...] = (),
 ) -> None:
     """Resume an explicit session with one turn -- the reply path."""
@@ -579,7 +581,7 @@ def _execute_session_turn(
         runs_dir=ctx.runs_dir,
         wait_seconds=request.lock_wait_seconds or None,
         progress_callback=progress,
-        host_config_path=host_config_path,
+        resolved_config=resolved_config,
         preamble_blocks=preamble_blocks,
     )
     if result.error:
@@ -616,7 +618,7 @@ def _execute_automation_turn(
     turn_id: str,
     request: TurnRequest,
     progress,
-    host_config_path: Path | None = None,
+    resolved_config: agent_config.ResolvedAgentConfig | None = None,
     preamble_blocks: tuple[str, ...] = (),
 ) -> None:
     """Route a turn through an automation's own machinery -- the chat path.
@@ -768,7 +770,9 @@ def submit_turn(body: dict[str, Any], ctx: EngineContext) -> dict[str, Any]:
         # parse_request guarantees exactly one of the two is set.
         assert request.session_id is not None
         target_session = request.session_id
-        probe, detail = runner.probe_session(target_session, cwd=ctx.cwd)
+        probe, detail = runner.probe_session(
+            target_session, cwd=ctx.cwd, runs_dir=ctx.runs_dir
+        )
         if probe is not runner.SessionProbe.EXISTS:
             raise TurnError(
                 404, _unresolvable_session_detail(target_session, probe, detail)

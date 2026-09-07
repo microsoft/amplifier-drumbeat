@@ -133,16 +133,19 @@ class SessionHealth:
     """Read-only health of one automation's pinned session.
 
     ``ceiling_hit`` and ``contract_drifted`` are the only two fields that
-    ever justify a rotation. ``transcript_bytes`` is an aside -- see this
-    module's docstring for why it is not a threshold.
+    ever justify a rotation HERE. ``prompt_tokens`` is the pre-emptive gate's
+    measurement, reported as an aside -- ``runner`` is where it is enforced,
+    ahead of the first turn.
     """
 
     automation: str
     slug: str
     session_id: str | None
     enabled: bool
-    transcript_bytes: int | None
-    transcript_lines: int | None
+    # The prompt-token count this session's last recorded turn sent -- the
+    # library's own reported ``tokens_in``, in the unit the provider refuses on.
+    # ``None`` when no run record for this session carries one.
+    prompt_tokens: int | None
     ceiling_hit: CeilingHit | None
     contract_drifted: bool
     contract_recorded: bool
@@ -550,29 +553,38 @@ def claim_provider_rotation(
         return False, None
 
 
-def _transcript_path(session_id: str, workspace: str, *, agent_home: Path) -> Path:
-    return (
-        Path(agent_home).expanduser()
-        / "state"
-        / "workspaces"
-        / workspace
-        / "sessions"
-        / session_id
-        / "transcript.jsonl"
-    )
+def _prompt_tokens(slug: str, *, session_id: str, runs_dir: Path, limit: int = 24) -> int | None:
+    """This session's largest observed prompt-token count, or ``None``.
 
-
-def _transcript_stats(path: Path) -> tuple[int | None, int | None]:
+    Read off the session's own most recent run records -- the library's own
+    reported ``tokens_in``, which is the count the provider returned and the
+    quantity the provider refuses on. Bounded, newest-first, and scoped to this
+    session id for the same reason ``_scan_recent_runs`` is: a predecessor
+    session's numbers say nothing about the live one.
+    """
+    auto_dir = Path(runs_dir).expanduser() / slug
     try:
-        size = path.stat().st_size
+        run_dirs = sorted((d for d in auto_dir.iterdir() if d.is_dir()), reverse=True)
     except OSError:
-        return None, None
-    try:
-        with path.open(encoding="utf-8") as f:
-            lines = sum(1 for _ in f)
-    except OSError:
-        return size, None
-    return size, lines
+        return None
+    for run_dir in run_dirs[:limit]:
+        try:
+            data = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if data.get("session_id") != session_id:
+            continue
+        steps = data.get("steps")
+        if not isinstance(steps, list):
+            continue
+        counts = [
+            step.get("tokens_in")
+            for step in steps
+            if isinstance(step, dict) and isinstance(step.get("tokens_in"), int)
+        ]
+        if counts:
+            return max(counts)
+    return None
 
 
 def _scan_recent_runs(
@@ -694,17 +706,13 @@ def health_for(
     automations: Iterable[object],
     *,
     runs_dir: Path,
-    agent_home: Path,
-    workspace: str,
 ) -> list[SessionHealth]:
     """Read-only health report for every automation's pinned session.
 
     Args:
         automations: parsed ``drumbeat.automation.Automation`` objects.
-        runs_dir: the engine's data directory (the pin store lives here).
-        agent_home: amplifier-agent's home (see ``paths.amplifier_agent_home``).
-        workspace: fallback workspace slug for pins recorded before the
-            ``session_workspace`` field existed.
+        runs_dir: the engine's data directory -- the pin store, every run
+            record, and every session's agent storage all live under it.
 
     Returns:
         One ``SessionHealth`` per automation, in the order given. Purely
@@ -731,8 +739,7 @@ def health_for(
                     slug=slug,
                     session_id=None,
                     enabled=bool(getattr(automation, "enabled", False)),
-                    transcript_bytes=None,
-                    transcript_lines=None,
+                    prompt_tokens=None,
                     ceiling_hit=None,
                     contract_drifted=False,
                     contract_recorded=False,
@@ -742,9 +749,8 @@ def health_for(
             )
             continue
 
-        ws = (pin.session_workspace if pin else None) or workspace
-        size, lines = _transcript_stats(
-            _transcript_path(session_id, ws, agent_home=agent_home)
+        prompt_tokens = _prompt_tokens(
+            slug, session_id=session_id, runs_dir=runs_dir
         )
         ceiling, consecutive = _scan_recent_runs(
             slug, session_id=session_id, runs_dir=runs_dir
@@ -778,8 +784,7 @@ def health_for(
                 slug=slug,
                 session_id=session_id,
                 enabled=bool(getattr(automation, "enabled", False)),
-                transcript_bytes=size,
-                transcript_lines=lines,
+                prompt_tokens=prompt_tokens,
                 ceiling_hit=ceiling,
                 contract_drifted=drifted,
                 contract_recorded=recorded is not None,

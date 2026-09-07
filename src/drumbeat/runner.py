@@ -62,7 +62,12 @@ from drumbeat.automation import (
     InjectSpec,
     Trigger,
 )
-from drumbeat.paths import amplifier_agent_home, derive_workspace_slug
+from drumbeat.paths import (
+    agent_session_id,
+    agent_session_storage,
+    agent_storage_root,
+    derive_workspace_slug,
+)
 from drumbeat.prompts import (
     DEFAULT_PROMPTS_DIR,
     PromptError,
@@ -102,7 +107,7 @@ _STEP_TIMEOUT_SECONDS = 900
 # a venv without the dependency synced). amplifier-agent is not on PyPI, so the
 # git URL is the mechanism; it is unpinned to match the pyproject dependency.
 AGENT_INSTALL_HINT = (
-    "the amplifier-agent engine library could not be imported. Every turn runs "
+    "the amplifier-agent library could not be imported. Every turn runs "
     "in an isolated worker (`python -m " + WORKER_MODULE + "`) that imports it, "
     "so nothing can run until it imports.\n"
     "  A normal `uv tool install git+<drumbeat repo>` installs amplifier-agent "
@@ -110,8 +115,11 @@ AGENT_INSTALL_HINT = (
     "see this, drumbeat is likely running from a dev checkout or a venv that "
     "has not installed its dependencies.\n"
     "  To install it yourself (it is NOT on PyPI -- a bare `uv tool install "
-    "amplifier-agent` will not resolve):\n"
-    "    uv tool install git+https://github.com/microsoft/amplifier-agent\n"
+    "amplifier-agent` will not resolve; the distribution lives in a "
+    "subdirectory of its repository):\n"
+    "    uv tool install \"amplifier-agent @ "
+    "git+https://github.com/microsoft/amplifier-agent@v1"
+    "#subdirectory=packages/python\"\n"
     "  or, in a dev checkout of drumbeat:  uv sync"
 )
 
@@ -120,20 +128,18 @@ AGENT_INSTALL_HINT = (
 # worker runs in), so it answers about the exact import a turn will perform --
 # not about whatever happens to be in this process's sys.modules.
 _IMPORT_CHECK_TIMEOUT_SECONDS = 60
-# Prewarm shells a cold ``uv pip install`` on first prepare; give it real room.
-_PREWARM_TIMEOUT_SECONDS = 600
 
 
 def check_agent_command(workspace: Path) -> str | None:
-    """Confirm the engine LIBRARY is importable in a fresh worker interpreter.
+    """Confirm the agent LIBRARY is importable in a fresh worker interpreter.
 
-    The preflight for ``serve``/``doctor``. Every turn runs
-    ``python -m {WORKER_MODULE}`` under ``sys.executable`` and imports the
-    engine library there, so this imports it in a fresh subprocess of that SAME
-    interpreter -- answering about the exact import a turn will perform, not
-    about this long-lived process's already-loaded modules (importing the heavy
-    library into the serve process just to preflight would also bind its
-    process-global state here, which the per-turn-worker design exists to avoid).
+    The preflight for ``serve``/``doctor``. It runs the worker's own
+    ``--preflight`` mode under ``sys.executable`` -- the SAME module and the
+    SAME interpreter a real turn uses -- so it answers about the exact import a
+    turn will perform, not about this long-lived process's already-loaded
+    modules. Preflighting by importing the library HERE would also bind its
+    process-global state in a process that outlives every turn, which the
+    per-turn-worker design exists to avoid.
 
     Returns a short descriptor (the resolved interpreter + library version) when
     the import succeeds, or ``None`` when it fails -- because its callers
@@ -142,13 +148,9 @@ def check_agent_command(workspace: Path) -> str | None:
     library import does not depend on the turn PATH.
     """
     del workspace  # library import is PATH-independent; kept for call-site stability
-    probe = (
-        "import amplifier_agent_lib as _l, amplifier_agent_cli.provider_sources; "
-        "print(_l.__version__)"
-    )
     try:
         result = subprocess.run(
-            [sys.executable, "-c", probe],
+            [sys.executable, "-m", WORKER_MODULE, "--preflight"],
             capture_output=True,
             text=True,
             timeout=_IMPORT_CHECK_TIMEOUT_SECONDS,
@@ -159,34 +161,7 @@ def check_agent_command(workspace: Path) -> str | None:
     if result.returncode != 0:
         return None
     version = result.stdout.strip() or "unknown"
-    return f"amplifier-agent engine library {version} (import via {sys.executable})"
-
-
-def prewarm_engine(*, timeout: float = _PREWARM_TIMEOUT_SECONDS) -> tuple[bool, str]:
-    """Prepare the bundle cache in a worker subprocess. Returns ``(ok, detail)``.
-
-    Requirement (h): ``serve``/``service install`` startup and ``doctor``
-    pre-warm the bundle prep (a cold prepare shells ``uv pip install``) so the
-    first scheduled turn never eats it. Runs the worker's ``--prewarm`` mode
-    under ``sys.executable`` -- the SAME interpreter and code path a real turn
-    uses -- so a warm cache here is a warm cache there. Best-effort: a failure
-    is reported for the caller to log, never raised, because a turn can still
-    (slowly) prepare its own cache.
-    """
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", WORKER_MODULE, "--prewarm"],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return False, f"bundle prewarm could not run: {exc}"
-    if result.returncode != 0:
-        tail = (result.stderr or result.stdout or "").strip()[-500:]
-        return False, f"bundle prewarm exited {result.returncode}: {tail}"
-    return True, "bundle cache prepared"
+    return f"amplifier-agent library {version} (import via {sys.executable})"
 
 
 class RunnerError(Exception):
@@ -204,11 +179,12 @@ class SessionLockedError(RunnerError):
 
     Fix 1: two OS processes -- the scheduler firing a scheduled run, and
     notify-serve handling an inbound reply/message -- can otherwise resume
-    the SAME pinned session id at the same time. amplifier-agent replays
-    and rewrites ``transcript.jsonl`` on resume, so two concurrent turns on
-    one session can interleave writes and corrupt or truncate it --
-    corrupting the very memory the pinned-session mechanism exists to
-    protect. This is always caught inside ``_execute_turn`` and converted
+    the SAME pinned session id at the same time. The agent library refuses a
+    durable id that already has a live handle (``session_in_use``) and a
+    second turn on a live session (``busy``) -- so without this lock the
+    second process does not corrupt the conversation, it simply FAILS, and a
+    scheduled run and an inbound reply racing each other would lose one of
+    the two for no reason. This lock is what serialises them instead. This is always caught inside ``_execute_turn`` and converted
     into a ``StepResult.error`` -- callers never see this exception type
     directly, they see it through the exact same error-handling path every
     other turn failure already uses.
@@ -307,8 +283,12 @@ class RunResult:
     # never acted on by this module, recorded purely so a human can
     # correlate item loss/behavior against when compaction likely happened.
     session_resumed: bool = False
-    session_transcript_bytes_at_start: int | None = None
-    session_transcript_lines_at_start: int | None = None
+    # The prompt-token count this session's previous turn sent, measured at run
+    # start (``_session_prompt_tokens``). Recorded for observability -- it is
+    # what the rotation gate reads, and it is the only honest signal a host has
+    # that a conversation is approaching the provider's ceiling. ``None`` on a
+    # fresh session and whenever no prior record carries a count.
+    session_prompt_tokens_at_start: int | None = None
     # (Fields ``suppressed_duplicate``/``suppressed_duplicate_of`` removed in
     # decomposition step 2: duplicate suppression happens at notification
     # mint, in the consumer's delivery worker -- see docs/ARCHITECTURE.md
@@ -400,12 +380,8 @@ def _local_now() -> datetime:
 
 # ---- "what time is it" context (Fix: agent had no honest sense of "now") ----
 #
-# amplifier-agent's own bundle declares hooks-status-context with
-# include_datetime=true, datetime_include_timezone=false: every turn already
-# gets an ephemeral, untagged "Today's date: YYYY-MM-DD HH:MM:SS" line (local
-# wall-clock, never persisted to transcript.jsonl -- see that hook's
-# `ephemeral=True`). Verified directly (2026-08-04): a throwaway
-# `amplifier-agent run` turn asked to state the date, time, and timezone
+# A turn is handed no timezone by anything upstream. Verified directly
+# (2026-08-04): a throwaway turn asked to state the date, time, and timezone
 # replied with the correct date/time but "timezone cannot be determined from
 # available context" -- exactly the gap this closes.
 #
@@ -503,16 +479,6 @@ class _SessionProbe(Enum):
     UNKNOWN = "unknown"
 
 
-def _amplifier_agent_home() -> Path:
-    """Thin wrapper -- see ``drumbeat.paths.amplifier_agent_home`` for the real
-    implementation and its docstring. Kept as a private name here so every
-    existing call site in this module (``_session_dir``, ``_probe_session``,
-    ...) is untouched by the move (same pattern as ``_derive_workspace_slug``
-    delegating to ``paths.derive_workspace_slug``).
-    """
-    return amplifier_agent_home()
-
-
 def _derive_workspace_slug(cwd: Path) -> str:
     """Thin wrapper -- see ``drumbeat.paths.derive_workspace_slug`` for the
     real implementation and its docstring. Kept as a private name here so
@@ -522,20 +488,19 @@ def _derive_workspace_slug(cwd: Path) -> str:
     return derive_workspace_slug(cwd)
 
 
-def _session_dir(session_id: str, *, cwd: Path) -> Path:
-    workspace = _derive_workspace_slug(cwd)
-    return (
-        _amplifier_agent_home()
-        / "state"
-        / "workspaces"
-        / workspace
-        / "sessions"
-        / session_id
-    )
+def _session_dir(session_id: str, *, runs_dir: Path) -> Path:
+    """This session's own agent-storage root -- see ``paths.agent_session_storage``.
+
+    Thin wrapper kept as a private name so every call site in this module reads
+    the same way it always has. The directory is drumbeat's; nothing in this
+    module ever reads INSIDE it, because the library declares its internal
+    layout non-contractual.
+    """
+    return agent_session_storage(session_id, runs_dir=runs_dir)
 
 
 def _probe_session(
-    session_id: str, *, cwd: Path, recorded_workspace: str | None
+    session_id: str, *, cwd: Path, runs_dir: Path, recorded_workspace: str | None
 ) -> tuple[_SessionProbe, str]:
     """Determine whether a pinned session id resolves to a real, resumable session.
 
@@ -550,20 +515,20 @@ def _probe_session(
        never treated as "safe to recreate", because doing so would
        silently abandon everything under the OLD workspace slug, which
        nothing will ever probe again.
-    2. Fix 3 -- fallback heuristic for automations pinned before this field
-       existed (``recorded_workspace is None``) or that happen to match:
-       if the CURRENT workspace directory does not exist AT ALL, that is
-       the same "moved/renamed" signal, inferred rather than recorded --
-       also ``WORKSPACE_MISMATCH``.
-    3. Only once the workspace itself is confirmed current: a confirmed-
-       absent SESSION directory is ``MISSING`` (safe to recreate) --
-       this is the ordinary, expected "session was deleted" case.
+    2. Otherwise: this session's own agent-storage root either exists
+       (``EXISTS`` -- resumable) or is confirmed absent (``MISSING``, the
+       ordinary "session was deleted" case, safe to recreate).
 
-    Any I/O error while checking, or a session directory present without
-    its transcript, is ``UNKNOWN`` -- the caller must abort rather than
-    guess. This is the "defend the pin" requirement: a silently-recreated
-    session here is the silent-drop defect this whole mechanism exists to
-    fix, re-armed.
+    That root lives INSIDE the workspace (``<runs_dir>/agent-storage/<id>``),
+    which is why there is no longer a "the project moved and orphaned the
+    sessions elsewhere" heuristic to run: a renamed or moved project carries
+    its sessions with it. Only a pin whose RECORDED workspace disagrees with
+    the current one is ambiguous, and that is rule 1.
+
+    Any I/O error while checking is ``UNKNOWN`` -- the caller must abort
+    rather than guess. This is the "defend the pin" requirement: a
+    silently-recreated session here is the silent-drop defect this whole
+    mechanism exists to fix, re-armed.
     """
     current_workspace = _derive_workspace_slug(cwd)
     if recorded_workspace is not None and recorded_workspace != current_workspace:
@@ -572,84 +537,84 @@ def _probe_session(
             (
                 f"automation was pinned under workspace {recorded_workspace!r} but "
                 f"the current working directory ({cwd}) derives workspace "
-                f"{current_workspace!r} -- the project directory was very likely "
-                "renamed or moved"
+                f"{current_workspace!r} -- this pin was very likely copied from "
+                "another workspace, or the workspace was re-identified"
             ),
         )
 
-    workspace_dir = _amplifier_agent_home() / "state" / "workspaces" / current_workspace
-    try:
-        workspace_exists = workspace_dir.is_dir()
-    except OSError as exc:
-        return (
-            _SessionProbe.UNKNOWN,
-            f"cannot stat workspace directory {workspace_dir}: {exc}",
-        )
-    if not workspace_exists:
-        return (
-            _SessionProbe.WORKSPACE_MISMATCH,
-            (
-                f"workspace directory does not exist at all: {workspace_dir} -- "
-                "the project directory was very likely renamed or moved (this "
-                "automation has no recorded session_workspace to confirm "
-                "directly -- it was pinned before that field existed)"
-            ),
-        )
-
-    session_dir = _session_dir(session_id, cwd=cwd)
+    session_dir = _session_dir(session_id, runs_dir=runs_dir)
     try:
         dir_exists = session_dir.is_dir()
     except OSError as exc:
         return _SessionProbe.UNKNOWN, f"cannot stat {session_dir}: {exc}"
     if not dir_exists:
         other_sessions_note = ""
-        sessions_dir = workspace_dir / "sessions"
+        storage_root = agent_storage_root(runs_dir)
         try:
-            if sessions_dir.is_dir():
-                other_count = sum(1 for _ in sessions_dir.iterdir())
+            if storage_root.is_dir():
+                other_count = sum(1 for _ in storage_root.iterdir())
                 other_sessions_note = (
-                    f" (workspace {workspace_dir} exists and contains "
+                    f" ({storage_root} exists and contains "
                     f"{other_count} other session(s))"
                 )
         except OSError:
             pass  # best-effort note only; doesn't change the MISSING determination
         return (
             _SessionProbe.MISSING,
-            f"no directory at {session_dir}{other_sessions_note}",
+            f"no storage at {session_dir}{other_sessions_note}",
         )
-
-    transcript_path = session_dir / "transcript.jsonl"
-    try:
-        transcript_exists = transcript_path.is_file()
-    except OSError as exc:
-        return _SessionProbe.UNKNOWN, f"cannot stat {transcript_path}: {exc}"
-    if not transcript_exists:
-        return (
-            _SessionProbe.UNKNOWN,
-            f"{session_dir} exists but has no transcript.jsonl (ambiguous state)",
-        )
-    return _SessionProbe.EXISTS, f"found {transcript_path}"
+    return _SessionProbe.EXISTS, f"found {session_dir}"
 
 
-def _transcript_stats(session_id: str, *, cwd: Path) -> dict[str, int | None]:
-    """Best-effort transcript size (bytes, lines) at a point in time.
+# How many of a slug's most recent run records the prompt-token probe reads
+# before giving up. Bounded work at run start, newest-first, same read-backward
+# discipline every other run-record scan here uses.
+_PROMPT_TOKEN_SCAN_LIMIT = 24
 
-    Recorded on ``RunResult`` purely for observability -- see run()'s
-    docstring -- never acted on by this module. ``None`` fields (not 0)
-    when the transcript can't be read, so a missing/unreadable file is
-    never confused with a genuinely empty one.
+
+def _session_prompt_tokens(
+    session_id: str, *, slug: str, runs_dir: Path
+) -> int | None:
+    """This session's largest observed PROMPT-token count, or ``None``.
+
+    The measurement behind the pre-emptive rotation gate, and the one recorded
+    on ``RunResult``. It reads the agent library's OWN reported ``tokens_in``
+    off this session's most recent run record -- the count the provider
+    returned, in the unit the provider actually refuses on.
+
+    Why a run record and not the live session: the library exposes no
+    context-pressure signal and does not compact (measured:
+    evidence/aa-v1-eval/FINDINGS-raw.md T6/D7), and this runs in the long-lived
+    scheduler process, which deliberately never imports the library. The last
+    turn's prompt size is the honest, already-recorded proxy for the next
+    turn's, and it is monotone within a session -- exactly what a gate needs.
+
+    ``None`` (not 0) when no record for this session carries a count, so
+    "unknown" is never confused with "small".
     """
-    transcript_path = _session_dir(session_id, cwd=cwd) / "transcript.jsonl"
+    auto_dir = Path(runs_dir).expanduser() / slug
     try:
-        size_bytes = transcript_path.stat().st_size
+        run_dirs = sorted((d for d in auto_dir.iterdir() if d.is_dir()), reverse=True)
     except OSError:
-        return {"bytes": None, "lines": None}
-    try:
-        with open(transcript_path, encoding="utf-8") as f:
-            lines = sum(1 for _ in f)
-    except OSError:
-        lines = None
-    return {"bytes": size_bytes, "lines": lines}
+        return None
+    for run_dir in run_dirs[:_PROMPT_TOKEN_SCAN_LIMIT]:
+        try:
+            data = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if data.get("session_id") != session_id:
+            continue
+        steps = data.get("steps")
+        if not isinstance(steps, list):
+            continue
+        counts = [
+            step.get("tokens_in")
+            for step in steps
+            if isinstance(step, dict) and isinstance(step.get("tokens_in"), int)
+        ]
+        if counts:
+            return max(counts)
+    return None
 
 
 # ---- automatic session rotation (see drumbeat.session_health) ----
@@ -662,60 +627,50 @@ def _transcript_stats(session_id: str, *, cwd: Path) -> dict[str, int | None]:
 # without landing in runs/session_rotations.jsonl, and never happen silently.
 
 
-# The transcript size (bytes, at run start) above which a pinned session is
-# rotated BEFORE the turn rather than after the provider refuses the prompt.
+# The prompt-token count (at run start) above which a pinned session is rotated
+# BEFORE the turn rather than after the provider refuses the prompt.
 #
-# WHY 5 MB, measured on this deployment's own 8-day window (4,133 runs with a
-# recorded `session_transcript_bytes_at_start`, 157 sessions):
+# WHY TOKENS: this is the unit the provider actually rejects on
+# (`prompt is too long: 219685 tokens > 200000 maximum`), and it is the count
+# the agent library itself reports and this engine already records on every
+# step (`tokens_in`). It is a measurement of the failing quantity, not a proxy
+# for it.
 #
-#   * Every one of the 41 observed ContextLengthError runs started from a
-#     transcript of 5,586,751 bytes or more. The smallest was 5.6 MB; the
-#     10th percentile 7.1 MB; the median 9.8 MB.
-#   * 1,138 runs started at or below 5,000,000 bytes. ZERO of them hit the
-#     ceiling.
-#   * So a 5 MB gate would have pre-empted all 41 observed crashes, and the
-#     runs it would have rotated instead are drawn from a population with no
-#     observed crashes at all -- i.e. it buys the whole observed failure mode.
-#
-# WHY A BYTE COUNT AT ALL, given the relation is indirect: the provider
-# rejects on PROMPT TOKENS, and amplifier-agent compacts in-session, so
-# transcript bytes are a weak, monotone proxy rather than a measurement of the
-# thing that fails. Bytes are, however, the only signal available at run start
-# without replaying the transcript, they are already recorded on every
-# RunResult, and they are monotone within a session -- which is exactly what a
-# pre-emptive gate needs. The gate is deliberately not asked to be a precise
-# predictor; it is asked to keep sessions inside the region where crashes were
-# never observed.
+# WHY 150,000, and what that number IS and IS NOT: it is calibrated off the
+# ceiling, not off a crash distribution. The two sessions whose true prompt
+# sizes the provider ever reported crashed at 219,685 and 201,361 tokens; the
+# smallest observed refusal is therefore 201,361, and 150,000 sits a quarter
+# below it. The gate is deliberately not asked to be a precise predictor of the
+# next turn's growth; it is asked to keep a session inside a region where no
+# refusal has been observed, with room for one more turn's growth.
 #
 # WHY NOT LOWER: rotation is not free -- it abandons accumulated conversation
-# memory. Measured per-run transcript growth is 0.29/0.41/0.64 MB at the
-# 25th/50th/75th percentile, so a 5 MB gate gives a session on the order of a
-# dozen runs from a cold start before it rotates. Dropping the gate further
-# buys no additional observed crashes and costs continuity directly.
+# memory. A lower gate rotates healthy sessions and buys no additional observed
+# crashes.
 #
 # The crash-rotation backstop (Trigger 1, at the end of the run) stays exactly
 # as it was: this gate reduces how often it fires, and never replaces it.
-_DEFAULT_SESSION_ROTATE_BYTES = 5_000_000
+_DEFAULT_SESSION_ROTATE_TOKENS = 150_000
 
 
-def _session_rotate_bytes() -> int:
-    """Transcript-size gate (bytes) for pre-emptive rotation of a pinned session.
+def _session_rotate_tokens() -> int:
+    """Prompt-token gate for pre-emptive rotation of a pinned session.
 
-    Override via ``$DRUMBEAT_SESSION_ROTATE_BYTES`` -- the same engine-level
+    Override via ``$DRUMBEAT_SESSION_ROTATE_TOKENS`` -- the same engine-level
     env-var seam ``$DRUMBEAT_SESSION_LOCK_WAIT_SECONDS`` and
     ``$DRUMBEAT_BACKGROUND_LOCK_WAIT_SECONDS`` already use. There is
     deliberately NO automation-frontmatter key: the automation file's
     vocabulary is closed (see contracts/automation-file.v1.md) and this is an
     engine deployment knob, not per-automation policy. An operator who wants
-    the gate out of the way sets it to a value no transcript will reach.
+    the gate out of the way sets it to a value no prompt will reach.
 
     FAIL LOUD: an unusable value (unparseable, or not a positive integer) is
     reported on stderr and the documented default is used, rather than being
     silently honored as "no gate".
     """
-    raw = os.environ.get("DRUMBEAT_SESSION_ROTATE_BYTES")
+    raw = os.environ.get("DRUMBEAT_SESSION_ROTATE_TOKENS")
     if not raw:
-        return _DEFAULT_SESSION_ROTATE_BYTES
+        return _DEFAULT_SESSION_ROTATE_TOKENS
     try:
         value = int(raw)
     except ValueError:
@@ -723,12 +678,12 @@ def _session_rotate_bytes() -> int:
     if value > 0:
         return value
     print(
-        f"[drumbeat] DRUMBEAT_SESSION_ROTATE_BYTES={raw!r} is not a positive "
+        f"[drumbeat] DRUMBEAT_SESSION_ROTATE_TOKENS={raw!r} is not a positive "
         f"integer -- ignoring it and using the default "
-        f"{_DEFAULT_SESSION_ROTATE_BYTES} bytes.",
+        f"{_DEFAULT_SESSION_ROTATE_TOKENS} tokens.",
         file=sys.stderr,
     )
-    return _DEFAULT_SESSION_ROTATE_BYTES
+    return _DEFAULT_SESSION_ROTATE_TOKENS
 
 
 def _auto_rotate(
@@ -904,7 +859,7 @@ def _build_command(
     fresh: bool,
     cwd: Path,
     text: str,
-    host_config_path: Path | None = None,
+    resolved_config: agent_config.ResolvedAgentConfig | None = None,
 ) -> list[str]:
     """The EXACT argv the worker is spawned with for this turn.
 
@@ -923,11 +878,11 @@ def _build_command(
         marker is present by construction. Proven in
         ``tests/test_soft_launch_gates.py`` against this function's output.
 
-    ``session_id``/``fresh``/``text``/``host_config_path`` are accepted so every
+    ``session_id``/``fresh``/``text``/``resolved_config`` are accepted so every
     existing (dry-run) call site is untouched; they travel to the worker via the
     stdin task spec, not argv, so they do not appear in the returned list.
     """
-    del session_id, fresh, text, host_config_path  # -> stdin task spec, not argv
+    del session_id, fresh, text, resolved_config  # -> stdin task spec, not argv
     del cwd  # the worker's cwd is set on the spawn, not encoded in argv
     return [sys.executable, "-m", WORKER_MODULE]
 
@@ -1733,6 +1688,59 @@ class _TurnOutcome:
 _MODULE_LOAD_FAILURE_RE = re.compile(r"Failed to load (provider|tool|hook) '([^']+)':")
 
 
+# A reply that is ITSELF a statement of provider unavailability -- the engine
+# answering that it has no brain. Anchored, never a substring search, for the
+# same reason ``_URGENT_MARKER_RE`` is anchored: a substring match would fail a
+# turn whose reply merely MENTIONS the phrase (an automation reporting on its own
+# fleet's health does exactly that), and an unanchored gate that fails healthy
+# runs is its own defect. Markdown decoration is tolerated because the model
+# writes markdown.
+_PROVIDER_UNAVAILABLE_REPLY_RE = re.compile(
+    r"\A[ \t]*(?:[-+*>#]+[ \t]+)?(?:[*_`]{1,3})?[ \t]*"
+    r"(?:error:[ \t]*)?no providers?[ \t]+available",
+    re.IGNORECASE,
+)
+
+
+def _dead_brain_error(outcome: "_TurnOutcome") -> str | None:
+    """Why this apparently-successful turn must be recorded as a FAILURE.
+
+    Two rules, both drumbeat's own, both closing the same defect class: a turn
+    that exits zero while having no working brain. Measured on the originating
+    deployment: 34 runs between 20:30Z and 23:44Z recorded
+    ``"failed": false, "error": null`` while their reply was the engine saying
+    it had no provider. A run that did nothing must never read as a run that
+    succeeded (docs/VISION.md §4).
+
+    1. **The reply is a provider-unavailability statement.** The library raises
+       a typed error rather than replying this way, so this is a belt to that
+       brace -- and it is the rule that caught the 34.
+    2. **Session init dropped a module.** ``module_failures`` is the agent
+       library's own warning that a provider/tool/hook failed to load and the
+       turn ran with a reduced module set. It was recorded for visibility and
+       deliberately left non-fatal; the measured outcome of that choice was 96
+       of 96 runs in one morning carrying a module failure while every run
+       recorded success. Visibility that nothing acts on is not visibility.
+
+    Returns ``None`` for an ordinary turn, so the common path is untouched.
+    """
+    if outcome.module_failures:
+        return (
+            "the turn ran with a degraded module set -- session init failed to "
+            f"load {list(outcome.module_failures)}. The reply (if any) was "
+            "produced without whatever those modules provide, so this run is "
+            "recorded as failed rather than as a success with a footnote."
+        )
+    if outcome.reply and _PROVIDER_UNAVAILABLE_REPLY_RE.match(outcome.reply):
+        return (
+            "the turn's reply is a statement of provider unavailability "
+            f"({outcome.reply.strip()[:200]!r}) -- the engine answering that it "
+            "has no provider to think with. Recorded as failed: a run that "
+            "produced no real work must never read as a run that succeeded."
+        )
+    return None
+
+
 def _detect_module_load_failures(stderr_text: str) -> tuple[str, ...]:
     """Scan one turn's captured stderr for amplifier-core's own
     ``Failed to load <type> '<module_id>':`` warning line and return the
@@ -1764,17 +1772,27 @@ def _worker_env(
     *,
     runs_dir: Path,
     session_id: str | None = None,
+    agent_host_config: Path | None = None,
 ) -> dict[str, str]:
     """The exact environment the per-turn worker is spawned with.
 
-    The full parent environment inherited (so the worker resolves the same
-    ``$AMPLIFIER_AGENT_HOME`` / ``$AMPLIFIER_AGENT_WORKSPACE`` and provider
-    credentials the engine already used), plus the two drumbeat vars the agent's
-    bash tool and any consumer CLI it invokes read (``DRUMBEAT_TURN_SESSION_ID``,
+    The full parent environment inherited (so the worker sees the same provider
+    credentials the engine already had -- credentials are environment-only and
+    reach the library no other way), plus the two drumbeat vars the agent's bash
+    tool and any consumer CLI it invokes read (``DRUMBEAT_TURN_SESSION_ID``,
     ``DRUMBEAT_DATA_DIR``), plus the pack-augmented turn ``PATH`` set DIRECTLY on
-    the child -- no ``os.environ["PATH"]`` bridge, no serializing lock. The SDK
-    era needed that bridge because the wrapper's env model refused a per-turn
-    PATH; a plain subprocess env does not.
+    the child.
+
+    ``$AMPLIFIER_AGENT_CONFIG`` is set to the host config this turn's agent
+    config materialized, and ONLY on the child. That variable is the single
+    channel through which reasoning effort can reach a provider request
+    (contracts/agent-binding.v1.md section 4). Overriding it here would silently
+    defeat an operator who set it -- which is exactly why the operator's own
+    file is folded in as layer 1 of the merge that produced this one
+    (``drumbeat.agent_config``), rather than being clobbered. When this turn's
+    config materialized nothing, any inherited value is REMOVED rather than left
+    in place: a turn must run on the policy that was resolved for it, never on a
+    stale file from an earlier one.
 
     ``packs.turn_path`` is deliberately NOT wrapped: a workspace whose pack list
     is broken must fail the run loudly (``packs.PackError`` propagates), not
@@ -1785,6 +1803,10 @@ def _worker_env(
         env[TURN_SESSION_ID_ENV_VAR] = session_id
     env[DATA_DIR_ENV_VAR] = str(Path(runs_dir).expanduser().resolve())
     env["PATH"] = packs.turn_path(cwd)
+    if agent_host_config is not None:
+        env[agent_config.ENV_CONFIG_VAR] = str(agent_host_config)
+    else:
+        env.pop(agent_config.ENV_CONFIG_VAR, None)
     return env
 
 
@@ -1795,38 +1817,62 @@ def _submit_turn(
     cwd: Path,
     text: str,
     runs_dir: Path,
-    host_config_path: Path | None = None,
+    resolved_config: agent_config.ResolvedAgentConfig | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> _TurnOutcome:
     """Run ONE turn in an isolated worker process and normalize the outcome.
 
     Spawns ``python -m drumbeat.agent_worker`` (one OS process per turn, VISION
-    §3), hands it the task spec -- prompt, session id, cwd, materialized-config
-    path, resume flag -- on **stdin** as JSON (never on argv), and reads the
-    worker's stdout NDJSON protocol: display events feed the progress tracker
+    §3), hands it the task spec on **stdin** as JSON (never on argv), and reads
+    the worker's stdout NDJSON protocol: display events feed the progress tracker
     (activity narration), and one terminal envelope (``RESULT_ENVELOPE_KEY``)
-    carries the reply and the engine's real token/cost counts. The worker's
+    carries the reply and the library's real token/cost counts. The worker's
     stderr is captured verbatim as this turn's stderr text (ceiling detection and
     the run's stderr.log read it).
 
-    Properties preserved from the SDK era: one OS process per turn; a hard
-    timeout enforced by SIGKILL to the whole process group (so the agent's own
-    tool subprocesses die with it); the pack-augmented per-turn PATH, now set
-    DIRECTLY on the child (no ``os.environ`` bridge, no serializing lock); and
+    The spec is EVERYTHING the worker needs to assemble one ``AgentOptions``:
+    the prompt, the translated agent session id, its own storage root, the
+    resolved provider/model, and the skills/MCP projections. Nothing is left for
+    the worker to look up -- provider, model and effort all come from the ONE
+    ``ResolvedAgentConfig`` this call is handed, so the options object and the
+    ``$AMPLIFIER_AGENT_CONFIG`` file can never disagree about which policy a
+    turn ran on.
+
+    Properties preserved: one OS process per turn; a hard timeout enforced by
+    SIGKILL to the whole process group (so the agent's own tool subprocesses die
+    with it); the pack-augmented per-turn PATH set DIRECTLY on the child; and
     "every failure becomes a populated ``_TurnOutcome.error``". The only
     exception allowed to escape is ``packs.PackError`` from ``_worker_env`` -- a
     broken workspace must fail the run loudly, exactly as before.
     """
-    env = _worker_env(cwd, runs_dir=runs_dir, session_id=session_id)  # PackError escapes
+    merged = resolved_config.config if resolved_config is not None else {}
+    provider = (
+        resolved_config.provider_module
+        if resolved_config is not None
+        and resolved_config.provider_module != agent_config.LIBRARY_DEFAULT_PROVIDER
+        else None
+    )
+    env = _worker_env(
+        cwd,
+        runs_dir=runs_dir,
+        session_id=session_id,
+        agent_host_config=(
+            resolved_config.host_config_path if resolved_config is not None else None
+        ),
+    )  # PackError escapes
     spec = {
         "prompt": text,
         "session_id": session_id,
+        "agent_session_id": agent_session_id(session_id),
         "turn_id": f"turn-{secrets.token_hex(4)}",
         "cwd": str(cwd),
-        "host_config_path": (
-            str(host_config_path) if host_config_path is not None else None
+        "storage": str(agent_session_storage(session_id, runs_dir=runs_dir)),
+        "provider": provider,
+        "model": (
+            resolved_config.default_model if resolved_config is not None else None
         ),
-        "mode": None,
+        "skills": list(agent_config.skills_dirs(merged, workspace=cwd)),
+        "mcp": [dict(server) for server in agent_config.mcp_servers(merged)],
         "resume": not fresh,
     }
     spec_json = json.dumps(spec)
@@ -2015,12 +2061,12 @@ def _submit_turn(
 #
 # Two OS processes can otherwise resume the SAME pinned session id at the
 # same time: the scheduler firing a scheduled run, and notify-serve
-# handling an inbound /api/reply or /api/message. amplifier-agent replays
-# and rewrites transcript.jsonl on resume, so two concurrent turns on one
-# session can interleave writes and corrupt or truncate it -- corrupting
-# the very memory the pinned-session mechanism exists to protect. This
-# lock is what prevents that: one fcntl.flock per session id, held for
-# exactly the duration of one turn's subprocess invocation.
+# handling an inbound /api/reply or /api/message. The agent library refuses
+# the second one outright (``session_in_use`` on a durable id with a live
+# handle, ``busy`` on a second turn), so the race costs a whole run rather
+# than corrupting one. This lock serialises them instead: one fcntl.flock per
+# session id, held for exactly the duration of one turn's subprocess
+# invocation.
 
 _SESSION_LOCK_POLL_SECONDS = 0.5
 _DEFAULT_INTERACTIVE_LOCK_WAIT_SECONDS = 5.0
@@ -2136,7 +2182,9 @@ def _session_lock(session_id: str, *, runs_dir: Path, wait_seconds: float | None
 SessionProbe = _SessionProbe
 
 
-def probe_session(session_id: str, *, cwd: Path) -> tuple[_SessionProbe, str]:
+def probe_session(
+    session_id: str, *, cwd: Path, runs_dir: Path
+) -> tuple[_SessionProbe, str]:
     """Does ``session_id`` resolve to a real, resumable session under ``cwd``?
 
     Thin public wrapper over ``_probe_session`` with no recorded workspace
@@ -2146,7 +2194,10 @@ def probe_session(session_id: str, *, cwd: Path) -> tuple[_SessionProbe, str]:
     non-``EXISTS`` verdict; this never guesses on its behalf.
     """
     return _probe_session(
-        session_id, cwd=Path(cwd).expanduser(), recorded_workspace=None
+        session_id,
+        cwd=Path(cwd).expanduser(),
+        runs_dir=Path(runs_dir).expanduser(),
+        recorded_workspace=None,
     )
 
 
@@ -2316,7 +2367,7 @@ def _execute_turn(
     runs_dir: Path,
     wait_seconds: float | None,
     progress_callback: ProgressCallback | None = None,
-    host_config_path: Path | None = None,
+    resolved_config: agent_config.ResolvedAgentConfig | None = None,
     preamble_blocks: tuple[str, ...] = (),
 ) -> tuple[StepResult, str]:
     """Execute one turn and return (StepResult, raw_stderr_text).
@@ -2373,7 +2424,7 @@ def _execute_turn(
                 cwd=cwd,
                 text=text,
                 runs_dir=runs_dir,
-                host_config_path=host_config_path,
+                resolved_config=resolved_config,
                 progress_callback=progress_callback,
             )
     except SessionLockedError as exc:
@@ -2445,15 +2496,20 @@ def _execute_turn(
         )
 
     # Success (outcome.error is None) or a plain engine error -- one shape.
-    # Tokens/cost are the engine's real reported numbers or honestly absent
+    # Tokens/cost are the library's real reported numbers or honestly absent
     # (None), never 0 (VISION §4); reply is the agent's text on success, "" on an
     # error; duration is measured wall-clock (the honest elapsed).
+    #
+    # A turn that exited zero with NO WORKING BRAIN is converted to an error
+    # here -- see ``_dead_brain_error``. This is the one place every turn's
+    # outcome passes through, so the rule cannot be bypassed by a caller.
+    error = outcome.error or _dead_brain_error(outcome)
     return (
         StepResult(
             index=index,
             text=text,
             reply=outcome.reply,
-            error=outcome.error,
+            error=error,
             duration_ms=outcome.duration_ms,
             tokens_in=outcome.tokens_in,
             tokens_out=outcome.tokens_out,
@@ -2477,7 +2533,7 @@ def resume_turn(
     runs_dir: Path,
     wait_seconds: float | None = None,
     progress_callback: ProgressCallback | None = None,
-    host_config_path: Path | None = None,
+    resolved_config: agent_config.ResolvedAgentConfig | None = None,
     preamble_blocks: tuple[str, ...] = (),
 ) -> StepResult:
     """Resume an existing session with one ad-hoc turn (not part of any automation).
@@ -2525,7 +2581,7 @@ def resume_turn(
         runs_dir=runs_dir,
         wait_seconds=wait_seconds,
         progress_callback=progress_callback,
-        host_config_path=host_config_path,
+        resolved_config=resolved_config,
         preamble_blocks=preamble_blocks,
     )
     if stderr_text:
@@ -3082,8 +3138,7 @@ def _persist_escaped_failure(
         failed=True,
         error=message,
         session_resumed=False,
-        session_transcript_bytes_at_start=None,
-        session_transcript_lines_at_start=None,
+        session_prompt_tokens_at_start=None,
     )
     try:
         _persist_run(
@@ -3123,20 +3178,21 @@ def _run_body(
 
     ``resolved_agent_config`` is the merged per-automation host config (9h5),
     resolved by ``run()``. Its ``.path`` is the host config handed to the engine
-    on every turn (``None`` -> no host config, the engine's own defaults), its
-    ``.provider_module`` drives built-in provider-change pin rotation below, and
-    its ``.sha``/``.path`` are recorded in the run record.
+    on every turn (``None`` -> no config at all, the library's own defaults),
+    its ``.provider_module`` drives built-in provider-change pin rotation below,
+    and its ``.sha``/``.path`` are recorded in the run record. The whole object
+    is threaded to each turn: ``.config`` supplies the skills/MCP projections,
+    ``.default_model`` the model, and ``.host_config_path`` the file the turn's
+    worker reads as ``$AMPLIFIER_AGENT_CONFIG``.
     """
-    host_config_path = (
-        resolved_agent_config.path if resolved_agent_config is not None else None
-    )
+    resolved_config = resolved_agent_config
     # The effective provider module this run resolves to -- recorded beside the
     # contract fingerprint when a session is created, and compared on resume so
     # a provider change auto-rotates the pin (owner decision: always).
     effective_provider = (
         resolved_agent_config.provider_module
         if resolved_agent_config is not None
-        else agent_config.BUNDLE_DEFAULT_PROVIDER
+        else agent_config.LIBRARY_DEFAULT_PROVIDER
     )
 
     pin = session_pins.get(automation.slug, runs_dir=runs_dir)
@@ -3148,6 +3204,7 @@ def _run_body(
         probe_status, probe_detail = _probe_session(
             pinned_session_id,
             cwd=cwd,
+            runs_dir=runs_dir,
             recorded_workspace=pin.session_workspace if pin else None,
         )
         if probe_status is _SessionProbe.EXISTS:
@@ -3220,7 +3277,7 @@ def _run_body(
                         )
                     )
 
-                oversize_bytes: int | None = None
+                oversize_tokens: int | None = None
                 rotate_reason: str | None = None
                 if drifted:
                     rotate_reason = (
@@ -3242,32 +3299,33 @@ def _run_body(
                         "fresh."
                     )
                 else:
-                    # Trigger 3 -- TRANSCRIPT SIZE. Checked only when nothing
-                    # else already decided to rotate (a second stat() would
+                    # Trigger 3 -- CONTEXT SIZE. Checked only when nothing
+                    # else already decided to rotate (a second read would
                     # change nothing but the log). Measured HERE, before the
                     # first turn, against the pinned session -- so an
                     # over-threshold session is rotated ahead of the ceiling
-                    # instead of after it. See _DEFAULT_SESSION_ROTATE_BYTES
-                    # for the measured rationale.
+                    # instead of after it. See _DEFAULT_SESSION_ROTATE_TOKENS
+                    # for the calibration.
                     #
-                    # Unreadable (None) is NOT over-threshold: "unknown" must
+                    # Unmeasured (None) is NOT over-threshold: "unknown" must
                     # not read as "yes" and abandon a live conversation, the
                     # same posture the drift and lifecycle checks take.
-                    size_threshold = _session_rotate_bytes()
-                    measured_bytes = _transcript_stats(pinned_session_id, cwd=cwd)[
-                        "bytes"
-                    ]
-                    if measured_bytes is not None and measured_bytes > size_threshold:
-                        oversize_bytes = measured_bytes
+                    size_threshold = _session_rotate_tokens()
+                    measured_tokens = _session_prompt_tokens(
+                        pinned_session_id, slug=automation.slug, runs_dir=runs_dir
+                    )
+                    if measured_tokens is not None and measured_tokens > size_threshold:
+                        oversize_tokens = measured_tokens
                         rotate_reason = (
-                            f"size threshold: this session's transcript is "
-                            f"{measured_bytes} bytes at run start, over the "
-                            f"{size_threshold}-byte gate "
-                            f"($DRUMBEAT_SESSION_ROTATE_BYTES). Every observed "
-                            "context-ceiling crash on this deployment started from a "
-                            "larger transcript than the gate; rotating now costs one "
-                            "conversation's memory instead of a failed run plus a "
-                            "forced rotation afterwards."
+                            f"size threshold: this session's last turn sent "
+                            f"{measured_tokens} prompt tokens, over the "
+                            f"{size_threshold}-token gate "
+                            f"($DRUMBEAT_SESSION_ROTATE_TOKENS). The provider "
+                            "refuses a prompt outright above its own ceiling and a "
+                            "session that lands there can never compact its way "
+                            "out; rotating now costs one conversation's memory "
+                            "instead of a failed run plus a forced rotation "
+                            "afterwards."
                         )
 
                 if rotate_reason is not None and not dry_run:
@@ -3300,11 +3358,11 @@ def _run_body(
                             f"{effective_provider!r}, so it WOULD be auto-rotated",
                             file=sys.stderr,
                         )
-                    if oversize_bytes is not None:
+                    if oversize_tokens is not None:
                         print(
                             f"[{automation.name}] dry run: pinned session "
-                            f"{pinned_session_id!r} has a {oversize_bytes}-byte "
-                            f"transcript, over the {_session_rotate_bytes()}-byte "
+                            f"{pinned_session_id!r} last sent {oversize_tokens} "
+                            f"prompt tokens, over the {_session_rotate_tokens()}-token "
                             "gate, so it WOULD be auto-rotated",
                             file=sys.stderr,
                         )
@@ -3364,8 +3422,7 @@ def _run_body(
                 failed=True,
                 error=abort_message,
                 session_resumed=False,
-                session_transcript_bytes_at_start=None,
-                session_transcript_lines_at_start=None,
+                session_prompt_tokens_at_start=None,
             )
             if not dry_run:
                 _persist_run(
@@ -3440,8 +3497,7 @@ def _run_body(
             failed=True,
             error=abort_message,
             session_resumed=not is_new_session,
-            session_transcript_bytes_at_start=None,
-            session_transcript_lines_at_start=None,
+            session_prompt_tokens_at_start=None,
         )
         if not dry_run:
             _persist_run(
@@ -3535,8 +3591,7 @@ def _run_body(
             failed=True,
             error=abort_message,
             session_resumed=not is_new_session,
-            session_transcript_bytes_at_start=None,
-            session_transcript_lines_at_start=None,
+            session_prompt_tokens_at_start=None,
         )
         if not dry_run:
             _persist_run(
@@ -3586,8 +3641,7 @@ def _run_body(
                 failed=True,
                 error=abort_message,
                 session_resumed=False,
-                session_transcript_bytes_at_start=None,
-                session_transcript_lines_at_start=None,
+                session_prompt_tokens_at_start=None,
             )
             _persist_run(
                 automation=automation,
@@ -3642,11 +3696,13 @@ def _run_body(
                 runs_dir=runs_dir,
             )
 
-    transcript_stats: dict[str, int | None]
-    if is_new_session:
-        transcript_stats = {"bytes": None, "lines": None}
-    else:
-        transcript_stats = _transcript_stats(session_id, cwd=cwd)
+    prompt_tokens_at_start: int | None = (
+        None
+        if is_new_session
+        else _session_prompt_tokens(
+            session_id, slug=automation.slug, runs_dir=runs_dir
+        )
+    )
 
     system_prompt = load_prompt("system", prompts_dir)
     # A system-prompt turn only ever fires on the run that CREATES the
@@ -3817,8 +3873,7 @@ def _run_body(
                 failed=True,
                 error=abort_message,
                 session_resumed=not is_new_session,
-                session_transcript_bytes_at_start=None,
-                session_transcript_lines_at_start=None,
+                session_prompt_tokens_at_start=None,
             )
             if not dry_run:
                 _persist_run(
@@ -3852,7 +3907,7 @@ def _run_body(
                 fresh=True,
                 cwd=cwd,
                 text=_prepend_now_context(system_prompt),
-                host_config_path=host_config_path,
+                resolved_config=resolved_config,
             )
             print(_format_command(cmd))
         if has_requirements_turn:
@@ -3862,7 +3917,7 @@ def _run_body(
                 fresh=requirements_turn_is_fresh,
                 cwd=cwd,
                 text=_prepend_now_context(requirements_turn_text),
-                host_config_path=host_config_path,
+                resolved_config=resolved_config,
             )
             print(_format_command(cmd))
         for i, (_spec, inject_text) in enumerate(inject_turns):
@@ -3871,7 +3926,7 @@ def _run_body(
                 fresh=(first_inject_turn_is_fresh and i == 0),
                 cwd=cwd,
                 text=_prepend_now_context(inject_text),
-                host_config_path=host_config_path,
+                resolved_config=resolved_config,
             )
             print(_format_command(cmd))
         for i, step in enumerate(automation.steps, start=1):
@@ -3880,7 +3935,7 @@ def _run_body(
                 fresh=(step_one_is_fresh and i == 1),
                 cwd=cwd,
                 text=_prepend_now_context(step.prompt),
-                host_config_path=host_config_path,
+                resolved_config=resolved_config,
             )
             print(_format_command(cmd))
         if auto_notify_prompt is not None:
@@ -3889,7 +3944,7 @@ def _run_body(
                 fresh=False,
                 cwd=cwd,
                 text=_prepend_now_context(auto_notify_prompt),
-                host_config_path=host_config_path,
+                resolved_config=resolved_config,
             )
             print(_format_command(cmd))
         finished_at = _iso8601_now()
@@ -3904,8 +3959,7 @@ def _run_body(
             notified=False,
             failed=False,
             session_resumed=not is_new_session,
-            session_transcript_bytes_at_start=transcript_stats["bytes"],
-            session_transcript_lines_at_start=transcript_stats["lines"],
+            session_prompt_tokens_at_start=prompt_tokens_at_start,
         )
 
     step_results: list[StepResult] = []
@@ -3937,7 +3991,7 @@ def _run_body(
             index=index,
             runs_dir=runs_dir,
             wait_seconds=None,
-            host_config_path=host_config_path,
+            resolved_config=resolved_config,
             preamble_blocks=_take_first_turn_blocks(),
         )
         step_results.append(system_result)
@@ -3965,7 +4019,7 @@ def _run_body(
             index=index,
             runs_dir=runs_dir,
             wait_seconds=None,
-            host_config_path=host_config_path,
+            resolved_config=resolved_config,
             preamble_blocks=_take_first_turn_blocks(),
         )
         step_results.append(requirements_result)
@@ -3995,7 +4049,7 @@ def _run_body(
                 index=index,
                 runs_dir=runs_dir,
                 wait_seconds=None,
-                host_config_path=host_config_path,
+                resolved_config=resolved_config,
                 preamble_blocks=_take_first_turn_blocks(),
             )
             step_results.append(inject_result)
@@ -4045,7 +4099,7 @@ def _run_body(
                 index=index,
                 runs_dir=runs_dir,
                 wait_seconds=None,
-                host_config_path=host_config_path,
+                resolved_config=resolved_config,
                 # Carry every validated inject: turn forward onto every step
                 # (see inject_recap_blocks above) -- a no-op tuple when this
                 # automation declares no inject:. The predecessor-crash notice
@@ -4091,7 +4145,7 @@ def _run_body(
                 index=check_index,
                 runs_dir=runs_dir,
                 wait_seconds=None,
-                host_config_path=host_config_path,
+                resolved_config=resolved_config,
                 # Same carry-forward as the automation.steps loop above --
                 # the auto-notify judgment reads the same injected state.
                 # _take_first_turn_blocks() is a no-op by here unless this
@@ -4246,12 +4300,13 @@ def _run_body(
         failed=failed,
         error=run_error,
         session_resumed=not is_new_session,
-        session_transcript_bytes_at_start=transcript_stats["bytes"],
-        session_transcript_lines_at_start=transcript_stats["lines"],
+        session_prompt_tokens_at_start=prompt_tokens_at_start,
         demoted=demoted,
         demoted_reason=demoted_reason,
         effective_config_path=(
-            str(host_config_path) if host_config_path is not None else None
+            str(resolved_agent_config.path)
+            if resolved_agent_config is not None and resolved_agent_config.path
+            else None
         ),
         effective_config_sha=(
             resolved_agent_config.sha if resolved_agent_config is not None else None
@@ -4323,7 +4378,7 @@ def _run_body(
         # delivery, and no code path below it does either.
 
     upload_outcome = ci_upload.upload_session(
-        _session_dir(session_id, cwd=cwd) / "context-intelligence",
+        _session_dir(session_id, runs_dir=runs_dir) / "context-intelligence",
         job_id=f"{automation.slug}-{run_id}",
     )
     _record_ci_upload_outcome(
@@ -4349,7 +4404,7 @@ def run_chat_message(
     lock_wait_seconds: float | None = None,
     progress_callback: ProgressCallback | None = None,
     force_new: bool = False,
-    host_config_path: Path | None = None,
+    resolved_config: agent_config.ResolvedAgentConfig | None = None,
     preamble_blocks: tuple[str, ...] = (),
 ) -> RunResult:
     """Route one chat message through the same automation machinery every
@@ -4439,6 +4494,7 @@ def run_chat_message(
         probe_status, probe_detail = _probe_session(
             pinned_session_id,
             cwd=cwd,
+            runs_dir=runs_dir,
             recorded_workspace=pin.session_workspace if pin else None,
         )
         if probe_status is _SessionProbe.EXISTS:
@@ -4619,7 +4675,7 @@ def run_chat_message(
                 runs_dir=runs_dir,
                 wait_seconds=resolved_wait_seconds,
                 progress_callback=progress_callback,
-                host_config_path=host_config_path,
+                resolved_config=resolved_config,
                 # Setup turns carry no injector preamble -- injectors ride the
                 # message turn that answers the person (see the message turn
                 # below). A brand-new session's identity turns run once, ever,
@@ -4652,7 +4708,7 @@ def run_chat_message(
                     runs_dir=runs_dir,
                     wait_seconds=resolved_wait_seconds,
                     progress_callback=progress_callback,
-                    host_config_path=host_config_path,
+                    resolved_config=resolved_config,
                     # No injector preamble on the requirements turn -- see the
                     # message turn below.
                 )
@@ -4762,7 +4818,7 @@ def run_chat_message(
                 runs_dir=runs_dir,
                 wait_seconds=resolved_wait_seconds,
                 progress_callback=progress_callback,
-                host_config_path=host_config_path,
+                resolved_config=resolved_config,
             )
             turns.append(inject_result)
             stderr_chunks.append((index, inject_stderr))
@@ -4806,7 +4862,7 @@ def run_chat_message(
             runs_dir=runs_dir,
             wait_seconds=resolved_wait_seconds,
             progress_callback=progress_callback,
-            host_config_path=host_config_path,
+            resolved_config=resolved_config,
             # Injector preamble blocks ride ONLY the message turn -- the turn
             # that answers the person. The identity/requirements setup turns
             # (fired once, ever, on a brand-new session) carry different text and
