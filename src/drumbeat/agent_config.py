@@ -33,7 +33,8 @@ Merge rules, deliberately boring so an author can predict the result:
 Validation is fail-loud and applies to every file/profile layer BEFORE it is
 merged:
 
-  * the top-level vocabulary is CLOSED to ``provider | mcp | skills``.
+  * the top-level vocabulary is CLOSED to
+    ``provider | mcp | skills | tool_result_ceiling_bytes``.
     ``approval``, ``allowProtocolSkew``, ``debug`` and ``providers`` are refused
     BY NAME, each with its own reason -- a key with nothing behind it is the
     "enabled, validated, inert" shape this module exists to prevent.
@@ -98,7 +99,7 @@ from typing import Any
 
 import yaml
 
-from drumbeat import fsutil
+from drumbeat import fsutil, tool_ceiling
 
 # The operator debug/host config, folded in as the merge BASE (layer 1).
 ENV_CONFIG_VAR = "AMPLIFIER_AGENT_CONFIG"
@@ -130,7 +131,9 @@ TURN_MATERIALIZED_DIRNAME = "turn_agent_configs"
 HOST_CONFIG_DIRNAME = "agent_host_configs"
 
 # The CLOSED top-level vocabulary a config layer may declare.
-ALLOWED_TOP_LEVEL_KEYS = frozenset({"provider", "mcp", "skills"})
+ALLOWED_TOP_LEVEL_KEYS = frozenset(
+    {"provider", "mcp", "skills", "tool_result_ceiling_bytes"}
+)
 
 # Top-level keys refused BY NAME, with the reason shown in the refusal. Both
 # would otherwise be caught by the closed-vocab check, but a named refusal
@@ -568,6 +571,7 @@ def validate_config_layer(
     _validate_provider_block(data, source=source)
     _refuse_misplaced_model_class(data, source=source, path="")
     _validate_reasoning_effort(data, source=source)
+    _validate_tool_result_ceiling(data, source=source)
     resolution = resolve_model(data, policy=policy, source=source)
     if resolution is not None:
         _refuse_denied_model(resolution, source=source, policy=policy)
@@ -662,6 +666,50 @@ def build_host_config(
         {provider_module: {"reasoning": {"effort": effort}}},
     )
     return out
+
+
+def _validate_tool_result_ceiling(data: Mapping[str, Any], *, source: str) -> None:
+    """Refuse a `tool_result_ceiling_bytes` that is not a positive integer.
+
+    At LOAD, not mid-turn: a ceiling nothing can satisfy must fail while an
+    author is looking at the file, the same discipline `reasoning_effort` and
+    `model_class` get. `0` is refused rather than read as "unlimited" -- see
+    `tool_ceiling.coerce_ceiling` for why there is no unlimited.
+    """
+    if "tool_result_ceiling_bytes" not in data:
+        return
+    try:
+        tool_ceiling.coerce_ceiling(
+            data["tool_result_ceiling_bytes"],
+            source=f"{source}: `tool_result_ceiling_bytes`",
+        )
+    except tool_ceiling.CeilingConfigError as exc:
+        raise AgentConfigError(str(exc)) from exc
+
+
+def tool_result_ceiling_bytes(merged: Mapping[str, Any]) -> int | None:
+    """The `tool_result_ceiling_bytes:` override, or `None` for the default.
+
+    `None` means "this automation declared nothing", which
+    `tool_ceiling.ceiling_bytes` then resolves against
+    `$DRUMBEAT_TOOL_RESULT_CEILING_BYTES` and the engine default -- distinct
+    from an explicit value, so a deployment knob is never shadowed by an
+    automation that never spoke.
+
+    Passed to the turn in CODE, never through the host config file: the
+    library's file vocabulary is five keys and closed, so a key written there
+    would validate and be read by nothing (contracts/agent-binding.v1.md
+    section 10).
+    """
+    raw = merged.get("tool_result_ceiling_bytes")
+    if raw is None:
+        return None
+    try:
+        return tool_ceiling.coerce_ceiling(
+            raw, source="agent config: `tool_result_ceiling_bytes`"
+        )
+    except tool_ceiling.CeilingConfigError as exc:
+        raise AgentConfigError(str(exc)) from exc
 
 
 def skills_dirs(merged: Mapping[str, Any], *, workspace: Path) -> tuple[str, ...]:
@@ -1311,5 +1359,6 @@ __all__ = [
     "resolve_turn",
     "select_profile",
     "skills_dirs",
+    "tool_result_ceiling_bytes",
     "validate_config_layer",
 ]

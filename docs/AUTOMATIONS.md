@@ -72,7 +72,7 @@ it never takes down the other automations' schedules.
 | `conversation` | no (default `continuous`) | `continuous` · `fresh` · `daily` — how the conversation persists across runs; see §2.1 |
 | `guidance_delivery` | no (default `reference`) | `reference` · `inline` — how required guidance FILES reach the agent; see §5 |
 | `priority` | no (default `normal`) | `high` · `normal` — dispatch order among automations due at the same tick; see §2.3 |
-| `agent_config` | no | Mapping: a per-automation agent-config overlay (provider, model, effort, MCP, skills); see §10 |
+| `agent_config` | no | Mapping: a per-automation agent-config overlay (provider, model, effort, MCP, skills, tool-result ceiling); see §10 |
 
 This vocabulary is **closed** (contract rule 2): every key above is registered,
 and an unknown or retired top-level key is refused loudly with a remedy at parse
@@ -785,11 +785,53 @@ name to `{transport, command?, args?, env?, url?, headers?}` — the inner
 vocabulary is closed, and an unknown key inside a server entry is refused naming
 it.
 
+### `tool_result_ceiling_bytes:` — how big one tool result may be
+
+```yaml
+agent_config:
+  tool_result_ceiling_bytes: 262144   # the default; a positive integer
+```
+
+A tool result is not a transient display artifact: it is appended to this
+automation's conversation and **re-sent, in full, on every later turn**. One
+oversized result therefore poisons the session permanently, and no later turn
+can undo it. Measured on the originating deployment: a single 46,464,072-byte
+tool result entered a pinned session, after which the provider refused every
+subsequent request and manual rotation was the only remedy.
+
+So drumbeat bounds every tool result its own process produces. Over the ceiling,
+the first N bytes are kept and a note is appended naming the file that holds the
+whole thing:
+
+```
+[drumbeat: output truncated -- kept 262144 of 46464072 bytes;
+ full output: <run dir>/tool-output/<call-id>.txt]
+```
+
+Absent, the engine default is **262144** bytes (256 KiB), itself overridable per
+deployment with `$DRUMBEAT_TOOL_RESULT_CEILING_BYTES`. Set the key when this
+automation's tools legitimately return more (or much less) than that. A value
+that is not a positive integer is refused at load; **`0` does not mean
+"unlimited"** — there is no unlimited, because an unbounded result is the
+failure this key exists to bound.
+
+**Two limits, honestly stated.** The ceiling reaches the shell tool drumbeat
+supplies (`run_command`) and nothing else: the agent library's own built-in
+tools and any MCP server's results are produced inside the library, and it
+offers no way to bound or replace them (a caller tool named `bash` is refused at
+construction; see
+[`../contracts/agent-binding.v1.md`](../contracts/agent-binding.v1.md) §10 and
+its "Known gap"). Every turn is told to prefer `run_command` over the built-in
+`bash`, but that is **advice, not enforcement**. The backstop for what slips
+through is automatic: a provider refusal on input size rotates the pinned
+session, so a poisoned conversation self-heals on the next run instead of
+failing forever (§10 of that same contract, and the rotation section below).
+
 ### What's allowed, and what is refused loudly
 
-The top-level vocabulary is **closed** to `provider · mcp · skills`. Anything
-else is refused at parse time, and four names are refused *by name*, each with
-its own reason:
+The top-level vocabulary is **closed** to
+`provider · mcp · skills · tool_result_ceiling_bytes`. Anything else is refused
+at parse time, and four names are refused *by name*, each with its own reason:
 
 - **`debug`** — raw provider request/response capture has no equivalent in the
   agent library, which exposes turn events rather than wire payloads. There is

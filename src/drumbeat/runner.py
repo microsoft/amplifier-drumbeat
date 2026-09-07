@@ -287,6 +287,16 @@ class RunResult:
     # below). Distinct from a per-step ``StepResult.error``, which always
     # means at least one turn ran. ``None`` for every ordinary run.
     error: str | None = None
+    # STRUCTURED cause for a failed run, when one could be established from the
+    # turn's own stderr -- today the provider's input-size refusal code
+    # (contracts/agent-binding.v1.md section 11). ``error`` is the human
+    # sentence; this is the machine-readable name of what happened, so a
+    # consumer never has to substring-match prose to make a decision. Measured
+    # on the originating deployment: the library reported only the lossy
+    # ``provider_failed`` while the real ``string_above_max_length`` sat unread
+    # in the worker's stderr.log. ``None`` -- never ``{}`` -- when nothing was
+    # established: an empty dict would read as "we looked and it was fine".
+    error_details: dict[str, Any] | None = None
     # Observability for the pinned-session mechanism (see run()'s docstring):
     # never acted on by this module, recorded purely so a human can
     # correlate item loss/behavior against when compaction likely happened.
@@ -1834,6 +1844,7 @@ def _submit_turn(
     runs_dir: Path,
     resolved_config: agent_config.ResolvedAgentConfig | None = None,
     progress_callback: ProgressCallback | None = None,
+    run_dir: Path | None = None,
 ) -> _TurnOutcome:
     """Run ONE turn in an isolated worker process and normalize the outcome.
 
@@ -1889,6 +1900,15 @@ def _submit_turn(
         "skills": list(agent_config.skills_dirs(merged, workspace=cwd)),
         "mcp": [dict(server) for server in agent_config.mcp_servers(merged)],
         "resume": not fresh,
+        # contracts/agent-binding.v1.md section 10: the byte ceiling this
+        # turn's caller tools apply to their own results, and the run
+        # directory the overflow is written under. ``None`` for either is
+        # honest and handled: no declared ceiling means the engine default
+        # (or $DRUMBEAT_TOOL_RESULT_CEILING_BYTES), and no run directory --
+        # an interactive turn -- means the note says the full output is
+        # unavailable. Neither ever means "no ceiling".
+        "tool_result_ceiling_bytes": agent_config.tool_result_ceiling_bytes(merged),
+        "run_dir": str(run_dir) if run_dir is not None else None,
     }
     spec_json = json.dumps(spec)
     tracker = (
@@ -2392,6 +2412,7 @@ def _execute_turn(
     progress_callback: ProgressCallback | None = None,
     resolved_config: agent_config.ResolvedAgentConfig | None = None,
     preamble_blocks: tuple[str, ...] = (),
+    run_dir: Path | None = None,
 ) -> tuple[StepResult, str]:
     """Execute one turn and return (StepResult, raw_stderr_text).
 
@@ -2449,6 +2470,7 @@ def _execute_turn(
                 runs_dir=runs_dir,
                 resolved_config=resolved_config,
                 progress_callback=progress_callback,
+                run_dir=run_dir,
             )
     except SessionLockedError as exc:
         print(f"[runner] {exc}", file=sys.stderr)
@@ -3211,6 +3233,11 @@ def _run_body(
     worker reads as ``$AMPLIFIER_AGENT_CONFIG``.
     """
     resolved_config = resolved_agent_config
+    # contracts/agent-binding.v1.md section 10: where a caller tool's
+    # over-ceiling output is written, so the truncation note in the transcript
+    # names a real file. Same path _persist_run writes this run's record under,
+    # derived once here rather than at each turn call site.
+    _turn_run_dir = runs_dir / automation.slug / run_id
     # The effective provider module this run resolves to -- recorded beside the
     # contract fingerprint when a session is created, and compared on resume so
     # a provider change auto-rotates the pin (owner decision: always).
@@ -4015,6 +4042,7 @@ def _run_body(
             text=system_prompt,
             index=index,
             runs_dir=runs_dir,
+            run_dir=_turn_run_dir,
             wait_seconds=None,
             resolved_config=resolved_config,
             preamble_blocks=_take_first_turn_blocks(),
@@ -4043,6 +4071,7 @@ def _run_body(
             text=requirements_turn_text,
             index=index,
             runs_dir=runs_dir,
+            run_dir=_turn_run_dir,
             wait_seconds=None,
             resolved_config=resolved_config,
             preamble_blocks=_take_first_turn_blocks(),
@@ -4073,6 +4102,7 @@ def _run_body(
                 text=inject_text,
                 index=index,
                 runs_dir=runs_dir,
+                run_dir=_turn_run_dir,
                 wait_seconds=None,
                 resolved_config=resolved_config,
                 preamble_blocks=_take_first_turn_blocks(),
@@ -4123,6 +4153,7 @@ def _run_body(
                 text=step.prompt,
                 index=index,
                 runs_dir=runs_dir,
+                run_dir=_turn_run_dir,
                 wait_seconds=None,
                 resolved_config=resolved_config,
                 # Carry every validated inject: turn forward onto every step
@@ -4169,6 +4200,7 @@ def _run_body(
                 text=auto_notify_prompt,
                 index=check_index,
                 runs_dir=runs_dir,
+                run_dir=_turn_run_dir,
                 wait_seconds=None,
                 resolved_config=resolved_config,
                 # Same carry-forward as the automation.steps loop above --
@@ -4355,19 +4387,31 @@ def _run_body(
     # failures for channels-check, 2 for agent-sessions-check, zero
     # recoveries. Rotating on the first hit costs exactly the run that had
     # already failed. See session_health's module docstring.
+    #
+    # Trigger 1b -- PROVIDER INPUT-SIZE REFUSAL (section 11). The SAME
+    # detection, widened. The 2026-09-07 incident arrived as a structured code
+    # (``string_above_max_length``, an oversized single tool result) that the
+    # prose-only pattern above could not see: the run reported the library's
+    # lossy ``provider_failed``, the pin was never rotated, and the identical
+    # run failed again four hours later on the same session. The pre-emptive
+    # token gate could not cover it either -- a refused turn records no usage
+    # for the gate to read. So the refusal is its own trigger, on this same
+    # single path, and ``detect_input_size_refusal`` is a strict superset of
+    # ``detect_ceiling_hit``.
     if failed and not dry_run:
-        ceiling = session_health.detect_ceiling_hit(
+        refusal = session_health.detect_input_size_refusal(
             "\n".join(text for _, text in stderr_chunks)
         )
-        if ceiling is not None:
+        if refusal is not None:
             ci_events.emit(
                 "drumbeat:session_ceiling_hit",
                 {
                     "automation": automation.name,
                     "run_id": run_id,
                     "session_id": session_id,
-                    "prompt_tokens": ceiling.prompt_tokens,
-                    "limit_tokens": ceiling.limit_tokens,
+                    "provider_code": refusal.code,
+                    "prompt_tokens": refusal.prompt_tokens,
+                    "limit_tokens": refusal.limit_tokens,
                 },
                 cwd=cwd,
             )
@@ -4375,9 +4419,13 @@ def _run_body(
                 automation,
                 old_session_id=session_id,
                 reason=(
-                    f"context ceiling hit on run {run_id}: {ceiling.detail}. "
-                    "This session cannot recover -- amplifier-agent compacts "
-                    "above the provider's limit, so the prompt only grows."
+                    f"provider input-size refusal on run {run_id}: "
+                    f"{refusal.detail}. The request exceeded the provider's "
+                    "input ceiling, and this session cannot recover -- its "
+                    "input is re-sent in full on every later turn and only "
+                    "grows, and the agent library neither compacts nor bounds "
+                    "a tool result, so the next run would be refused "
+                    "identically."
                 ),
                 runs_dir=runs_dir,
             )
@@ -4495,6 +4543,11 @@ def run_chat_message(
     runs_dir = Path(runs_dir).expanduser()
     run_id = new_run_id()
     started_at = _iso8601_now()
+    # contracts/agent-binding.v1.md section 10: where a caller tool's
+    # over-ceiling output is written, so the truncation note in the transcript
+    # names a real file. Same path _persist_run writes this run's record under,
+    # derived once here rather than at each turn call site.
+    _turn_run_dir = runs_dir / chat_automation.slug / run_id
     resolved_wait_seconds = (
         lock_wait_seconds
         if lock_wait_seconds is not None
@@ -4698,6 +4751,7 @@ def run_chat_message(
                 text=step.prompt,
                 index=index,
                 runs_dir=runs_dir,
+                run_dir=_turn_run_dir,
                 wait_seconds=resolved_wait_seconds,
                 progress_callback=progress_callback,
                 resolved_config=resolved_config,
@@ -4731,6 +4785,7 @@ def run_chat_message(
                     text=requirements_turn_text,
                     index=index,
                     runs_dir=runs_dir,
+                    run_dir=_turn_run_dir,
                     wait_seconds=resolved_wait_seconds,
                     progress_callback=progress_callback,
                     resolved_config=resolved_config,
@@ -4841,6 +4896,7 @@ def run_chat_message(
                 text=outcome.text,
                 index=index,
                 runs_dir=runs_dir,
+                run_dir=_turn_run_dir,
                 wait_seconds=resolved_wait_seconds,
                 progress_callback=progress_callback,
                 resolved_config=resolved_config,
@@ -4885,6 +4941,7 @@ def run_chat_message(
             text=text,
             index=index,
             runs_dir=runs_dir,
+            run_dir=_turn_run_dir,
             wait_seconds=resolved_wait_seconds,
             progress_callback=progress_callback,
             resolved_config=resolved_config,
@@ -5252,6 +5309,23 @@ def _persist_run(
         sorted({m for step in result.steps for m in step.module_failures})
     )
 
+    # Structured cause, established ONCE here at the same choke point, for the
+    # same reason ``result.error`` is normalized above: every RunResult-
+    # constructing path gets it, and no present or future call site has to
+    # remember. contracts/agent-binding.v1.md section 11 -- a provider
+    # input-size refusal names its own code, so the run record stops reporting
+    # only the library's lossy ``provider_failed``. Guarded by ``failed`` so a
+    # successful run is never given a manufactured cause, and left as ``None``
+    # (not ``{}``) when nothing matched: an empty dict would read as "we
+    # looked and it was fine". A caller that already established a cause wins
+    # -- this only fills a gap, it never overwrites.
+    if result.failed and result.error_details is None:
+        refusal = session_health.detect_input_size_refusal(
+            "\n".join(text for _, text in stderr_chunks)
+        )
+        if refusal is not None:
+            result.error_details = refusal.as_error_details()
+
     engine_events.append_event(
         runs_dir,
         engine_events.EventType.RUN_COMPLETED,
@@ -5264,6 +5338,7 @@ def _persist_run(
             "finished_at": result.finished_at,
             "failed": result.failed,
             "error": result.error,
+            "error_details": result.error_details,
             "final_reply_rule": final_reply_rule,
             "final_reply": result.final_reply,
             "module_failures": result.module_failures,

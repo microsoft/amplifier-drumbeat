@@ -84,6 +84,29 @@ against it · the worked example. Status stays DRAFT and says why until then.
 
 ## Changelog
 
+- **2026-09-07** — The `agent_config:` top-level vocabulary **widens by one key**, to
+  `provider | mcp | skills | tool_result_ceiling_bytes`.
+  - **`tool_result_ceiling_bytes: <positive integer>`** — the per-automation byte
+    ceiling applied to a tool result before it enters the conversation
+    (`contracts/agent-binding.v1.md` §10). Absent = the engine default,
+    **262144** bytes (256 KiB), itself overridable per deployment via
+    `$DRUMBEAT_TOOL_RESULT_CEILING_BYTES`. A value that is not a positive integer is
+    refused at load naming the remedy; `0` is refused rather than read as "unlimited",
+    because there is no unlimited — an unbounded result is the defect this key exists
+    to bound.
+  - Unlike `$DRUMBEAT_SESSION_ROTATE_TOKENS` (deliberately env-only, an engine
+    deployment knob), this one IS per-automation, and the evidence says why: tool-output
+    volume is a property of what an automation does, not of the deployment it runs in.
+    Measured on the originating deployment, a single m365 sweep returned a
+    46,464,072-byte tool result while every rollup automation on the same host stayed
+    under a megabyte. One fleet-wide number would either strangle the rollups or leave
+    the sweep unbounded.
+  - The key is passed to the turn in CODE, exactly like `skills:` and `mcp:` — it names
+    drumbeat's own behavior, and the agent library's host-config file has no key for it
+    (its vocabulary is five keys and closed), so writing it there would validate and be
+    read by nothing.
+  Contract amended in the SAME change as the code, tests, and docs. Schema reference:
+  docs/AUTOMATIONS.md §10; seam reference: contracts/agent-binding.v1.md §10.
 - **2026-09-06** — `agent_config:` semantics pinned to the agent-library seam, which
   now has its own contract: `contracts/agent-binding.v1.md`. The top-level
   `agent_config:` vocabulary **narrows to `provider | mcp | skills`**; every closed

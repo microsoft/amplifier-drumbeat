@@ -183,6 +183,130 @@ def detect_ceiling_hit(text: str) -> CeilingHit | None:
     return max(hits, key=lambda h: h.prompt_tokens)
 
 
+# ---- Trigger 1b -- PROVIDER INPUT-SIZE REFUSAL (drumbeat-m0j) --------------
+#
+# contracts/agent-binding.v1.md section 11. ``CEILING_RE`` above matches ONE
+# provider's prose form. The 2026-09-07 incident arrived in a different shape
+# entirely -- a STRUCTURED error code, ``string_above_max_length``, describing
+# an oversized single tool result rather than an oversized prompt -- and
+# nothing in the engine matched it. The run recorded the library's lossy
+# ``provider_failed``, the real code sat unread in the worker's stderr.log,
+# the pre-emptive token gate could not fire (a refused turn records no usage
+# to measure), and the identical run failed again four hours later on the same
+# pinned session.
+#
+# These three codes all mean the same operationally decisive thing: the
+# provider refused this request because of its INPUT SIZE, and the input only
+# grows from here. That makes each one exactly as terminal for a pinned
+# session as the prose ceiling hit, and it is rotated on the same single path.
+INPUT_SIZE_REFUSAL_CODES = (
+    "context_length_exceeded",
+    "string_above_max_length",
+    "request_too_large",
+)
+
+# Matched on a strict boundary so a code never matches inside a longer
+# identifier. Ordered as declared, and the FIRST match in the text wins --
+# a run that retried and logged two codes is reported by the one that
+# actually arrived first.
+_REFUSAL_CODE_RE = re.compile(
+    r"(?<![0-9A-Za-z_])(" + "|".join(INPUT_SIZE_REFUSAL_CODES) + r")(?![0-9A-Za-z_])"
+)
+
+
+@dataclass(frozen=True)
+class InputSizeRefusal:
+    """A provider refusal proving the pinned session's input is too large.
+
+    ``code`` is the provider's own structured code when it gave one, or the
+    synthetic ``"prompt_too_long"`` when only the prose form was present --
+    never ``None``, because the whole point of this record is that the run
+    finally NAMES its cause instead of reporting the library's lossy
+    ``provider_failed``.
+
+    ``prompt_tokens``/``limit_tokens`` are populated only by the prose form,
+    which is the only shape that carries numbers. They stay ``None`` for a
+    structured code -- honestly absent, never a fabricated 0.
+    """
+
+    code: str
+    prompt_tokens: int | None = None
+    limit_tokens: int | None = None
+
+    #: The synthetic code used when only the prose ceiling form matched.
+    PROSE_CODE = "prompt_too_long"
+
+    @property
+    def detail(self) -> str:
+        if self.prompt_tokens is not None and self.limit_tokens is not None:
+            return (
+                f"{self.code}: prompt is too long: {self.prompt_tokens} tokens > "
+                f"{self.limit_tokens} maximum"
+            )
+        return f"{self.code}: the provider refused this request on input size"
+
+    def as_error_details(self) -> dict[str, object]:
+        """The ``run_completed.error_details`` payload for this refusal.
+
+        Only keys with real values appear: an absent token count is ABSENT,
+        not ``null`` padding, for the same reason usage counters are
+        (docs/VISION.md section 4).
+        """
+        details: dict[str, object] = {"provider_code": self.code, "source": "stderr"}
+        if self.prompt_tokens is not None:
+            details["prompt_tokens"] = self.prompt_tokens
+        if self.limit_tokens is not None:
+            details["limit_tokens"] = self.limit_tokens
+        return details
+
+
+def detect_input_size_refusal(text: str) -> InputSizeRefusal | None:
+    """Return the provider's input-size refusal in ``text``, if any.
+
+    Superset of :func:`detect_ceiling_hit`: it matches the three structured
+    provider codes AND the prose ceiling form. A structured code wins when both
+    are present, because it is the provider's own name for what happened and
+    needs no pattern-matching to interpret downstream.
+
+    Args:
+        text: captured stderr from one or more turns. Empty input yields
+            ``None``.
+
+    Returns:
+        The refusal, or ``None`` when the text carries no input-size refusal at
+        all. A failure that is not about input size must never be reported as
+        one -- rotating a healthy session costs a real conversation's memory.
+
+    Example:
+        >>> detect_input_size_refusal("invalid_request_error string_above_max_length").code
+        'string_above_max_length'
+        >>> r = detect_input_size_refusal("prompt is too long: 219685 tokens > 200000 maximum")
+        >>> r.code, r.prompt_tokens, r.limit_tokens
+        ('prompt_too_long', 219685, 200000)
+        >>> detect_input_size_refusal("connection reset by peer") is None
+        True
+        >>> detect_input_size_refusal("a_string_above_max_length_thing") is None
+        True
+    """
+    if not text:
+        return None
+    hit = detect_ceiling_hit(text)
+    match = _REFUSAL_CODE_RE.search(text)
+    if match is not None:
+        return InputSizeRefusal(
+            code=match.group(1),
+            prompt_tokens=hit.prompt_tokens if hit else None,
+            limit_tokens=hit.limit_tokens if hit else None,
+        )
+    if hit is not None:
+        return InputSizeRefusal(
+            code=InputSizeRefusal.PROSE_CODE,
+            prompt_tokens=hit.prompt_tokens,
+            limit_tokens=hit.limit_tokens,
+        )
+    return None
+
+
 def contract_fingerprint(steps: Sequence[Step]) -> str:
     """Stable sha256 over an automation's ordered step **prompts**.
 
